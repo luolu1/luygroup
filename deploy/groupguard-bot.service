@@ -1,0 +1,24 @@
+[Unit]
+Description=GroupGuard Telegram bot
+After=network-online.target groupguard-web.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=groupguard
+Group=groupguard
+WorkingDirectory=/opt/groupguard
+Environment=GROUPGUARD_CONFIG=/opt/groupguard/config.json
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/groupguard/.venv/bin/python run_bot.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

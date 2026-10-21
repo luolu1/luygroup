@@ -1,0 +1,183 @@
+{% extends "base.html" %}
+{% block title %}用户与订阅{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <div class="eyebrow">USERS &amp; SUBSCRIPTIONS</div>
+    <h1>用户与订阅</h1>
+    <p class="muted small">控制台账号会在用户私聊机器人时自动创建。普通用户拥有基础权限，订阅用户解锁高级能力。</p>
+  </div>
+  <form class="row" method="get" action="/users">
+    <input type="search" name="q" value="{{ q }}" placeholder="名称 / 用户名 / Telegram ID" style="min-width:240px">
+    <button class="ghost sm" type="submit">搜索</button>
+    {% if q %}<a class="btn ghost sm" href="/users">清空</a>{% endif %}
+  </form>
+</section>
+
+{% if issued_url %}
+<div class="banner ok">
+  <strong>新的控制台登录地址已生成</strong>
+  <div class="faint small">Token 24 小时内有效；旧 Token 和旧控制台路径已立即失效。</div>
+  <div class="codebox" style="margin-top:8px">{{ issued_url }}</div>
+  <div class="form-actions" style="margin-top:10px;padding-top:0;border-top:0">
+    <button class="ghost sm" type="button" data-copy="{{ issued_url }}">复制登录地址</button>
+  </div>
+</div>
+{% endif %}
+
+<div class="card">
+  <div class="spread" style="margin-bottom:12px">
+    <h2 style="margin:0">用户列表</h2>
+    <div class="muted small">
+      共 {{ users|length }} 个用户{% if q %}，搜索“{{ q }}”{% endif %}
+    </div>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>用户</th><th>角色</th><th>订阅</th><th>状态</th><th>控制台路径</th><th>操作</th></tr></thead>
+      <tbody>
+      {% for user in users %}
+        {% set sub = subscription_by_user.get(user.id) %}
+        <tr>
+          <td>
+            {{ user.display_name or user.username or user.id }}
+            <div class="faint mono small">{{ user.telegram_id or '未绑定 Telegram ID' }}{% if user.username %} · @{{ user.username }}{% endif %}</div>
+          </td>
+          <td>
+            <span class="badge {% if user.role == 'superadmin' %}purple{% elif user.role == 'subscriber' %}ok{% endif %}">
+              {{ {'superadmin': '超级管理员', 'subscriber': '订阅用户', 'user': '普通用户'}.get(user.role, user.role) }}
+            </span>
+          </td>
+          <td>
+            {% if user.role == 'superadmin' %}<span class="faint">平台管理员</span>
+            {% elif sub %}
+              <span class="badge ok">生效中</span>
+              <div class="faint small">到期 {{ sub.expires_at|dt }}</div>
+            {% else %}<span class="faint">未订阅</span>{% endif %}
+          </td>
+          <td>
+            <span class="badge {% if user.is_active %}ok{% else %}bad{% endif %}">{{ '启用' if user.is_active else '停用' }}</span>
+          </td>
+          <td><code>/console/{{ user.console_path }}</code></td>
+          <td>
+            <button class="ghost sm" type="button" data-modal-open="user-modal-{{ user.id }}">编辑</button>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6"><div class="empty">没有匹配的用户。</div></td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% for user in users %}
+  {% set sub = subscription_by_user.get(user.id) %}
+  {% set current_plan = plan_by_id.get(sub.plan_id) if sub else none %}
+  <dialog class="modal" id="user-modal-{{ user.id }}" aria-labelledby="user-modal-title-{{ user.id }}">
+    <div class="modal-head">
+      <div>
+        <h2 id="user-modal-title-{{ user.id }}">{{ user.display_name or user.username or user.id }}</h2>
+        <div class="muted mono small">{{ user.telegram_id or '未绑定 Telegram ID' }}{% if user.username %} · @{{ user.username }}{% endif %}</div>
+      </div>
+      <button class="ghost sm" type="button" data-modal-close>关闭</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-summary">
+        <span class="badge {% if user.role == 'superadmin' %}purple{% elif user.role == 'subscriber' %}ok{% endif %}">
+          {{ {'superadmin': '超级管理员', 'subscriber': '订阅用户', 'user': '普通用户'}.get(user.role, user.role) }}
+        </span>
+        <span class="badge {% if user.is_active %}ok{% else %}bad{% endif %}">{{ '启用' if user.is_active else '停用' }}</span>
+        {% if sub %}<span class="badge info">订阅至 {{ sub.expires_at|date }}</span>{% endif %}
+      </div>
+
+      <div class="modal-section">
+        <h3>控制台登录</h3>
+        <div class="kv">
+          <span class="k">控制台路径</span>
+          <span class="mono break">/console/{{ user.console_path }}</span>
+          <span class="k">Token 有效期</span>
+          <span>{% if user.token_expires_at %}{{ user.token_expires_at|dt }}{% else %}<span class="faint">尚未通过 /token 获取</span>{% endif %}</span>
+        </div>
+        <form method="post" action="/users/{{ user.id }}/token?q={{ q|urlencode }}"
+              data-confirm="重置会立即作废旧 Token 和控制台路径，并生成新的登录地址。确定继续？">
+          <div class="form-actions" style="margin-top:12px;padding-top:12px">
+            <button class="ghost sm" type="submit">重置 Token 和路径</button>
+          </div>
+        </form>
+        <div class="hint">重置后新的登录地址会显示在页面顶部。Token 有效期为 24 小时，过期后可通过 Bot 的 /token 自动轮换。</div>
+      </div>
+
+      {% if user.role != 'superadmin' %}
+      <div class="modal-section">
+        <h3>角色</h3>
+        <form method="post" action="/users/{{ user.id }}/role?q={{ q|urlencode }}" class="row">
+          <select name="role" style="width:160px">
+            <option value="user" {% if user.role == 'user' %}selected{% endif %}>普通用户</option>
+            <option value="subscriber" {% if user.role == 'subscriber' %}selected{% endif %}>订阅用户</option>
+          </select>
+          <button class="ghost sm" type="submit">保存角色</button>
+        </form>
+        <div class="hint">普通用户仅基础权限；订阅用户解锁 AI、跨群联动、通报、积分商城等高级能力。</div>
+      </div>
+
+      <div class="modal-section">
+        <h3>订阅</h3>
+        {% if sub and current_plan %}
+        <div class="hint">当前套餐：{{ current_plan.label or current_plan.name }}，到期 {{ sub.expires_at|dt }}。</div>
+        {% endif %}
+        <form method="post" action="/users/{{ user.id }}/subscription?q={{ q|urlencode }}">
+          <div class="row" style="align-items:flex-end">
+            <label class="field" style="flex:1;min-width:170px;margin:0">
+              <span class="muted small">套餐</span>
+              <select name="plan_id">
+                {% for plan in plans %}
+                <option value="{{ plan.id }}" {% if current_plan and current_plan.id == plan.id %}selected{% endif %}>{{ plan.label or plan.name }}</option>
+                {% endfor %}
+              </select>
+            </label>
+            <label class="field" style="width:96px;margin:0">
+              <span class="muted small">天数</span>
+              <input name="days" type="number" min="1" max="3650" value="30">
+            </label>
+          </div>
+          <div class="form-actions" style="margin-top:12px;padding-top:12px">
+            <button class="sm" type="submit" name="action" value="activate">{{ '续费 / 变更套餐' if sub else '开通订阅' }}</button>
+            {% if sub %}
+            <button class="danger sm" type="submit" name="action" value="cancel"
+                    data-confirm="取消订阅后该用户会立即恢复普通用户权限，确定继续？">取消订阅</button>
+            {% endif %}
+          </div>
+        </form>
+        <div class="hint">开通或续费会替换当前订阅，有效期从操作时起重新计算。支付尚未接入，由超级管理员手动管理。</div>
+      </div>
+
+      <div class="modal-section">
+        <h3>账号状态</h3>
+        <form method="post" action="/users/{{ user.id }}/toggle?q={{ q|urlencode }}">
+          <button class="ghost sm" type="submit"
+                  data-confirm="{{ '停用后该用户将无法登录控制台，确定继续？' if user.is_active else '确定重新启用该用户？' }}">
+            {{ '停用账号' if user.is_active else '启用账号' }}
+          </button>
+        </form>
+        <div class="hint">{{ '停用后该用户无法登录控制台，Bot 也不会为其签发 Token。' if user.is_active else '当前已停用，启用后可重新访问控制台。' }}</div>
+      </div>
+      {% else %}
+      <div class="modal-section">
+        <div class="hint">超级管理员角色、订阅和状态由 <code>config.json</code> 的 <code>bot.admin_ids</code> 管理，不能在控制台修改。</div>
+      </div>
+      {% endif %}
+    </div>
+  </dialog>
+{% endfor %}
+
+<div class="card">
+  <h2>订阅套餐</h2>
+  {% if plans %}
+  <div class="table-wrap"><table><thead><tr><th>套餐</th><th>群组上限</th><th class="num">每日 AI 请求</th><th class="num">每日样本</th></tr></thead><tbody>
+  {% for plan in plans %}<tr><td>{{ plan.label or plan.name }}</td><td>{{ plan.group_limit }}</td><td class="num">{{ plan.ai_daily_quota }}</td><td class="num">{{ plan.sample_daily_quota }}</td></tr>{% endfor %}
+  </tbody></table></div>
+  {% else %}<div class="empty">暂无套餐。</div>{% endif %}
+  <div class="hint">支付尚未接入，订阅由超级管理员在此手动开通或取消。</div>
+</div>
+{% endblock %}

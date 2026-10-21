@@ -1,0 +1,1188 @@
+{% extends "base.html" %}
+{% set gid = group.id %}
+{% block title %}{{ group.title or ('群组 ' ~ group.id) }}{% endblock %}
+{% block content %}
+{% macro member_actions(uid, m, tab_name) %}
+<form class="actions" method="post" action="/groups/{{ gid }}/members/{{ uid }}/action">
+  <input type="hidden" name="tab" value="{{ tab_name }}">
+  <input type="hidden" name="minutes" value="{{ group.mute_minutes or 60 }}">
+  {% if m and m.is_banned %}
+  <button class="ghost sm" type="submit" name="action" value="unban">解封</button>
+  {% else %}
+  <button class="danger sm" type="submit" name="action" value="ban" data-confirm="确定封禁该用户？">封禁</button>
+  {% endif %}
+  {% if m and m.is_muted %}
+  <button class="ghost sm" type="submit" name="action" value="unmute">解除禁言</button>
+  {% else %}
+  <button class="ghost sm" type="submit" name="action" value="mute">禁言</button>
+  {% endif %}
+  <button class="ghost sm" type="submit" name="action" value="kick" data-confirm="确定踢出该用户？">踢出</button>
+  {% if tab_name == 'members' %}
+  <button class="ghost sm" type="submit" name="action" value="clearwarns" data-confirm="确定清除该用户全部警告？">清警告</button>
+  {% endif %}
+</form>
+{% endmacro %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">GROUP · {{ group.chat_type or 'supergroup' }}</div>
+    <h1>{{ group.title or ('群组 ' ~ group.id) }}</h1>
+    <div class="row small">
+      <button type="button" class="btn ghost sm" data-copy="{{ group.id }}">{{ group.id }}</button>
+      {% if group.username %}<span class="badge">@{{ group.username }}</span>{% endif %}
+      {% if group.is_active %}<span class="badge ok">启用</span>{% else %}<span class="badge bad">停用</span>{% endif %}
+      <span class="faint">成员 {{ group.member_count or 0 }} · 消息 {{ group.message_count or 0 }}</span>
+    </div>
+  </div>
+  <a class="btn ghost sm" href="/groups">← 返回群组列表</a>
+</div>
+
+<div class="subnav">
+  {% for key, label in tabs %}
+  <a href="/groups/{{ gid }}?tab={{ key }}" class="{% if tab == key %}active{% endif %}">{{ label }}</a>
+  {% endfor %}
+</div>
+
+{% if bot_membership_error %}
+<div class="banner err">
+  无法确认机器人在本群的状态：{{ bot_membership_error }}
+</div>
+{% elif bot_member is defined %}
+  {% set bstatus = bot_member.status %}
+  {% if bstatus not in ['creator', 'administrator', 'member'] and not (bstatus == 'restricted' and bot_member.is_member) %}
+  <div class="banner err">
+    <b>机器人当前不在该群</b>（状态：{{ bstatus }}），无法接收入群事件，也不会执行进群验证或管理操作。
+    {% if bot_username %}<a href="https://t.me/{{ bot_username }}?startgroup=true" target="_blank" rel="noreferrer">重新邀请 @{{ bot_username }}</a>{% endif %}
+  </div>
+  {% elif bstatus not in ['creator', 'administrator'] %}
+  <div class="banner err">
+    机器人已在群内，但<b>不是管理员</b>。进群验证、封禁、删除消息等功能无法生效。请将其设为管理员，并授予“封禁用户、删除消息、邀请用户”权限。
+  </div>
+  {% elif bstatus == 'administrator' and not bot_member.can_restrict_members %}
+  <div class="banner err">
+    机器人是管理员，但缺少<b>“封禁用户 / 限制成员”</b>权限，验证超时后无法踢出成员。请在群管理权限中补充该权限。
+  </div>
+  {% endif %}
+{% endif %}
+
+{# ==================================================================== settings #}
+{% if tab == 'settings' %}
+<div class="grid cols-2">
+  <div class="card">
+    <h2>基础状态</h2>
+    <form method="post" action="/groups/{{ gid }}/settings">
+      <input type="hidden" name="_scope" value="general">
+      <div class="switches">
+        <label class="switch">
+          <input class="check" type="checkbox" name="is_active" {% if group.is_active %}checked{% endif %}>
+          <span><span class="t">启用机器人</span><span class="d">关闭后该群不再执行任何自动管理。</span></span>
+        </label>
+        <label class="switch">
+          <input class="check" type="checkbox" name="delete_command_messages" {% if group.delete_command_messages %}checked{% endif %}>
+          <span><span class="t">删除命令消息</span><span class="d">执行管理命令后自动删除命令本身。</span></span>
+        </label>
+        {% if can('welcome') %}
+        <label class="switch">
+          <input class="check" type="checkbox" name="welcome_enabled" {% if group.welcome_enabled %}checked{% endif %}>
+          <span><span class="t">新人欢迎语</span><span class="d">验证通过或成员加入后发送欢迎语。</span></span>
+        </label>
+        {% endif %}
+      </div>
+
+      {% if can('welcome') %}
+      <label for="welcome_text">欢迎语</label>
+      <textarea id="welcome_text" name="welcome_text" rows="3"
+                placeholder="支持 {name} 与 {group} 占位符">{{ group.welcome_text or '' }}</textarea>
+      <div class="hint">占位符：<code>{name}</code> 成员名称，<code>{group}</code> 群名称。</div>
+      {% else %}
+      <div class="alert small">新人欢迎语属于订阅版功能。升级订阅后可在此配置。</div>
+      {% endif %}
+
+      <label for="rules_text">群规文案</label>
+      <textarea id="rules_text" name="rules_text" rows="5"
+                placeholder="发送 /rules 时展示，留空则使用默认提示">{{ group.rules_text or '' }}</textarea>
+
+      <div class="form-grid">
+        <div class="field">
+          <label for="log_channel_id">管理日志频道 ID</label>
+          <input id="log_channel_id" name="log_channel_id" type="text" inputmode="numeric"
+                 value="{{ group.log_channel_id or '' }}" placeholder="例如 -1001234567890">
+        </div>
+        {% if can('reports') %}
+        <div class="field">
+          <label for="report_chat_id">举报接收会话 ID</label>
+          <input id="report_chat_id" name="report_chat_id" type="text" inputmode="numeric"
+                 value="{{ group.report_chat_id or '' }}" placeholder="留空则发送到群内">
+        </div>
+        {% endif %}
+      </div>
+
+      {% if can('reports') %}
+      <div class="divider"></div>
+      <h3>举报与通报</h3>
+      <div class="switches">
+        <label class="switch">
+          <input class="check" type="checkbox" name="report_enabled" {% if group.report_enabled %}checked{% endif %}>
+          <span><span class="t">允许成员举报</span><span class="d">成员可用 /report 回复消息举报。</span></span>
+        </label>
+        <label class="switch">
+          <input class="check" type="checkbox" name="report_receive" {% if group.report_receive %}checked{% endif %}>
+          <span><span class="t">接收他人通报</span><span class="d">允许订阅其他群组的举报通报。</span></span>
+        </label>
+      </div>
+      {% endif %}
+
+      {% if can('linkage') %}
+      <div class="divider"></div>
+      <h3>跨群封禁联动</h3>
+      <div class="switches">
+        <label class="switch">
+          <input class="check" type="checkbox" name="crossban_enabled" {% if group.crossban_enabled %}checked{% endif %}>
+          <span><span class="t">启用跨群封禁</span><span class="d">本群封禁会同步到联动群组。</span></span>
+        </label>
+      </div>
+      <label for="crossban_mode">联动范围</label>
+      <select id="crossban_mode" name="crossban_mode">
+        <option value="shared" {% if group.crossban_mode == 'shared' %}selected{% endif %}>共享群组联动（互相同步）</option>
+        <option value="own" {% if group.crossban_mode == 'own' %}selected{% endif %}>自动匹配所有已开启跨群封禁的群组</option>
+      </select>
+      <div class="hint">共享联动需要在「联动与通报」标签中手动添加群组；「自动匹配」模式会匹配所有已开启跨群封禁的群组（即本机器人管理的群）。</div>
+      {% endif %}
+
+      {% if can('points') %}
+      <div class="divider"></div>
+      <h3>积分体系</h3>
+      <div class="switches">
+        <label class="switch">
+          <input class="check" type="checkbox" name="points_enabled" {% if group.points_enabled %}checked{% endif %}>
+          <span><span class="t">启用积分</span><span class="d">开启签到、商城、红包、抽奖与竞拍。</span></span>
+        </label>
+      </div>
+      <div class="form-grid">
+        <div class="field">
+          <label for="points_name">积分名称</label>
+          <input id="points_name" name="points_name" type="text" value="{{ group.points_name or '积分' }}" maxlength="32">
+        </div>
+        <div class="field">
+          <label for="points_per_message">每条消息积分</label>
+          <input id="points_per_message" name="points_per_message" type="number" min="0"
+                 value="{{ group.points_per_message or 0 }}">
+        </div>
+        <div class="field">
+          <label for="points_cooldown">积分冷却（秒）</label>
+          <input id="points_cooldown" name="points_cooldown" type="number" min="0"
+                 value="{{ group.points_cooldown or 0 }}">
+        </div>
+        <div class="field">
+          <label for="daily_bonus">每日签到奖励</label>
+          <input id="daily_bonus" name="daily_bonus" type="number" min="0"
+                 value="{{ group.daily_bonus or 0 }}">
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="form-actions">
+        <button type="submit">保存基础设置</button>
+        <span class="faint small">修改会记录到管理日志。</span>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>运行信息</h2>
+    <div class="kv">
+      <span class="k">群组 ID</span><span class="mono">{{ group.id }}</span>
+      <span class="k">类型</span><span>{{ group.chat_type or '—' }}</span>
+      <span class="k">所有者 ID</span><span class="mono">{{ group.owner_id or '未记录' }}</span>
+      <span class="k">成员数</span><span>{{ group.member_count or 0 }}</span>
+      <span class="k">消息总数</span><span>{{ group.message_count or 0 }}</span>
+      <span class="k">创建时间</span><span>{{ group.created_at|dt }}</span>
+      <span class="k">最近更新</span><span>{{ group.updated_at|dt }}</span>
+    </div>
+    <div class="divider"></div>
+    <h3>常用命令</h3>
+    <div class="small muted" style="line-height:1.9">
+      <code>/settings</code> 查看当前设置 ·
+      <code>/setrules</code> 设置群规 ·
+      <code>/setwarn 3 mute 60</code> 警告策略 ·
+      <code>/setflood 8 10 mute</code> 刷屏策略 ·
+      <code>/setverify on</code> 进群验证 ·
+      <code>/setai ad on</code> AI 广告检测 ·
+      <code>/logs</code> 管理日志
+    </div>
+    <div class="alert">
+      Bot API 无法读取用户简介（bio）。「简介检测」仅能对姓名与用户名做关键词近似检查。
+    </div>
+  </div>
+</div>
+
+{# ================================================================== moderation #}
+{% elif tab == 'moderation' %}
+<div class="card">
+  <h2>反广告与刷屏策略</h2>
+  <form method="post" action="/groups/{{ gid }}/settings">
+    <input type="hidden" name="_scope" value="moderation">
+    <div class="switches">
+      <label class="switch">
+        <input class="check" type="checkbox" name="anti_ad_enabled" {% if group.anti_ad_enabled %}checked{% endif %}>
+        <span><span class="t">本地反广告</span><span class="d">链接、邀请、关键词与刷屏检测，无需 AI。</span></span>
+      </label>
+      <label class="switch">
+        <input class="check" type="checkbox" name="anti_spam_enabled" {% if group.anti_spam_enabled %}checked{% endif %}>
+        <span><span class="t">刷屏检测</span><span class="d">在时间窗口内超过消息数限制时触发。</span></span>
+      </label>
+      <label class="switch">
+        <input class="check" type="checkbox" name="block_forwarded" {% if group.block_forwarded %}checked{% endif %}>
+        <span><span class="t">拦截转发消息</span><span class="d">删除所有来自其他会话的转发。</span></span>
+      </label>
+    </div>
+
+    <div class="form-grid" style="margin-top:14px">
+      <div class="field">
+        <label for="max_message_length">最大消息长度</label>
+        <input id="max_message_length" name="max_message_length" type="number" min="0"
+               value="{{ group.max_message_length or 0 }}">
+        <div class="hint">0 表示不限制。</div>
+      </div>
+      <div class="field">
+        <label for="warn_limit">警告上限</label>
+        <input id="warn_limit" name="warn_limit" type="number" min="0" value="{{ group.warn_limit or 0 }}">
+      </div>
+      <div class="field">
+        <label for="warn_action">达到上限后的处罚</label>
+        <select id="warn_action" name="warn_action">
+          <option value="mute" {% if group.warn_action == 'mute' %}selected{% endif %}>禁言</option>
+          <option value="kick" {% if group.warn_action == 'kick' %}selected{% endif %}>踢出</option>
+          <option value="ban" {% if group.warn_action == 'ban' %}selected{% endif %}>封禁</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="mute_minutes">默认禁言时长（分钟）</label>
+        <input id="mute_minutes" name="mute_minutes" type="number" min="1" value="{{ group.mute_minutes or 60 }}">
+      </div>
+      <div class="field">
+        <label for="flood_limit">刷屏消息数</label>
+        <input id="flood_limit" name="flood_limit" type="number" min="1" value="{{ group.flood_limit or 8 }}">
+      </div>
+      <div class="field">
+        <label for="flood_window">刷屏窗口（秒）</label>
+        <input id="flood_window" name="flood_window" type="number" min="1" value="{{ group.flood_window or 10 }}">
+      </div>
+      <div class="field">
+        <label for="flood_action">刷屏处罚</label>
+        <select id="flood_action" name="flood_action">
+          <option value="mute" {% if group.flood_action == 'mute' %}selected{% endif %}>禁言</option>
+          <option value="kick" {% if group.flood_action == 'kick' %}selected{% endif %}>踢出</option>
+          <option value="ban" {% if group.flood_action == 'ban' %}selected{% endif %}>封禁</option>
+        </select>
+      </div>
+    </div>
+
+    <label for="allowed_domains">允许的域名</label>
+    <textarea id="allowed_domains" name="allowed_domains" rows="2"
+              placeholder="每行或逗号分隔，例如：youtube.com, bilibili.com">{{ group.allowed_domains or '' }}</textarea>
+
+    <div class="hint">关键词规则已统一在
+      <a href="/groups/{{ gid }}?tab=keywords">「关键词」标签页</a> 管理，可设置删除、警告、禁言、封禁或关键词回复。
+    </div>
+
+    <div class="form-actions">
+      <button type="submit">保存风控策略</button>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>近 30 天风控统计</h2>
+  {% if stats %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>日期</th><th class="num">消息</th><th class="num">警告</th><th class="num">封禁</th><th class="num">删除</th></tr></thead>
+      <tbody>
+      {% for s in stats %}
+        <tr>
+          <td class="mono">{{ s.day }}</td>
+          <td class="num">{{ s.messages or 0 }}</td>
+          <td class="num">{{ s.warns or 0 }}</td>
+          <td class="num">{{ s.bans or 0 }}</td>
+          <td class="num">{{ s.deletes or 0 }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<div class="empty">暂无统计数据。</div>{% endif %}
+</div>
+
+{# ========================================================================= ai #}
+{% elif tab == 'ai' %}
+{% if ai_provider_count == 0 and (group.ai_ad_enabled or group.ai_assistant_enabled or group.ai_chat_enabled) %}
+<div class="banner err">
+  当前已开启 AI 功能，但没有启用任何 AI 接口，所有 AI 调用都会失败。请先到
+  <a href="/ai">AI 接口</a> 添加并启用接口；本地广告规则不受影响。
+</div>
+{% endif %}
+<div class="card">
+  <h2>AI 功能开关与额度</h2>
+  <form method="post" action="/groups/{{ gid }}/settings">
+    <input type="hidden" name="_scope" value="ai">
+    <div class="switches">
+      <label class="switch">
+        <input class="check" type="checkbox" name="ai_ad_enabled" {% if group.ai_ad_enabled %}checked{% endif %}>
+        <span><span class="t">AI 广告检测</span><span class="d">本地规则无法确定时抽样交给 AI 判断。</span></span>
+      </label>
+      <label class="switch">
+        <input class="check" type="checkbox" name="ai_assistant_enabled" {% if group.ai_assistant_enabled %}checked{% endif %}>
+        <span><span class="t">AI 管理助理</span><span class="d">管理员可用 /ask 询问群管理与配置问题。</span></span>
+      </label>
+      <label class="switch">
+        <input class="check" type="checkbox" name="ai_chat_enabled" {% if group.ai_chat_enabled %}checked{% endif %}>
+        <span><span class="t">AI 闲聊</span><span class="d">成员对话时由 AI 回复，建议配合额度限制。</span></span>
+      </label>
+    </div>
+    <div class="form-grid" style="margin-top:14px">
+      <div class="field">
+        <label for="ai_daily_quota">每日 AI 请求额度</label>
+        <input id="ai_daily_quota" name="ai_daily_quota" type="number" min="0"
+               value="{{ group.ai_daily_quota or 0 }}">
+        <div class="hint">0 表示不限制，按群组每日统计。</div>
+      </div>
+      <div class="field">
+        <label for="sample_daily_quota">每日样本拦截额度</label>
+        <input id="sample_daily_quota" name="sample_daily_quota" type="number" min="0"
+               value="{{ group.sample_daily_quota or 0 }}">
+        <div class="hint">用于限制抽样送检消息数量。</div>
+      </div>
+    </div>
+    <div class="form-actions">
+      <button type="submit">保存 AI 设置</button>
+      <a class="btn ghost sm" href="/ai">管理 AI 接口</a>
+    </div>
+  </form>
+</div>
+
+<div class="grid cols-2">
+  <div class="card">
+    <h2>AI 用量（最近 30 天）</h2>
+    {% if usage %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>日期</th><th class="num">请求</th><th class="num">抽样</th><th class="num">命中</th></tr></thead>
+        <tbody>
+        {% for u in usage %}
+          <tr>
+            <td class="mono">{{ u.day }}</td>
+            <td class="num">{{ u.requests or 0 }}</td>
+            <td class="num">{{ u.samples or 0 }}</td>
+            <td class="num">{{ u.hits or 0 }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">暂无 AI 用量。</div>{% endif %}
+  </div>
+
+  <div class="card">
+    <h2>最近 AI 事件</h2>
+    {% if events %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>类型</th><th>接口</th><th>命中</th><th>结果</th></tr></thead>
+        <tbody>
+        {% for e in events %}
+          <tr>
+            <td class="faint nowrap">{{ e.created_at|dt }}</td>
+            <td><span class="badge info">{{ e.kind }}</span></td>
+            <td class="mono small">{{ e.provider or '—' }}</td>
+            <td>{% if e.hit %}<span class="badge bad">命中</span>{% else %}<span class="badge">通过</span>{% endif %}</td>
+            <td class="small">{{ e.result|short(46) }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">暂无 AI 事件。</div>{% endif %}
+  </div>
+</div>
+
+{# ======================================================================= join #}
+{% elif tab == 'join' %}
+<div class="card">
+  <h2>进群验证</h2>
+  <form method="post" action="/groups/{{ gid }}/settings">
+    <input type="hidden" name="_scope" value="join">
+    <div class="switches">
+      <label class="switch">
+        <input class="check" type="checkbox" name="verify_enabled" {% if group.verify_enabled %}checked{% endif %}>
+        <span><span class="t">启用进群验证</span><span class="d">新成员需识别图片验证码并点击对应按钮，超时自动踢出。</span></span>
+      </label>
+      {% if can('verify_advanced') %}
+      <label class="switch">
+        <input class="check" type="checkbox" name="require_username" {% if group.require_username %}checked{% endif %}>
+        <span><span class="t">必须设置用户名</span><span class="d">没有 @username 的成员不允许通过验证。</span></span>
+      </label>
+      <label class="switch">
+        <input class="check" type="checkbox" name="invite_redemption" {% if group.invite_redemption %}checked{% endif %}>
+        <span><span class="t">邀请码核销</span><span class="d">记录并核销邀请链接的使用次数。</span></span>
+      </label>
+      {% endif %}
+    </div>
+
+    <div class="form-grid" style="margin-top:14px">
+      <div class="field">
+        <label for="verify_timeout">验证超时（秒）</label>
+        <input id="verify_timeout" name="verify_timeout" type="number" min="60"
+               value="{{ group.verify_timeout or 300 }}">
+        <div class="hint">超时后由后台任务自动踢出。</div>
+      </div>
+    </div>
+
+    {% if can('verify_advanced') %}
+    <label for="bio_block_keywords">姓名 / 用户名拦截关键词</label>
+    <textarea id="bio_block_keywords" name="bio_block_keywords" rows="3"
+              placeholder="每行或逗号分隔，用于近似检查姓名与用户名">{{ group.bio_block_keywords or '' }}</textarea>
+    <div class="hint">Telegram Bot API 无法读取用户简介，此功能只能检查姓名与用户名。</div>
+    {% else %}
+    <div class="alert small">用户名必填、邀请码核销与姓名/用户名关键词检查属于订阅版功能。</div>
+    {% endif %}
+
+    <div class="form-actions">
+      <button type="submit">保存验证设置</button>
+    </div>
+  </form>
+  <div class="alert">
+    欢迎语在「基础设置」中配置；验证通过后会自动发送。必关频道请在「必关频道」标签维护。
+  </div>
+</div>
+
+<div class="card">
+  <h2>验证记录</h2>
+  {% if verifications %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>时间</th><th>用户</th><th>状态</th><th>Token</th><th>通过时间</th></tr></thead>
+      <tbody>
+      {% for v in verifications %}
+        <tr>
+          <td class="faint nowrap">{{ v.created_at|dt }}</td>
+          <td class="mono small">{{ v.user_id }}</td>
+          <td>
+            {% if v.status == 'passed' %}<span class="badge ok">已通过</span>
+            {% elif v.status == 'pending' %}<span class="badge warn">等待验证</span>
+            {% else %}<span class="badge bad">{{ v.status }}</span>{% endif %}
+          </td>
+          <td class="mono small faint">{{ v.token|short(16) }}</td>
+          <td class="faint nowrap">{{ v.passed_at|dt }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<div class="empty">暂无验证记录。</div>{% endif %}
+</div>
+
+{# ===================================================================== admins #}
+{% elif tab == 'admins' %}
+<div class="grid cols-2">
+  <div class="card">
+    <h2>添加 / 更新协助管理员</h2>
+    <form method="post" action="/groups/{{ gid }}/admins/add">
+      <div class="form-grid">
+        <div class="field">
+          <label for="user_id">Telegram 用户 ID</label>
+          <input id="user_id" name="user_id" type="text" inputmode="numeric" required placeholder="例如 123456789">
+        </div>
+        <div class="field">
+          <label for="role">角色</label>
+          <select id="role" name="role">
+            <option value="assistant">协助管理员</option>
+            <option value="admin">管理员</option>
+            <option value="owner">所有者</option>
+          </select>
+        </div>
+      </div>
+      <label>权限</label>
+      <div class="switches">
+        <label class="inline"><input class="check" type="checkbox" name="permissions" value="ban" checked> 封禁</label>
+        <label class="inline"><input class="check" type="checkbox" name="permissions" value="mute" checked> 禁言</label>
+        <label class="inline"><input class="check" type="checkbox" name="permissions" value="warn" checked> 警告</label>
+        <label class="inline"><input class="check" type="checkbox" name="permissions" value="delete" checked> 删除消息</label>
+        <label class="inline"><input class="check" type="checkbox" name="permissions" value="info" checked> 成员信息</label>
+        <label class="inline"><input class="check" type="checkbox" name="permissions" value="settings"> 修改设置</label>
+      </div>
+      <div class="form-actions"><button type="submit">保存协助管理员</button></div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>当前协助管理员</h2>
+    {% if admins %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>用户</th><th>角色</th><th>权限</th><th></th></tr></thead>
+        <tbody>
+        {% for a in admins %}
+          {% set m = member_map.get(a.user_id) %}
+          <tr>
+            <td>
+              {{ user_label(a.user_id, m.first_name if m else '', m.username if m else '') }}
+              <div class="faint mono small">{{ a.user_id }}</div>
+            </td>
+            <td><span class="badge purple">{{ a.role }}</span></td>
+            <td class="small faint">{{ a.permission_set|join(', ') }}</td>
+            <td>
+              <form method="post" action="/groups/{{ gid }}/admins/{{ a.id }}/delete"
+                    data-confirm="确定移除该协助管理员？">
+                <button class="danger sm" type="submit">移除</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">尚未添加协助管理员。</div>{% endif %}
+    <div class="hint">Telegram 群管理员自动拥有全部权限；此列表仅用于额外的协助管理员。</div>
+  </div>
+</div>
+
+{# ==================================================================== members #}
+{% elif tab == 'members' %}
+<div class="card">
+  <div class="spread">
+    <h2>成员档案</h2>
+    <div class="row">
+      <form class="row" method="get" action="/groups/{{ gid }}">
+        <input type="hidden" name="tab" value="members">
+        <input type="search" name="q" value="{{ q }}" placeholder="姓名 / 用户名 / ID" style="width:220px">
+        <label class="faint small" style="display:flex;align-items:center;gap:6px">
+          <input type="checkbox" name="show_left" value="1" {% if show_left %}checked{% endif %}> 含已离开
+        </label>
+        <button class="ghost sm" type="submit">搜索</button>
+      </form>
+      <form method="post" action="/groups/{{ gid }}/members/sync">
+        <button class="ghost sm" type="submit">同步成员状态</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="hint" style="margin-bottom:12px">
+    机器人已记录 {{ tracked_total }} 名在群成员 · Telegram 群当前 {{ group.member_count or '—' }} 人。
+    Telegram Bot API 不允许机器人拉取群内全部成员，这里只显示机器人见过进群、发言或被管理过的成员；
+    点击「同步成员状态」可校正这些已知成员的在群状态，并补录群管理员。
+  </div>
+
+  {% if can('points') %}
+  <form class="row" method="post" action="/groups/{{ gid }}/points" style="margin-bottom:14px">
+    <input type="text" name="user_id" inputmode="numeric" placeholder="用户 ID" style="width:150px" required>
+    <input type="number" name="delta" placeholder="积分变化，如 10 或 -5" style="width:180px" required>
+    <input type="text" name="reason" placeholder="原因（可选）" style="width:200px">
+    <button class="ghost sm" type="submit">调整积分</button>
+  </form>
+  {% endif %}
+
+  {% if members %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>成员</th>{% if can('points') %}<th class="num">积分</th>{% endif %}<th class="num">消息</th><th>验证</th><th>状态</th><th>最近活跃</th><th>权限操作</th></tr>
+      </thead>
+      <tbody>
+      {% for m in members %}
+        <tr>
+          <td>
+            {{ user_label(m.user_id, m.first_name, m.username) }}
+            <div class="faint mono small">{{ m.user_id }}</div>
+          </td>
+          {% if can('points') %}<td class="num">{{ m.points or 0 }}</td>{% endif %}
+          <td class="num">{{ m.message_count or 0 }}</td>
+          <td>{% if m.is_verified %}<span class="badge ok">已验证</span>{% else %}<span class="badge">未验证</span>{% endif %}</td>
+          <td>
+            {% if m.is_banned %}<span class="badge bad">封禁</span>{% endif %}
+            {% if m.is_muted %}<span class="badge warn">禁言</span>{% endif %}
+            {% if m.is_member is not none and not m.is_member %}<span class="badge">已离开</span>{% endif %}
+            {% if (m.is_member is none or m.is_member) and not m.is_banned and not m.is_muted %}<span class="badge ok">正常</span>{% endif %}
+          </td>
+          <td class="faint nowrap">{{ m.last_seen|dt }}</td>
+          <td>{{ member_actions(m.user_id, m, 'members') }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<div class="empty">暂无成员记录。</div>{% endif %}
+</div>
+
+{# =================================================================== warnings #}
+{% elif tab == 'warnings' %}
+<div class="card">
+  <div class="spread">
+    <h2>警告记录</h2>
+    <span class="faint small">当前显示 {{ warnings|length }} 条 · 记录 ID 由处置时间生成</span>
+  </div>
+  <form method="get" action="/groups/{{ gid }}" class="actions"
+        style="margin-bottom:14px;flex-wrap:wrap;align-items:end">
+    <input type="hidden" name="tab" value="warnings">
+    <div class="field" style="flex:1;min-width:260px">
+      <label for="warning_q">搜索</label>
+      <input id="warning_q" type="search" name="q" value="{{ q }}"
+             placeholder="记录 ID / 姓名 / 用户名 / 用户 ID / 原因 / 原文">
+    </div>
+    <div class="field">
+      <label for="warning_act">处置</label>
+      <select id="warning_act" name="act">
+        <option value="">全部处置</option>
+        <option value="warn" {% if act == 'warn' %}selected{% endif %}>警告</option>
+        <option value="mute" {% if act == 'mute' %}selected{% endif %}>禁言</option>
+        <option value="kick" {% if act == 'kick' %}selected{% endif %}>踢出</option>
+        <option value="ban" {% if act == 'ban' %}selected{% endif %}>封禁</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="warning_src">来源</label>
+      <select id="warning_src" name="src">
+        <option value="">全部来源</option>
+        <option value="ai" {% if src == 'ai' %}selected{% endif %}>AI 判定</option>
+        <option value="keyword" {% if src == 'keyword' %}selected{% endif %}>关键词</option>
+        <option value="builtin" {% if src == 'builtin' %}selected{% endif %}>本地规则</option>
+        <option value="flood" {% if src == 'flood' %}selected{% endif %}>刷屏</option>
+        <option value="forward" {% if src == 'forward' %}selected{% endif %}>转发</option>
+        <option value="length" {% if src == 'length' %}selected{% endif %}>超长消息</option>
+        <option value="repeat" {% if src == 'repeat' %}selected{% endif %}>重复消息</option>
+        <option value="manual" {% if src == 'manual' %}selected{% endif %}>人工</option>
+      </select>
+    </div>
+    {% if can('ai') %}
+    <div class="field">
+      <label for="warning_review">AI 审核</label>
+      <select id="warning_review" name="review">
+        <option value="">全部状态</option>
+        <option value="pending" {% if review == 'pending' %}selected{% endif %}>待审核</option>
+        <option value="false_positive" {% if review == 'false_positive' %}selected{% endif %}>误杀已学习</option>
+        <option value="confirmed" {% if review == 'confirmed' %}selected{% endif %}>已确认违规</option>
+      </select>
+    </div>
+    {% endif %}
+    <button class="ghost sm" type="submit">筛选</button>
+    <a class="btn ghost sm" href="/groups/{{ gid }}?tab=warnings">重置</a>
+  </form>
+  {% if warnings %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>记录 ID</th><th>处置时间</th><th>成员</th><th>原因 / 原文</th><th>来源</th><th>处置</th><th>操作者</th><th>AI 审核</th></tr></thead>
+      <tbody>
+      {% set action_labels = {"warn": "警告", "mute": "禁言", "kick": "踢出", "ban": "封禁"} %}
+      {% set source_labels = {"ai": "AI 判定", "keyword": "关键词", "builtin": "本地规则", "flood": "刷屏", "forward": "转发", "length": "超长消息", "repeat": "重复消息", "manual": "人工"} %}
+      {% for w in warnings %}
+        {% set m = member_map.get(w.user_id) %}
+        {% set warning_action = w.action or 'warn' %}
+        <tr>
+          <td class="mono small nowrap">
+            <a href="/groups/{{ gid }}?tab=warnings&q={{ w.code or w.id }}">{{ w.code or w.id }}</a>
+          </td>
+          <td class="faint nowrap">{{ w.created_at|dt }}</td>
+          <td>
+            {{ user_label(w.user_id, m.first_name if m else '', m.username if m else '') }}
+            <div class="faint mono small">{{ w.user_id }}</div>
+          </td>
+          <td>
+            <div>{{ w.reason or '—' }}</div>
+            {% if w.content %}
+            <details class="small">
+              <summary class="faint">查看原文</summary>
+              <div class="faint break" style="white-space:pre-wrap;margin-top:6px">{{ w.content[:500] }}{% if w.content|length > 500 %}…{% endif %}</div>
+            </details>
+            {% endif %}
+          </td>
+          <td><span class="badge">{{ source_labels.get(w.source, w.source or '人工') }}</span></td>
+          <td>
+            <span class="badge {% if warning_action == 'ban' %}bad{% elif warning_action == 'kick' %}info{% else %}warn{% endif %}">{{ action_labels.get(warning_action, warning_action) }}</span>
+          </td>
+          <td class="mono small">{{ w.admin_id or '系统' }}</td>
+          <td style="min-width:240px">
+            {% if w.source == 'ai' %}
+              {% if w.review_status == 'false_positive' %}
+                <span class="badge ok">误杀已学习</span>
+              {% elif w.review_status == 'confirmed' %}
+                <span class="badge bad">已确认违规</span>
+              {% else %}
+                <span class="badge warn">待审核</span>
+              {% endif %}
+              {% if w.review_note %}<div class="faint small">{{ w.review_note }}</div>{% endif %}
+              {% if w.reviewed_by %}<div class="faint mono small">审核人 {{ w.reviewed_by }}</div>{% endif %}
+              {% if can('ai') %}
+              <form method="post" action="/groups/{{ gid }}/warnings/{{ w.id }}/review" style="margin-top:8px">
+                <input type="hidden" name="q" value="{{ q }}">
+                <input type="hidden" name="act" value="{{ act }}">
+                <input type="hidden" name="src" value="{{ src }}">
+                <input type="hidden" name="review" value="{{ review }}">
+                <div class="actions" style="flex-wrap:wrap;gap:6px">
+                  <input name="note" type="text" maxlength="500" value="{{ w.review_note or '' }}"
+                         placeholder="误杀说明（可选）" style="min-width:180px">
+                  <button class="ghost sm" type="submit" name="decision" value="false_positive">误杀并学习</button>
+                  <button class="danger sm" type="submit" name="decision" value="confirmed">确认违规</button>
+                </div>
+              </form>
+              {% else %}
+              <div class="faint small">AI 审核与学习属于订阅版功能</div>
+              {% endif %}
+            {% else %}
+              <span class="faint">—</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<div class="empty">没有符合条件的警告记录。</div>{% endif %}
+  <div class="hint">AI 判定记录可在本页标记“误杀并学习”，该消息会写入学习数据并在下次直接按正常消息处理；记录 ID 可用于筛选和审计。账号处置与清警告请到「成员」页操作。</div>
+</div>
+
+{# =================================================================== keywords #}
+{% elif tab == 'keywords' %}
+<div class="grid cols-2">
+  <div class="card">
+    <h2>添加关键词</h2>
+    <form method="post" action="/groups/{{ gid }}/keywords/add">
+      <label for="pattern">匹配内容</label>
+      <input id="pattern" name="pattern" type="text" required placeholder="例如：加微信 或 re:https?://\S+" maxlength="255">
+      <label class="inline" style="margin-top:12px"><input class="check" type="checkbox" name="is_regex"> 作为正则表达式</label>
+      <div class="form-grid" style="margin-top:12px">
+        <div class="field">
+          <label for="action">命中处置</label>
+          <select id="action" name="action">
+            <option value="delete">删除消息</option>
+            <option value="warn">警告</option>
+            <option value="mute">禁言</option>
+            <option value="kick">踢出</option>
+            <option value="ban">封禁</option>
+            <option value="reply">关键词回复</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="note">备注</label>
+          <input id="note" name="note" type="text" maxlength="255" placeholder="可选">
+        </div>
+      </div>
+      <label for="reply_text">关键词回复内容</label>
+      <textarea id="reply_text" name="reply_text" rows="3"
+                placeholder="选择“关键词回复”时发送，例如：请先阅读群公告，不要发布广告。"></textarea>
+      <div class="hint">仅在处置选择“关键词回复”时使用；回复不会删除原消息。</div>
+      <div class="form-actions"><button type="submit">添加关键词</button></div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>现有规则（{{ keywords|length }}）</h2>
+    {% if keywords %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>内容</th><th>类型</th><th>处置 / 回复</th><th>备注</th><th></th></tr></thead>
+        <tbody>
+        {% for k in keywords %}
+          {% set action_labels = {'delete': '删除', 'warn': '警告', 'mute': '禁言', 'kick': '踢出', 'ban': '封禁', 'reply': '回复'} %}
+          <tr>
+            <td class="mono small break">{{ k.pattern }}</td>
+            <td>{% if k.is_regex %}<span class="badge purple">正则</span>{% else %}<span class="badge">文本</span>{% endif %}</td>
+            <td>
+              <span class="badge warn">{{ action_labels.get(k.action, k.action) }}</span>
+              {% if k.action == 'reply' %}<div class="faint small">回复：{{ k.reply_text|short(48) }}</div>{% endif %}
+            </td>
+            <td class="faint small">{{ k.note|short(30) }}</td>
+            <td>
+              <form method="post" action="/groups/{{ gid }}/keywords/{{ k.id }}/delete"
+                    data-confirm="确定删除该关键词？">
+                <button class="danger sm" type="submit">删除</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">尚未配置关键词。</div>{% endif %}
+  </div>
+</div>
+
+{# ================================================================== whitelist #}
+{% elif tab == 'whitelist' %}
+<div class="grid cols-2">
+  <div class="card">
+    <h2>添加免检成员</h2>
+    <form method="post" action="/groups/{{ gid }}/whitelist/add">
+      <label for="user_id">Telegram 用户 ID</label>
+      <input id="user_id" name="user_id" type="text" inputmode="numeric" required placeholder="例如 123456789">
+      <label for="note">备注</label>
+      <input id="note" name="note" type="text" maxlength="255" placeholder="可选，例如：合作方">
+      <div class="form-actions"><button type="submit">加入白名单</button></div>
+    </form>
+    <div class="hint">白名单成员不会被反广告、关键词与刷屏规则处理。</div>
+  </div>
+
+  <div class="card">
+    <h2>白名单（{{ whitelist|length }}）</h2>
+    {% if whitelist %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>成员</th><th>备注</th><th>添加时间</th><th></th></tr></thead>
+        <tbody>
+        {% for w in whitelist %}
+          {% set m = member_map.get(w.user_id) %}
+          <tr>
+            <td>
+              {{ user_label(w.user_id, m.first_name if m else '', m.username if m else '') }}
+              <div class="faint mono small">{{ w.user_id }}</div>
+            </td>
+            <td class="faint small">{{ w.note or '—' }}</td>
+            <td class="faint nowrap">{{ w.created_at|dt }}</td>
+            <td>
+              <form method="post" action="/groups/{{ gid }}/whitelist/{{ w.id }}/delete"
+                    data-confirm="确定移出白名单？">
+                <button class="danger sm" type="submit">移除</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">白名单为空。</div>{% endif %}
+  </div>
+</div>
+
+{# =================================================================== channels #}
+{% elif tab == 'channels' %}
+<div class="grid cols-2">
+  <div class="card">
+    <h2>添加必关频道</h2>
+    <form method="post" action="/groups/{{ gid }}/channels/add">
+      <div class="form-grid">
+        <div class="field">
+          <label for="channel_id">频道 ID</label>
+          <input id="channel_id" name="channel_id" type="text" inputmode="numeric" required placeholder="-1001234567890">
+          <div class="hint">机器人需是频道管理员才能校验订阅状态。</div>
+        </div>
+        <div class="field">
+          <label for="title">展示名称</label>
+          <input id="title" name="title" type="text" maxlength="255" placeholder="例如：官方公告">
+        </div>
+        <div class="field">
+          <label for="username">频道用户名</label>
+          <input id="username" name="username" type="text" maxlength="255" placeholder="不带 @">
+        </div>
+        <div class="field">
+          <label for="invite_link">邀请链接</label>
+          <input id="invite_link" name="invite_link" type="text" maxlength="512" placeholder="https://t.me/+...">
+        </div>
+      </div>
+      <div class="form-actions"><button type="submit">保存频道</button></div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>必关频道（{{ channels|length }}）</h2>
+    {% if channels %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>频道</th><th>链接</th><th></th></tr></thead>
+        <tbody>
+        {% for c in channels %}
+          <tr>
+            <td>
+              {{ c.title or ('频道 ' ~ c.channel_id) }}
+              <div class="faint mono small">{{ c.channel_id }}{% if c.username %} · @{{ c.username }}{% endif %}</div>
+            </td>
+            <td class="small break">
+              {% if c.invite_link %}<a href="{{ c.invite_link }}" target="_blank" rel="noopener">{{ c.invite_link|short(32) }}</a>
+              {% elif c.username %}https://t.me/{{ c.username }}{% else %}—{% endif %}
+            </td>
+            <td>
+              <form method="post" action="/groups/{{ gid }}/channels/{{ c.id }}/delete"
+                    data-confirm="确定删除该必关频道？">
+                <button class="danger sm" type="submit">删除</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">尚未配置必关频道。</div>{% endif %}
+  </div>
+</div>
+
+{# ====================================================================== links #}
+{% elif tab == 'links' %}
+<div class="grid cols-2">
+  <div class="card">
+    <h2>跨群封禁联动</h2>
+    <form class="row" method="post" action="/groups/{{ gid }}/crosslinks/add" style="margin-bottom:14px">
+      <input type="text" name="other_group_id" inputmode="numeric" placeholder="联动群组 ID" style="width:200px" required>
+      <button class="ghost sm" type="submit">添加联动</button>
+    </form>
+    {% if cross_items %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>群组</th><th>添加时间</th><th></th></tr></thead>
+        <tbody>
+        {% for item in cross_items %}
+          <tr>
+            <td>
+              <a href="/groups/{{ item.other_id }}">{{ item.title or ('群组 ' ~ item.other_id) }}</a>
+              <div class="faint mono small">{{ item.other_id }}</div>
+            </td>
+            <td class="faint nowrap">{{ item.link.created_at|dt }}</td>
+            <td>
+              <form method="post" action="/groups/{{ gid }}/crosslinks/{{ item.link.id }}/delete"
+                    data-confirm="确定删除该联动？">
+                <button class="danger sm" type="submit">删除</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">尚未添加联动群组。</div>{% endif %}
+  </div>
+
+  <div class="card">
+    <h2>通报订阅者</h2>
+    <form class="row" method="post" action="/groups/{{ gid }}/reportlinks/add" style="margin-bottom:14px">
+      <input type="text" name="subscriber_id" inputmode="numeric" placeholder="接收通报的群组 ID" style="width:220px" required>
+      <button class="ghost sm" type="submit">添加订阅者</button>
+    </form>
+    {% if report_links %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>接收群组</th><th>添加时间</th><th></th></tr></thead>
+        <tbody>
+        {% for r in report_links %}
+          {% set sub = subscriber_map.get(r.subscriber_id) %}
+          <tr>
+            <td>
+              <a href="/groups/{{ r.subscriber_id }}">{{ sub.title if sub else ('群组 ' ~ r.subscriber_id) }}</a>
+              <div class="faint mono small">{{ r.subscriber_id }}</div>
+            </td>
+            <td class="faint nowrap">{{ r.created_at|dt }}</td>
+            <td>
+              <form method="post" action="/groups/{{ gid }}/reportlinks/{{ r.id }}/delete"
+                    data-confirm="确定删除该通报订阅？">
+                <button class="danger sm" type="submit">删除</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">尚未配置通报订阅者。</div>{% endif %}
+    <div class="hint">本群产生的举报会同时发送给这些群组的通报频道或管理群。</div>
+  </div>
+</div>
+
+{# ====================================================================== games #}
+{% elif tab == 'games' %}
+<div class="card">
+  <h2>积分商城</h2>
+  <form method="post" action="/groups/{{ gid }}/shop/add">
+    <div class="form-grid">
+      <div class="field">
+        <label for="name">商品名称</label>
+        <input id="name" name="name" type="text" maxlength="128" required>
+      </div>
+      <div class="field">
+        <label for="cost">所需积分</label>
+        <input id="cost" name="cost" type="number" min="0" value="10">
+      </div>
+      <div class="field">
+        <label for="stock">库存</label>
+        <input id="stock" name="stock" type="number" min="-1" value="-1">
+        <div class="hint">-1 表示不限量。</div>
+      </div>
+      <div class="field">
+        <label for="reward_type">奖励类型</label>
+        <select id="reward_type" name="reward_type">
+          <option value="custom">自定义文案</option>
+          <option value="role">身份 / 头衔</option>
+        </select>
+      </div>
+      <div class="field span-2">
+        <label for="description">商品说明</label>
+        <input id="description" name="description" type="text" maxlength="2000">
+      </div>
+      <div class="field span-2">
+        <label for="reward_text">发放内容</label>
+        <textarea id="reward_text" name="reward_text" rows="2" placeholder="兑换后私聊或群内提示的内容"></textarea>
+      </div>
+    </div>
+    <div class="form-actions"><button type="submit">上架商品</button></div>
+  </form>
+
+  {% if shop_items %}
+  <div class="table-wrap" style="margin-top:16px">
+    <table>
+      <thead><tr><th>商品</th><th class="num">积分</th><th class="num">库存</th><th>类型</th><th>范围</th><th></th></tr></thead>
+      <tbody>
+      {% for item in shop_items %}
+        <tr>
+          <td>{{ item.name }}<div class="faint small">{{ item.description|short(50) }}</div></td>
+          <td class="num">{{ item.cost }}</td>
+          <td class="num">{{ '不限' if item.stock < 0 else item.stock }}</td>
+          <td><span class="badge">{{ item.reward_type }}</span></td>
+          <td>{% if item.group_id %}<span class="badge info">本群</span>{% else %}<span class="badge purple">全局</span>{% endif %}</td>
+          <td>
+            {% if item.group_id == gid %}
+            <form method="post" action="/groups/{{ gid }}/shop/{{ item.id }}/delete"
+                  data-confirm="确定删除该商品？">
+              <button class="danger sm" type="submit">删除</button>
+            </form>
+            {% else %}<span class="faint small">—</span>{% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<div class="empty">商城还没有商品。</div>{% endif %}
+</div>
+
+<div class="grid cols-2">
+  <div class="card">
+    <h2>积分红包</h2>
+    {% if packets %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>发送者</th><th class="num">总额</th><th class="num">剩余</th><th>状态</th><th>创建时间</th></tr></thead>
+        <tbody>
+        {% for p in packets %}
+          <tr>
+            <td class="mono small">{{ p.sender_id }}</td>
+            <td class="num">{{ p.total }}</td>
+            <td class="num">{{ p.remaining_amount }} / {{ p.remaining_count }}</td>
+            <td>
+              {% if p.status == 'open' %}<span class="badge ok">进行中</span>
+              {% elif p.status == 'finished' %}<span class="badge">已领完</span>
+              {% else %}<span class="badge bad">{{ p.status }}</span>{% endif %}
+            </td>
+            <td class="faint nowrap">{{ p.created_at|dt }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">暂无红包记录。</div>{% endif %}
+  </div>
+
+  <div class="card">
+    <h2>抽奖</h2>
+    {% if lotteries %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>活动</th><th class="num">费用</th><th class="num">名额</th><th>状态</th><th>开奖时间</th></tr></thead>
+        <tbody>
+        {% for l in lotteries %}
+          <tr>
+            <td>{{ l.title }}<div class="faint small">{{ l.prize|short(36) }}</div></td>
+            <td class="num">{{ l.entry_fee or 0 }}</td>
+            <td class="num">{{ l.winners_count or 1 }}</td>
+            <td>
+              {% if l.status == 'open' %}<span class="badge ok">进行中</span>
+              {% elif l.status == 'drawn' %}<span class="badge info">已开奖</span>
+              {% else %}<span class="badge">{{ l.status }}</span>{% endif %}
+            </td>
+            <td class="faint nowrap">{{ l.ends_at|dt }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">暂无抽奖记录。</div>{% endif %}
+  </div>
+
+  <div class="card">
+    <h2>竞拍</h2>
+    {% if auctions %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>拍品</th><th class="num">当前价</th><th>领先者</th><th>状态</th><th>结束时间</th></tr></thead>
+        <tbody>
+        {% for a in auctions %}
+          <tr>
+            <td>{{ a.item }}<div class="faint small">起拍 {{ a.start_price }} · 加价 {{ a.step }}</div></td>
+            <td class="num">{{ a.current_price or 0 }}</td>
+            <td class="mono small">{{ a.current_bidder or '—' }}</td>
+            <td>
+              {% if a.status == 'open' %}<span class="badge ok">进行中</span>
+              {% elif a.status == 'finished' %}<span class="badge info">已成交</span>
+              {% else %}<span class="badge">{{ a.status }}</span>{% endif %}
+            </td>
+            <td class="faint nowrap">{{ a.ends_at|dt }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">暂无竞拍记录。</div>{% endif %}
+  </div>
+</div>
+
+{# ======================================================================= logs #}
+{% elif tab == 'logs' %}
+<div class="card">
+  <div class="spread">
+    <h2>管理日志</h2>
+    <span class="faint small">最近 200 条</span>
+  </div>
+  {% if logs %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>时间</th><th>动作</th><th>操作者</th><th>目标</th><th>详情</th></tr></thead>
+      <tbody>
+      {% for log in logs %}
+        <tr>
+          <td class="faint nowrap">{{ log.created_at|dt }}</td>
+          <td><span class="badge">{{ log.action }}</span></td>
+          <td class="mono small">{{ log.admin_id or '系统' }}</td>
+          <td class="mono small">{{ log.target_id or '—' }}</td>
+          <td class="small">{{ log.detail or '—' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<div class="empty">暂无管理日志。</div>{% endif %}
+</div>
+
+{# ==================================================================== reports #}
+{% elif tab == 'reports' %}
+<div class="card">
+  <h2>举报记录</h2>
+  {% if reports %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>时间</th><th>举报人</th><th>被举报人</th><th>原因</th><th>内容摘录</th><th>消息</th><th></th></tr></thead>
+      <tbody>
+      {% for r in reports %}
+        <tr>
+          <td class="faint nowrap">{{ r.created_at|dt }}</td>
+          <td class="mono small">{{ r.reporter_id }}</td>
+          <td class="mono small">{{ r.target_user_id or '—' }}</td>
+          <td>{{ r.reason or '—' }}</td>
+          <td class="small">{{ r.excerpt|short(56) }}</td>
+          <td class="mono small">{{ r.message_id or '—' }}</td>
+          <td>
+            <form method="post" action="/reports/{{ r.id }}/delete" data-confirm="确定删除该举报记录？">
+              <button class="danger sm" type="submit">删除</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<div class="empty">暂无举报记录。</div>{% endif %}
+</div>
+{% endif %}
+{% endblock %}

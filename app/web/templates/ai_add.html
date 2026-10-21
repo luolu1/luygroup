@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}添加 AI 供应商{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">AI PROVIDERS · ADD</div>
+    <h1>添加供应商与模型</h1>
+    <div class="muted small">选择供应商模板后自动填入接口地址，再获取该供应商的模型列表并选择。</div>
+  </div>
+  <a class="btn ghost sm" href="/ai">← 返回接口列表</a>
+</div>
+
+<div class="card">
+  <form method="post" action="/ai/providers/add" class="provider-form">
+    <div class="form-grid">
+      <div class="field">
+        <label for="provider_preset">供应商模板</label>
+        <select id="provider_preset" data-preset>
+          {% for preset in presets %}
+          <option value="{{ preset.id }}" data-base-url="{{ preset.base_url }}"
+                  data-models="{{ preset.models|join('|') }}" data-hint="{{ preset.hint }}">{{ preset.label }}</option>
+          {% endfor %}
+        </select>
+        <div class="hint" data-preset-hint>选择供应商后会自动填入接口地址，并可拉取该供应商的模型列表。</div>
+      </div>
+      <div class="field">
+        <label for="name">唯一名称</label>
+        <input id="name" name="name" type="text" maxlength="64" required placeholder="例如 deepseek-main">
+        <div class="hint">仅用于内部标识，不能重复。</div>
+      </div>
+      <div class="field">
+        <label for="label">显示名称</label>
+        <input id="label" name="label" type="text" maxlength="128" placeholder="例如 DeepSeek 主接口">
+      </div>
+      <div class="field">
+        <label for="api_key">API Key</label>
+        <input id="api_key" name="api_key" type="password" maxlength="512" placeholder="sk-..." data-api-key>
+      </div>
+      <div class="field span-2">
+        <label for="base_url">接口地址（OpenAI 兼容）</label>
+        <input id="base_url" name="base_url" type="text" maxlength="512" required
+               placeholder="https://api.deepseek.com/v1" data-base-url>
+        <div class="hint">可以省略协议：例如 <code>vyceai.com/v1</code> 会自动补全为 <code>https://vyceai.com/v1</code>。</div>
+      </div>
+      <div class="field span-2">
+        <label for="model">模型</label>
+        <div class="row">
+          <input id="model" name="model" type="text" maxlength="128" required
+                 placeholder="deepseek-chat" style="flex:1;min-width:220px" data-model>
+          <button type="button" class="ghost sm" data-fetch-models>获取供应商模型</button>
+        </div>
+        <select data-model-select style="margin-top:8px;display:none"></select>
+        <div class="hint" data-model-status>也可以直接手动填写模型 ID。</div>
+      </div>
+      <div class="field">
+        <label for="priority">优先级</label>
+        <input id="priority" name="priority" type="number" min="0" max="100000" value="100">
+        <div class="hint">数值越小越优先。</div>
+      </div>
+      <div class="field">
+        <label>状态</label>
+        <label class="inline"><input class="check" type="checkbox" name="enabled" checked> 启用</label>
+      </div>
+    </div>
+    <div class="form-actions">
+      <button type="submit">添加接口</button>
+      <a class="btn ghost" href="/ai">取消</a>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>调用说明</h2>
+  <div class="kv">
+    <span class="k">请求超时</span><span>{{ defaults.timeout }} 秒</span>
+    <span class="k">上下文消息</span><span>{{ defaults.max_context_messages }} 条</span>
+  </div>
+  <div class="divider"></div>
+  <div class="alert">
+    所有接口均为 OpenAI 兼容的 <code>/chat/completions</code> 格式。模型可以通过“获取供应商模型”选择，也可以手动填写；添加后可在接口列表里继续切换供应商与模型。
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="/static/ai.js?v=20261020-7"></script>
+{% endblock %}

@@ -1,0 +1,49 @@
+{
+  "bot": {
+    "token": "123456789:REPLACE_WITH_YOUR_BOT_TOKEN",
+    "admin_ids": [123456789],
+    "username": "",
+    "proxy": ""
+  },
+  "web": {
+    "host": "0.0.0.0",
+    "port": 8090,
+    "secret_key": "CHANGE_ME_TO_A_LONG_RANDOM_STRING",
+    "password": "CHANGE_ME_PANEL_PASSWORD",
+    "base_url": "http://127.0.0.1:8090",
+    "session_max_age": 86400
+  },
+  "database": {
+    "url": "sqlite+aiosqlite:///./data/groupguard.db"
+  },
+  "defaults": {
+    "warn_limit": 3,
+    "warn_action": "mute",
+    "mute_minutes": 60,
+    "flood_limit": 8,
+    "flood_window": 10,
+    "flood_action": "mute",
+    "ai_daily_quota": 200,
+    "sample_daily_quota": 500,
+    "points_per_message": 1,
+    "points_cooldown": 60,
+    "daily_bonus": 5
+  },
+  "ai": {
+    "timeout": 25,
+    "max_context_messages": 8,
+    "learning_dir": "data/ai_learning",
+    "providers": [
+      {
+        "name": "builtin",
+        "label": "内置接口（OpenAI 兼容）",
+        "base_url": "https://api.openai.com/v1",
+        "api_key": "",
+        "model": "gpt-4o-mini",
+        "priority": 100,
+        "enabled": false,
+        "builtin": true
+      }
+    ]
+  }
+}

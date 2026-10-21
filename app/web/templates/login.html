@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css">
+  <title>登录 · GroupGuard</title>
+</head>
+<body>
+  <div class="login-wrap">
+    <form class="login-card" method="post" action="/login" autocomplete="off">
+      <div class="logo">🛡</div>
+      <h1>GroupGuard 控制台</h1>
+      <p class="sub">使用专属控制台地址中的 Token 登录。</p>
+
+      {% if error %}<div class="banner err">{{ error }}</div>{% endif %}
+
+      <label for="token">控制台 Token</label>
+      <input id="token" name="token" type="password" placeholder="粘贴控制台 Token" required autofocus>
+
+      <input type="hidden" name="next" value="{{ next_url|default('') }}">
+
+      <button type="submit">进入控制台</button>
+      <p class="hint" style="text-align:center;margin-top:16px">
+         请使用管理员创建的随机控制台地址登录；Token 可随时撤销。
+      </p>
+    </form>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

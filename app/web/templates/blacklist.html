@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+{% block title %}全局黑名单{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">GLOBAL BLACKLIST</div>
+    <h1>全局黑名单</h1>
+    <div class="muted small">平台通用记录作用于所有群组；订阅用户添加的记录只作用于自己绑定的群组。</div>
+  </div>
+  <form class="row" method="get" action="/blacklist">
+    <input type="search" name="q" value="{{ q }}" placeholder="用户 ID 或原因" style="min-width:200px">
+    <button class="ghost" type="submit">搜索</button>
+    {% if q %}<a class="btn ghost sm" href="/blacklist">清空</a>{% endif %}
+  </form>
+</div>
+
+<div class="grid cols-2">
+  <div class="card">
+    <h2>加入黑名单</h2>
+    <form method="post" action="/blacklist/add">
+      <label for="user_id">Telegram 用户 ID</label>
+      <input id="user_id" name="user_id" type="text" inputmode="numeric" required placeholder="例如 123456789">
+      <label for="reason">原因</label>
+      <input id="reason" name="reason" type="text" maxlength="500" placeholder="例如：跨群广告 / 诈骗">
+      <div class="form-actions"><button type="submit">加入黑名单</button></div>
+    </form>
+    <div class="hint">同一用户重复提交时会覆盖原因，不会产生重复记录。平台通用记录仅超级管理员可修改。</div>
+  </div>
+
+  <div class="card tight">
+    <h2>处理逻辑</h2>
+    <div class="kv">
+      <span class="k">拦截时机</span><span>成员进群事件</span>
+      <span class="k">执行动作</span><span>立即踢出并记录日志</span>
+      <span class="k">适用范围</span><span>平台通用记录：所有群组；个人记录：自己绑定的群组</span>
+    </div>
+    <div class="alert" style="margin-top:14px">
+      黑名单与各群白名单互不冲突：白名单只影响本群风控，不会解除黑名单拦截。请谨慎添加。
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="spread">
+    <h2>名单记录（{{ entries|length }}）</h2>
+    <span class="faint small">最多显示 300 条</span>
+  </div>
+  {% if entries %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>用户 ID</th><th>原因</th><th>范围</th><th>添加者</th><th>添加时间</th><th></th></tr></thead>
+      <tbody>
+      {% for e in entries %}
+        <tr>
+          <td>
+            <button type="button" class="btn ghost sm mono" data-copy="{{ e.user_id }}">{{ e.user_id }}</button>
+          </td>
+          <td>{{ e.reason or '—' }}</td>
+          <td>{% if e.owner_user_id is none %}<span class="badge">平台通用</span>{% else %}<span class="badge ok">个人</span>{% endif %}</td>
+          <td class="mono small">{{ e.added_by or '—' }}</td>
+          <td class="faint nowrap">{{ e.created_at|dt }}</td>
+          <td>
+            {% if ent.is_superadmin or (ent.user and e.owner_user_id == ent.user.id) %}
+            <form method="post" action="/blacklist/{{ e.id }}/delete"
+                  data-confirm="确定将用户 {{ e.user_id }} 移出黑名单？">
+              <button class="danger sm" type="submit">移除</button>
+            </form>
+            {% else %}
+            <span class="faint small">只读</span>
+            {% endif %}
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">{% if q %}没有匹配「{{ q }}」的记录。{% else %}全局黑名单为空。{% endif %}</div>
+  {% endif %}
+</div>
+{% endblock %}

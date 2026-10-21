@@ -1,0 +1,156 @@
+{% extends "base.html" %}
+{% block title %}总览{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">OVERVIEW</div>
+    <h1>控制台总览</h1>
+    <div class="muted small">群组、成员与今日风控情况一览。</div>
+  </div>
+  <div class="row">
+    <a class="btn ghost sm" href="/groups">群组列表</a>
+    {% if can('stats_global') %}<a class="btn ghost sm" href="/stats">数据统计</a>{% endif %}
+  </div>
+</div>
+
+<div class="grid cols-4">
+  <div class="stat" style="--c: var(--accent)">
+    <div class="ic">👥</div>
+    <div class="num">{{ groups_total }}</div>
+    <div class="lbl">已记录群组 · 活跃 {{ active_groups }}</div>
+  </div>
+  <div class="stat" style="--c: var(--accent-2)">
+    <div class="ic">🧑</div>
+    <div class="num">{{ members_total }}</div>
+    <div class="lbl">成员档案数</div>
+  </div>
+  <div class="stat" style="--c: var(--accent-3)">
+    <div class="ic">💬</div>
+    <div class="num">{{ messages_total }}</div>
+    <div class="lbl">累计消息数</div>
+  </div>
+  <div class="stat" style="--c: var(--warn)">
+    <div class="ic">⚠️</div>
+    <div class="num">{{ warnings_total }}</div>
+    <div class="lbl">生效中的警告</div>
+  </div>
+</div>
+
+<div class="grid cols-4" style="margin-top:15px">
+  <div class="stat">
+    <div class="lbl">📨 今日消息</div>
+    <div class="num">{{ today_messages }}</div>
+  </div>
+  <div class="stat">
+    <div class="lbl">🚪 今日进群</div>
+    <div class="num">{{ today_joins }}</div>
+  </div>
+  <div class="stat">
+    <div class="lbl">🔨 今日封禁</div>
+    <div class="num">{{ today_bans }}</div>
+  </div>
+  <div class="stat">
+    <div class="lbl">🤖 今日 AI 请求</div>
+    <div class="num">{{ today_ai }}</div>
+  </div>
+</div>
+
+<div class="grid cols-2" style="margin-top:18px">
+  <div class="card">
+    <div class="spread">
+      <h2>近 14 天消息量</h2>
+      <span class="badge info">今日 AI 命中 {{ today_hits }}</span>
+    </div>
+    <div class="chart-wrap">
+      <div class="chart">
+        {% for p in series %}
+        <div class="col" title="{{ p.day }} · 消息 {{ p.messages }} · 进群 {{ p.joins }} · 封禁 {{ p.bans }} · AI {{ p.ai }}">
+          <div class="cnt">{{ p.messages or '' }}</div>
+          <div class="bar" style="height: {{ ((p.messages / max_messages) * 100)|round(1) }}%"></div>
+          <div class="cap">{{ p.label }}</div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>风险与举报</h2>
+    <div class="kv">
+      {% if can('global_blacklist') %}<span class="k">全局黑名单</span><span>{{ blacklist_total }} 人</span>{% endif %}
+      {% if can('reports') %}<span class="k">举报记录</span><span>{{ reports_total }} 条</span>{% endif %}
+      <span class="k">今日 AI 命中</span><span>{{ today_hits }} 次</span>
+      <span class="k">活跃群组</span><span>{{ active_groups }} / {{ groups_total }}</span>
+    </div>
+    {% if can('global_blacklist') or can('reports') %}
+    <div class="divider"></div>
+    <div class="row">
+      {% if can('global_blacklist') %}<a class="btn ghost sm" href="/blacklist">管理全局黑名单</a>{% endif %}
+      {% if can('reports') %}<a class="btn ghost sm" href="/reports">查看举报</a>{% endif %}
+    </div>
+    {% endif %}
+    {% if can('ai') %}
+    <div class="alert" style="margin-top:16px">
+      提示：AI 广告检测与闲聊默认关闭，请在群组的「AI」标签内按需开启并配置每日额度。
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="grid cols-2" style="margin-top:18px">
+  <div class="card">
+    <div class="spread">
+      <h2>最近活跃群组</h2>
+      <a class="small" href="/groups">全部 →</a>
+    </div>
+    {% if recent_groups %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>群组</th><th>成员</th><th>消息</th><th>更新</th></tr></thead>
+        <tbody>
+        {% for g in recent_groups %}
+          <tr>
+            <td>
+              <a href="/groups/{{ g.id }}">{{ g.title or ('群组 ' ~ g.id) }}</a>
+              <div class="faint mono small">{{ g.id }}{% if g.username %} · @{{ g.username }}{% endif %}</div>
+            </td>
+            <td class="num">{{ g.member_count or 0 }}</td>
+            <td class="num">{{ g.message_count or 0 }}</td>
+            <td class="faint nowrap">{{ g.updated_at|dt }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="empty">还没有群组记录。把机器人拉进群并发送一条消息即可自动登记。</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="spread">
+      <h2>最近管理日志</h2>
+      <span class="faint small">最新 10 条</span>
+    </div>
+    {% if recent_logs %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>动作</th><th>群组</th><th>操作者</th></tr></thead>
+        <tbody>
+        {% for log in recent_logs %}
+          <tr>
+            <td class="faint nowrap">{{ log.created_at|dt }}</td>
+            <td><span class="badge">{{ log.action }}</span> <span class="faint small">{{ log.detail|short(36) }}</span></td>
+            <td class="mono small">{{ log.group_id }}</td>
+            <td class="mono small">{{ log.admin_id or '—' }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+    <div class="empty">暂无管理日志。</div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

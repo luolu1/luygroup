@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}举报与通报{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">REPORTS</div>
+    <h1>举报与通报</h1>
+    <div class="muted small">成员举报记录，以及跨群通报的投递情况。</div>
+  </div>
+  <form method="get" action="/reports">
+    <select name="group_id" onchange="this.form.submit()" style="min-width:200px">
+      <option value="">全部群组</option>
+      {% for g in all_groups %}
+      <option value="{{ g.id }}" {% if group_id == g.id %}selected{% endif %}>{{ g.title or g.id }}</option>
+      {% endfor %}
+    </select>
+  </form>
+</div>
+
+<div class="card">
+  <div class="spread">
+    <h2>举报记录（{{ reports|length }}）</h2>
+    <span class="faint small">最多显示 300 条</span>
+  </div>
+  {% if reports %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>时间</th>
+          <th>群组</th>
+          <th>举报人</th>
+          <th>被举报人</th>
+          <th>原因</th>
+          <th>内容摘录</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for r in reports %}
+        {% set g = group_map.get(r.group_id) %}
+        <tr>
+          <td class="faint nowrap">{{ r.created_at|dt }}</td>
+          <td>
+            <a href="/groups/{{ r.group_id }}?tab=reports">{{ g.title if g else r.group_id }}</a>
+          </td>
+          <td class="mono small">{{ r.reporter_id }}</td>
+          <td class="mono small">{{ r.target_user_id or '—' }}</td>
+          <td>{{ r.reason or '—' }}</td>
+          <td class="small">{{ r.excerpt|short(70) }}</td>
+          <td>
+            <form method="post" action="/reports/{{ r.id }}/delete"
+                  data-confirm="确定删除该举报记录？">
+              <button class="danger sm" type="submit">删除</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">暂无举报记录。成员可回复违规消息并发送 <code>/report 原因</code>。</div>
+  {% endif %}
+</div>
+
+<div class="card tight">
+  <h2>通报配置</h2>
+  <div class="small muted" style="line-height:1.9">
+    在群组的「联动与通报」标签中可以添加通报订阅者：本群产生的举报会发送给这些群组。
+    目标群组需要开启「接收他人通报」，或由系统在添加订阅关系时自动开启。
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,113 @@
+{% extends "base.html" %}
+{% block title %}数据统计{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">ANALYTICS</div>
+    <h1>数据统计</h1>
+    <div class="muted small">近 {{ days }} 天的群组活跃、风控与 AI 命中分析。</div>
+  </div>
+  <a class="btn ghost sm" href="/">返回总览</a>
+</div>
+
+<div class="grid cols-4">
+  <div class="stat" style="--c: var(--accent)">
+    <div class="lbl">累计消息</div>
+    <div class="num">{{ total_messages }}</div>
+  </div>
+  <div class="stat" style="--c: var(--accent-2)">
+    <div class="lbl">进群 / 退群</div>
+    <div class="num">{{ total_joins }} <span class="faint" style="font-size:15px">/ {{ total_leaves }}</span></div>
+  </div>
+  <div class="stat" style="--c: var(--danger)">
+    <div class="lbl">封禁次数</div>
+    <div class="num">{{ total_bans }}</div>
+  </div>
+  <div class="stat" style="--c: var(--accent-3)">
+    <div class="lbl">AI 请求</div>
+    <div class="num">{{ ai_requests }}</div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:18px">
+  <div class="spread">
+    <h2>消息趋势</h2>
+    <span class="badge info">AI 命中 {{ ai_hits }} · 抽样 {{ ai_samples }}</span>
+  </div>
+  <div class="chart-wrap">
+    <div class="chart" style="min-height:180px">
+      {% for p in series %}
+      <div class="col" title="{{ p.day }} · 消息 {{ p.messages }} · 进群 {{ p.joins }} · 退群 {{ p.leaves }} · 封禁 {{ p.bans }} · AI {{ p.ai }} · 命中 {{ p.hits }}">
+        <div class="cnt">{{ p.messages or '' }}</div>
+        <div class="bar" style="height: {{ ((p.messages / max_messages) * 100)|round(1) }}%"></div>
+        <div class="cap">{{ p.label }}</div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<div class="grid cols-2">
+  <div class="card">
+    <h2>活跃群组 Top 10</h2>
+    {% if top_rows %}
+    {% set top_max = (top_rows|map(attribute='messages')|max) or 1 %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>群组</th><th class="num">消息</th><th style="width:42%">占比</th></tr></thead>
+        <tbody>
+        {% for row in top_rows %}
+          <tr>
+            <td>
+              <a href="/groups/{{ row.group.id }}">{{ row.group.title or row.group.id }}</a>
+              <div class="faint mono small">{{ row.group.id }}</div>
+            </td>
+            <td class="num">{{ row.messages }}</td>
+            <td>
+              <div class="progress"><span style="width: {{ ((row.messages / top_max) * 100)|round(1) }}%"></span></div>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">暂无群组统计。</div>{% endif %}
+  </div>
+
+  <div class="card">
+    <h2>命中来源分析</h2>
+    {% if sources %}
+    {% set source_max = (sources|map(attribute='count')|max) or 1 %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>来源</th><th class="num">次数</th><th style="width:42%">占比</th></tr></thead>
+        <tbody>
+        {% for s in sources %}
+          <tr>
+            <td>
+              {% if s.source == 'ai' %}<span class="badge purple">AI</span>
+              {% elif s.source == 'builtin' %}<span class="badge info">内置规则</span>
+              {% elif s.source == 'keyword' %}<span class="badge warn">关键词</span>
+              {% elif s.source == 'flood' %}<span class="badge bad">刷屏</span>
+              {% else %}<span class="badge">{{ s.source }}</span>{% endif %}
+            </td>
+            <td class="num">{{ s.count }}</td>
+            <td>
+              <div class="progress"><span style="width: {{ ((s.count / source_max) * 100)|round(1) }}%"></span></div>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">暂无命中记录。</div>{% endif %}
+    <div class="divider"></div>
+    <div class="kv">
+      <span class="k">总命中次数</span><span>{{ total_hits }}</span>
+      <span class="k">AI 请求</span><span>{{ ai_requests }}</span>
+      <span class="k">AI 命中</span><span>{{ ai_hits }}</span>
+      <span class="k">样本拦截</span><span>{{ ai_samples }}</span>
+    </div>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css?v=20261020-6">
+  <title>{% block title %}控制台{% endblock %} · GroupGuard</title>
+</head>
+<body>
+  {% set path = request.url.path %}
+  <header class="top">
+    <a class="brand" href="/">
+      <span class="logo">🛡</span>
+      <span>GroupGuard</span>
+      <span class="tag">GROUP·GUARD</span>
+    </a>
+    <nav>
+      <a href="/" class="{% if path == '/' %}active{% endif %}">总览</a>
+      <a href="/groups" class="{% if path.startswith('/groups') %}active{% endif %}">群组</a>
+      {% if can('ai_providers') %}<a href="/ai" class="{% if path.startswith('/ai') %}active{% endif %}">AI 接口</a>{% endif %}
+      {% if can('global_blacklist') %}<a href="/blacklist" class="{% if path == '/blacklist' %}active{% endif %}">黑名单</a>{% endif %}
+      {% if can('reports') %}<a href="/reports" class="{% if path == '/reports' %}active{% endif %}">通报</a>{% endif %}
+      {% if can('stats_global') %}<a href="/stats" class="{% if path == '/stats' %}active{% endif %}">统计</a>{% endif %}
+      {% if ent and ent.is_superadmin %}<a href="/users" class="{% if path.startswith('/users') %}active{% endif %}">用户</a>{% endif %}
+      <span class="ident hide-sm" title="{{ console_user.telegram_id if console_user else '' }}">{{ role_label }}{% if ent and ent.display_name %} · {{ ent.display_name }}{% endif %}</span>
+      <a href="/logout" class="ident">退出</a>
+    </nav>
+  </header>
+
+  <main>
+    {% set flash_msg = request.query_params.get('msg') %}
+    {% set flash_err = request.query_params.get('err') %}
+    {% if flash_msg %}
+    <div class="banner ok">{{ flash_msg }}<span class="faint" data-dismiss style="float:right;cursor:pointer">✕</span></div>
+    {% endif %}
+    {% if flash_err %}
+    <div class="banner err">{{ flash_err }}<span class="faint" data-dismiss style="float:right;cursor:pointer">✕</span></div>
+    {% endif %}
+
+    {% block content %}{% endblock %}
+  </main>
+
+  <script src="/static/app.js?v=20261020-6"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

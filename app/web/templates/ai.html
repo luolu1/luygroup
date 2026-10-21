@@ -1,0 +1,306 @@
+{% extends "base.html" %}
+{% block title %}AI 接口{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">AI PROVIDERS</div>
+    <h1>AI 接口与用量</h1>
+    <div class="muted small">按供应商选择接口、拉取模型并自由切换；优先 / 备用接口按优先级自动回退。</div>
+  </div>
+  <div class="actions">
+    <a class="btn sm" href="/ai/add">＋ 添加供应商与模型</a>
+    <a class="btn ghost sm" href="/stats">查看统计</a>
+  </div>
+</div>
+
+<div class="grid cols-2">
+  <div class="card">
+    <h2>调用说明</h2>
+    <div class="kv">
+      <span class="k">请求超时</span><span>{{ defaults.timeout }} 秒</span>
+      <span class="k">上下文消息</span><span>{{ defaults.max_context_messages }} 条</span>
+      <span class="k">接口数量</span><span>{{ providers|length }}</span>
+    </div>
+    <div class="divider"></div>
+    <div class="alert">
+      所有接口均为 OpenAI 兼容的 <code>/chat/completions</code> 格式。接口按优先级升序尝试，失败自动切换；全部失败时跳过 AI 判断，不影响本地规则。
+    </div>
+    <div class="small muted" style="line-height:1.9">
+      • AI 广告检测：仅在本地规则无法确定时抽样。<br>
+      • AI 管理助理：管理员在群内使用 <code>/ask</code>。<br>
+      • AI 闲聊：可在每个群组单独关闭。<br>
+      • 供应商模板只负责填入地址，模型可以随时切换。
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="spread">
+      <h2>AI 学习数据</h2>
+      <span class="faint small">长期保存 · 不按时间自动过期</span>
+    </div>
+    <div class="kv">
+      {% if ent and ent.is_superadmin %}
+      <span class="k">存储目录</span><span class="mono small break">{{ learning.directory }}</span>
+      {% endif %}
+      <span class="k">已学习条目</span><span>{{ learning.entries }}</span>
+      <span class="k">累计命中</span><span>{{ learning.hits }}</span>
+      <span class="k">分类</span>
+      <span>
+        {% for kind, count in learning.by_kind.items() %}
+        <span class="badge info">{{ kind }} {{ count }}</span>
+        {% else %}<span class="faint">暂无</span>{% endfor %}
+      </span>
+    </div>
+    {% if ent and ent.is_superadmin %}
+    <form method="post" action="/ai/learning/dir" style="margin-top:14px">
+      <label for="learning_dir">存储目录（服务器路径）</label>
+      <div class="actions" style="align-items:stretch">
+        <input id="learning_dir" name="directory" type="text" required
+               value="{{ learning.directory }}" class="mono"
+               placeholder="/opt/groupguard/data/ai_learning" style="flex:1;min-width:240px">
+        <button class="ghost sm" type="submit">保存目录</button>
+      </div>
+      <div class="hint">可填写绝对路径，或相对项目目录的路径。更换目录时会自动迁移现有 JSONL 学习文件。</div>
+    </form>
+    {% endif %}
+    <div class="alert">
+      成功调用 AI 后，相同广告或问题会优先从本地学习数据返回，不再消耗 token。学习数据按群组和内容精确匹配，不会按时间自动过期，可作为机器人的长期训练数据。
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="spread">
+    <h2>接口列表</h2>
+    <span class="faint small">按优先级排序 · 卡片内可直接切换供应商与模型</span>
+  </div>
+  {% if providers %}
+  <div class="provider-list">
+    {% for p in providers %}
+    {% set preset = provider_preset(p.base_url) %}
+    <div class="provider-item">
+      <div class="provider-head">
+        <div class="provider-title">
+          <strong>{{ p.label or p.name }}</strong>
+          {% if p.builtin or not p.owner_user_id %}
+          <span class="badge info">系统内置</span>
+          {% elif owner_map.get(p.owner_user_id) %}
+          <span class="badge">用户 · {{ owner_map[p.owner_user_id].display_name or owner_map[p.owner_user_id].id }}</span>
+          {% else %}
+          <span class="badge">用户 #{{ p.owner_user_id }}</span>
+          {% endif %}
+          {% if not provider_editable(p) %}<span class="badge">只读</span>{% endif %}
+        </div>
+        <div class="provider-tools">
+          <form method="post" action="/ai/providers/{{ p.id }}/test">
+            <button class="provider-action" type="submit">测试连通</button>
+          </form>
+          {% if provider_editable(p) %}
+          <form method="post" action="/ai/providers/{{ p.id }}/delete"
+                data-confirm="确定删除接口 {{ p.name }}？">
+            <button class="provider-action danger" type="submit">删除</button>
+          </form>
+          <button type="button" class="provider-action accent" data-edit-toggle="provider-edit-{{ p.id }}"
+                  aria-expanded="false" aria-controls="provider-edit-{{ p.id }}">编辑</button>
+          {% endif %}
+          <span class="badge">优先级 {{ p.priority }}</span>
+          {% if provider_editable(p) %}
+          <form method="post" action="/ai/providers/{{ p.id }}/update" class="provider-switch-form">
+            <label class="provider-switch" title="{{ '已启用，点击停用' if p.enabled else '已停用，点击启用' }}">
+              <input type="checkbox" name="enabled" value="on" {% if p.enabled %}checked{% endif %}
+                     data-auto-submit aria-label="启用或停用接口">
+              <span class="provider-switch-track"><span class="provider-switch-thumb"></span></span>
+            </label>
+          </form>
+          {% else %}
+          <span class="badge {{ 'ok' if p.enabled else '' }}">{{ '启用' if p.enabled else '停用' }}</span>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="provider-meta">
+        {% if ent and ent.is_superadmin %}
+        <div class="provider-fact provider-url">
+          <span class="fact-label">接口</span>
+          <span class="mono provider-url-text" title="{{ p.base_url or '未配置' }}">{{ p.base_url or '—' }}</span>
+        </div>
+        {% endif %}
+        <div class="provider-fact">
+          <span class="fact-label">Key</span>
+          {% if p.api_key %}
+          <span class="badge ok"><span class="dot"></span>已配置</span>
+          {% else %}
+          <span class="badge bad"><span class="dot"></span>未配置</span>
+          {% endif %}
+        </div>
+        {% if provider_editable(p) %}
+        <form method="post" action="/ai/providers/{{ p.id }}/update" class="quick-control">
+          {% if p.enabled %}<input type="hidden" name="enabled" value="on">{% endif %}
+          <span class="quick-label">供应商</span>
+          <select name="base_url" data-auto-submit title="选择后立即保存供应商">
+            {% if not preset %}
+            <option value="{{ p.base_url or '' }}" selected>自定义（当前地址）</option>
+            {% endif %}
+            {% for item in presets if item.base_url %}
+            <option value="{{ item.base_url }}" {% if preset and item.id == preset.id %}selected{% endif %}>{{ item.label }}</option>
+            {% endfor %}
+          </select>
+        </form>
+        {% set models = preset.models if preset else [] %}
+        <form method="post" action="/ai/providers/{{ p.id }}/update"
+              class="quick-control quick-model" data-model-form
+              data-provider-id="{{ p.id }}"
+              data-base-url="{{ p.base_url or '' }}"
+              data-fallback="{% if p.model and p.model not in models %}{{ p.model }}|{% endif %}{{ models|join('|') }}">
+          {% if p.enabled %}<input type="hidden" name="enabled" value="on">{% endif %}
+          <span class="quick-label">模型</span>
+          <input type="hidden" name="model" value="{{ p.model or '' }}" data-model-value>
+          <div class="quick-model-picker" data-model-picker>
+            <button type="button" class="quick-model-trigger" data-model-trigger
+                    aria-haspopup="listbox" aria-expanded="false"
+                    aria-controls="model-menu-{{ p.id }}"
+                    title="点击获取并选择模型，也可手动输入">
+              <span class="quick-model-current" data-model-current
+                    title="{{ p.model or '选择模型' }}">{{ p.model or '选择模型' }}</span>
+              <svg class="quick-model-caret" viewBox="0 0 24 24" width="12" height="12"
+                   fill="none" stroke="currentColor" stroke-width="2"
+                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="m6 9 6 6 6-6"></path>
+              </svg>
+            </button>
+            <div class="quick-model-menu" id="model-menu-{{ p.id }}" data-model-menu hidden>
+              <div class="quick-model-loading" data-model-loading>正在获取模型…</div>
+              <input type="text" class="quick-model-search" data-model-search
+                     placeholder="搜索或输入自定义模型" autocomplete="off"
+                     spellcheck="false" aria-label="搜索或输入模型">
+              <div class="quick-model-list" role="listbox" data-model-list></div>
+              <div class="quick-model-empty" data-model-empty hidden>暂无可选模型</div>
+              <div class="quick-model-error" data-model-error hidden></div>
+              <div class="quick-model-footer">
+                <button type="button" class="quick-model-refresh" data-model-refresh>↻ 重新获取</button>
+                <span class="quick-model-hint">回车应用自定义名称</span>
+              </div>
+            </div>
+          </div>
+        </form>
+        {% else %}
+        <div class="provider-fact">
+          <span class="fact-label">模型</span>
+          <span class="mono small">{{ p.model or '—' }}</span>
+        </div>
+        {% endif %}
+      </div>
+
+      {% if provider_editable(p) %}
+      <div class="provider-edit-panel" id="provider-edit-{{ p.id }}" hidden>
+        <form method="post" action="/ai/providers/{{ p.id }}/update" class="provider-form"
+              data-provider-id="{{ p.id }}">
+          <div class="form-grid">
+            <div class="field">
+              <label>供应商模板</label>
+              <select data-preset>
+                {% for item in presets %}
+                <option value="{{ item.id }}" data-base-url="{{ item.base_url }}"
+                        data-models="{{ item.models|join('|') }}" data-hint="{{ item.hint }}">{{ item.label }}</option>
+                {% endfor %}
+              </select>
+              <div class="hint" data-preset-hint>切换供应商会修改下方接口地址；模型可重新拉取。</div>
+            </div>
+            <div class="field">
+              <label>显示名称</label>
+              <input name="label" type="text" maxlength="128" value="{{ p.label or '' }}">
+            </div>
+            <div class="field span-2">
+              <label>接口地址</label>
+              <input name="base_url" type="text" maxlength="512" value="{{ p.base_url or '' }}" data-base-url>
+            </div>
+            <div class="field">
+              <label>API Key（留空保持不变）</label>
+              <input name="api_key" type="password" maxlength="512" data-api-key
+                     placeholder="{{ '已配置，留空不修改' if p.api_key else '未配置' }}">
+            </div>
+            <div class="field">
+              <label>模型</label>
+              <div class="row">
+                <input name="model" type="text" maxlength="128" value="{{ p.model or '' }}"
+                       style="flex:1;min-width:180px" data-model>
+                <button type="button" class="ghost sm" data-fetch-models>获取模型</button>
+              </div>
+              <select data-model-select style="margin-top:8px;display:none"></select>
+              <div class="hint" data-model-status>可以直接切换为供应商提供的其它模型。</div>
+            </div>
+            <div class="field">
+              <label>优先级</label>
+              <input name="priority" type="number" min="0" max="100000" value="{{ p.priority }}">
+            </div>
+            <div class="field">
+              <label>状态</label>
+              <label class="inline"><input class="check" type="checkbox" name="enabled" {% if p.enabled %}checked{% endif %}> 启用</label>
+            </div>
+          </div>
+          <div class="form-actions"><button class="ghost sm" type="submit">保存修改</button></div>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+  {% else %}
+  <div class="empty">尚未配置任何 AI 接口。即使不配置，机器人仍会使用本地规则进行反广告检测。</div>
+  {% endif %}
+</div>
+
+<div class="grid cols-2">
+  <div class="card">
+    <h2>近 14 天用量</h2>
+    {% if usage %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>日期</th><th>群组</th><th class="num">请求</th><th class="num">抽样</th><th class="num">命中</th></tr></thead>
+        <tbody>
+        {% for u in usage %}
+          {% set g = group_map.get(u.group_id) %}
+          <tr>
+            <td class="mono">{{ u.day }}</td>
+            <td>
+              <a href="/groups/{{ u.group_id }}?tab=ai">{{ g.title if g else u.group_id }}</a>
+            </td>
+            <td class="num">{{ u.requests or 0 }}</td>
+            <td class="num">{{ u.samples or 0 }}</td>
+            <td class="num">{{ u.hits or 0 }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">暂无用量记录。</div>{% endif %}
+  </div>
+
+  <div class="card">
+    <h2>最近事件</h2>
+    {% if events %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>时间</th><th>群组</th><th>类型</th><th>接口</th><th>命中</th></tr></thead>
+        <tbody>
+        {% for e in events %}
+          {% set g = group_map.get(e.group_id) %}
+          <tr>
+            <td class="faint nowrap">{{ e.created_at|dt }}</td>
+            <td class="small">{{ g.title if g else e.group_id }}</td>
+            <td><span class="badge info">{{ e.kind }}</span></td>
+            <td class="mono small">{{ e.provider or '—' }}</td>
+            <td>{% if e.hit %}<span class="badge bad">是</span>{% else %}<span class="badge">否</span>{% endif %}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}<div class="empty">暂无 AI 事件。</div>{% endif %}
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/ai.js?v=20261020-7"></script>
+{% endblock %}

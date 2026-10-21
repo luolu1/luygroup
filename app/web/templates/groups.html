@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}群组{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">GROUPS</div>
+    <h1>群组管理</h1>
+    <div class="muted small">共 {{ groups|length }} 个已记录群组。点击群组进入详细设置。</div>
+  </div>
+  <form class="row" method="get" action="/groups">
+    <input type="search" name="q" value="{{ q }}" placeholder="搜索群名或用户名" style="min-width:220px">
+    <button type="submit" class="ghost">搜索</button>
+    {% if q %}<a class="btn ghost sm" href="/groups">清空</a>{% endif %}
+  </form>
+</div>
+
+<div class="card tight" style="margin-bottom:14px">
+  <form class="row" method="post" action="/groups/add">
+    <input type="text" name="chat" placeholder="群组 ID（如 -1001234567890）或 @群用户名" style="min-width:300px" required>
+    <button type="submit">添加群组</button>
+    {% if bot_username %}<a class="btn ghost sm" href="https://t.me/{{ bot_username }}?startgroup=true" target="_blank" rel="noreferrer">邀请机器人入群</a>{% endif %}
+    <span class="muted small">机器人必须已在该群中；添加后会同步群名并可在下方配置。</span>
+  </form>
+</div>
+
+<div class="card">
+  {% if groups %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>群组</th>
+          <th class="num">成员</th>
+          <th class="num">消息</th>
+          <th>状态</th>
+          <th>风控</th>
+          <th>更新</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for g in groups %}
+        <tr>
+          <td>
+            <a href="/groups/{{ g.id }}">{{ g.title or ('群组 ' ~ g.id) }}</a>
+            <div class="faint mono small">{{ g.id }}{% if g.username %} · @{{ g.username }}{% endif %}</div>
+          </td>
+          <td class="num">{{ counts.get(g.id, g.member_count or 0) }}</td>
+          <td class="num">{{ g.message_count or 0 }}</td>
+          <td>
+            {% if g.is_active %}<span class="badge ok">启用</span>{% else %}<span class="badge bad">停用</span>{% endif %}
+          </td>
+          <td class="small">
+            {% if g.anti_ad_enabled %}<span class="badge info">反广告</span>{% endif %}
+            {% if g.ai_ad_enabled %}<span class="badge purple">AI 检测</span>{% endif %}
+            {% if g.verify_enabled %}<span class="badge warn">验证</span>{% endif %}
+          </td>
+          <td class="faint nowrap">{{ g.updated_at|dt }}</td>
+          <td><a class="btn ghost sm" href="/groups/{{ g.id }}">设置</a></td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">
+    {% if q %}没有匹配「{{ q }}」的群组。{% else %}还没有群组记录。{% if bot_username %}点击「邀请机器人入群」把 @{{ bot_username }} 拉进群，{% else %}把机器人拉进群，{% endif %}然后发送 /start 或任意命令即可自动登记。{% endif %}
+  </div>
+  {% endif %}
+</div>
+
+<div class="card tight">
+  <div class="row">
+    <span class="badge info">提示</span>
+    <span class="muted small">群组必须先把机器人设为管理员，封禁、禁言、删除消息等功能才能生效。</span>
+  </div>
+</div>
+{% endblock %}
