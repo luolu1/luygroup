@@ -87,6 +87,7 @@ async def on_group_message(message: Message, bot: Bot) -> None:
         member.last_seen = utcnow()
         group.message_count = (group.message_count or 0) + 1
         await repo.bump_stat(session, group.id, "messages")
+        await repo.bump_member_daily(session, group.id, user.id)
         if (
             group.points_enabled
             and group.points_per_message

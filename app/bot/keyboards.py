@@ -8,17 +8,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 def main_menu() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(
-        InlineKeyboardButton(text="🛡 管理命令", callback_data="help:admin"),
-        InlineKeyboardButton(text="⭐ 积分玩法", callback_data="help:points"),
+        InlineKeyboardButton(text="👥 群组命令", callback_data="help:group"),
+        InlineKeyboardButton(text="🔐 私聊命令", callback_data="help:private"),
     )
-    builder.row(
-        InlineKeyboardButton(text="🎁 抽奖竞拍", callback_data="help:games"),
-        InlineKeyboardButton(text="🤖 AI 功能", callback_data="help:ai"),
-    )
-    builder.row(
-        InlineKeyboardButton(text="⚙️ 设置入口", callback_data="help:settings"),
-        InlineKeyboardButton(text="✖️ 关闭", callback_data="panel:close"),
-    )
+    builder.row(InlineKeyboardButton(text="✖️ 关闭", callback_data="panel:close"))
     return builder.as_markup()
 
 

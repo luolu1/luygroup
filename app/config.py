@@ -67,8 +67,9 @@ class AIProviderSeed(BaseModel):
 class AIConfig(BaseModel):
     timeout: int = 25
     max_context_messages: int = 8
-    # Optional directory for permanent AI learning JSONL files. Relative paths
-    # are resolved against the directory containing config.json.
+    # Optional root directory for permanent AI learning JSONL files. The
+    # directory stores ad_detection/, assistant/ and chat/ subdirectories.
+    # Relative paths are resolved against the directory containing config.json.
     learning_dir: str = ""
     providers: list[AIProviderSeed] = Field(default_factory=list)
 

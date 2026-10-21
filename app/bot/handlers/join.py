@@ -540,7 +540,7 @@ async def on_new_members(message: Message, bot: Bot) -> None:
                 await message.answer(
                     "👋 我是 <b>群卫 GroupGuard</b>。\n"
                     "请把我设为管理员，并授予删除消息、封禁用户、邀请用户权限。\n\n"
-                    "管理员发送 /help 查看命令；面板地址请私聊我发送 /panel。"
+                    "管理员发送 /help 查看命令；面板地址请私聊我发送 /console。"
                 )
             except TelegramAPIError:
                 pass
@@ -592,7 +592,7 @@ async def on_my_chat_member(update: ChatMemberUpdated, bot: Bot) -> None:
         return
     lines = [
         "👋 我是 <b>群卫 GroupGuard</b>，已加入本群。",
-        "管理员发送 /help 查看命令；面板地址请私聊我发送 /panel。",
+        "管理员发送 /help 查看命令；面板地址请私聊我发送 /console。",
     ]
     if new == "administrator":
         lines.append("\n✅ 已获得管理员权限，封禁、禁言、删除消息与进群验证功能可正常使用。")

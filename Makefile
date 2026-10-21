@@ -3,7 +3,7 @@ VENV := .venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
 
-.PHONY: help venv install init-config run run-bot run-web check smoke smoke-permissions smoke-captcha smoke-scheduler docker-build docker-up docker-down docker-logs clean
+.PHONY: help venv install init-config run run-bot run-web check smoke smoke-permissions smoke-captcha smoke-scheduler smoke-commands docker-build docker-up docker-down docker-logs clean
 
 help:
 	@echo "GroupGuard 常用命令："
@@ -17,6 +17,7 @@ help:
 	@echo "  make smoke-permissions 运行角色、群组与接口隔离回归测试"
 	@echo "  make smoke-captcha 运行验证码刷新、三次失败移出回归测试"
 	@echo "  make smoke-scheduler 运行验证超时移出回归测试"
+	@echo "  make smoke-commands 运行命令菜单、学习分目录、功能门槛与自助命令测试"
 	@echo "  make docker-build  构建 Docker 镜像"
 	@echo "  make docker-up     启动 Docker Compose"
 	@echo "  make docker-down   停止 Docker Compose"
@@ -67,6 +68,9 @@ smoke-rejoin: $(PYTHON)
 
 smoke-scheduler: $(PYTHON)
 	$(PYTHON) scripts/smoke_scheduler.py
+
+smoke-commands: $(PYTHON)
+	$(PYTHON) scripts/smoke_commands.py
 
 docker-build:
 	docker compose build

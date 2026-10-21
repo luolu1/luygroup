@@ -143,7 +143,7 @@ groupguard/
 │   │   ├── repo.py             # 数据访问辅助
 │   │   ├── detect.py           # 本地广告检测与频率限制
 │   │   ├── ai.py               # OpenAI 兼容调用、供应商模板与备用切换
-│   │   ├── ai_learning.py      # AI 学习数据（按群组 JSONL，长期保存）
+│   │   ├── ai_learning.py      # AI 学习数据（按用途/群组 JSONL，长期保存）
 │   │   ├── quota.py            # 每群每日 AI 额度
 │   │   └── scheduler.py        # 验证超时、开奖、竞拍结算、红包退款
 │   └── web/
@@ -313,7 +313,7 @@ SQLite 已自动启用 WAL、`busy_timeout=5000` 与外键约束。单机场景�
 | --- | --- |
 | `timeout` | 单次接口超时（秒） |
 | `max_context_messages` | 对话上下文保留条数 |
-| `learning_dir` | AI 学习数据目录；相对路径按项目目录解析，可在控制台修改并自动迁移已有 JSONL |
+| `learning_dir` | AI 学习数据根目录；内部自动使用 `ad_detection`、`assistant`、`chat` 三个子目录。相对路径按项目目录解析，可在控制台修改并自动迁移已有 JSONL |
 | `providers` | 首次启动时写入数据库的 AI 接口种子 |
 
 接口对象字段：
@@ -350,96 +350,53 @@ SQLite 已自动启用 WAL、`busy_timeout=5000` 与外键约束。单机场景�
 
 ## 命令列表
 
-### 通用
+Telegram 命令面板按聊天类型分别注册：私聊只显示私聊命令，群组只显示群组命令。输入 `/ads`（群组）或 `/start`（私聊）可随时打开对应菜单。
+
+### 私聊命令
 
 | 命令 | 说明 |
 | --- | --- |
-| `/start` | 开始 / 打开命令面板 |
-| `/help` | 命令面板 |
-| `/rules` | 查看群规 |
-| `/id` | 查看自己的 ID、群 ID、被回复用户 ID |
-| `/panel` | 获取 Web 控制台地址（仅机器人管理员私聊，群内不公开） |
-| `/ping` | 检查机器人是否在线 |
-| `/info [用户]` | 成员信息 |
-| `/warns [用户]` | 警告记录 |
-| `/stats` | 本群统计 |
-| `/ask 问题` | 询问 AI 助理 |
-| `/report [原因]` | 回复违规消息举报 |
-| `/reports` | 查看最近举报（管理员） |
+| `/start` | 快速开始并自动建立控制台账号 |
+| `/console` | 获取订阅控制台登录地址（仅私聊，群内不公开） |
+| `/sub` | 查看当前套餐、到期时间、绑定群组与有效功能 |
+| `/unbanme` | 自助解除机器人自动执行的封禁 |
+| `/unmuteme` | 自助解除机器人自动执行的禁言 |
+| `/cjtz` | 开启/关闭抽奖私聊推送，可带 `on` / `off` |
+| `/jptz` | 开启/关闭竞拍私聊推送，可带 `on` / `off` |
 
-### 管理
+> `/unbanme` 与 `/unmuteme` 不会覆盖管理员手动封禁/禁言，也不会绕过全局黑名单或入群自动禁言。控制台地址与 Token 只在私聊显示。
+
+### 群组命令
 
 | 命令 | 说明 |
 | --- | --- |
-| `/ban [原因]` | 封禁（回复用户或 `@用户名` / ID） |
-| `/unban` | 解封 |
-| `/kick` | 移出群聊 |
-| `/mute [分钟] [原因]` | 禁言 |
-| `/unmute` | 解除禁言 |
-| `/warn [原因]` | 警告 |
-| `/unwarn` | 撤销最近一条警告 |
-| `/resetwarns` | 清空警告 |
-| `/del` | 删除被回复的消息 |
-| `/whitelist [用户] [备注]` | 加入免检名单 |
-| `/unwhitelist` | 移出免检名单 |
-| `/addkeyword 关键词 [delete\|warn\|mute\|kick\|ban]` | 添加关键词规则；`re:` 前缀表示正则 |
-| `/addreply 关键词 => 回复内容` | 添加关键词自动回复；命中后发送回复，不删除原消息 |
-| `/keywords` | 查看关键词 |
-| `/delkeyword 编号或关键词` | 删除关键词 |
-| `/logs [数量]` | 管理日志 |
-| `/settings` | 当前设置摘要 |
+| `/ads` | 总菜单 |
+| `/ban` | 回复广告消息封禁（也支持 `@用户名` / 用户 ID） |
+| `/iunban` | 全局解封并尝试跨群解除限制 |
+| `/jy 用户ID 10m` | 手动禁言；支持 `10`、`10m`、`1h`、`2d` 及中文单位 |
+| `/jcjy` | 解除禁言（回复被禁言用户） |
+| `/wladd` | 回复用户添加白名单 |
+| `/wlrm` | 回复用户移除白名单 |
+| `/fy` | 查询某人的近 10 天、近 30 天和累计发言 |
+| `/cf` | 查询封禁历史、处置原因和当前限制状态 |
+| `/jf` | 查看自己的积分与排名 |
+| `/id` | 查询用户 ID、群 ID |
+| `/cj 标题 \| 奖品 [参与费] [分钟]` | 发起抽奖 |
+| `/jp 物品 \| 起拍价 [加价幅度] [分钟]` | 发起竞拍 |
 
-### 设置
+### 兼容命令与高级命令
 
-| 命令 | 说明 |
-| --- | --- |
-| `/setrules 文本` | 设置群规（也可回复消息） |
-| `/setwarn 次数 mute\|kick\|ban` | 警告阈值与动作 |
-| `/setflood 条数 秒数 mute\|kick\|ban` | 刷屏限制 |
-| `/setmute 分钟` | 默认禁言时长 |
-| `/setwelcome 文本` | 欢迎语，占位符 `{name}` `{group}` `{id}` |
-| `/setverify on\|off` | 进群验证开关 |
-| `/setai ad\|assistant\|chat on\|off` | 分别开关三种 AI 能力 |
-| `/setquota 请求数 样本数` | 每日 AI 额度 |
-| `/setcrossban on\|off\|own\|shared` | 跨群封禁 |
-| `/setreport on\|off` | 举报功能开关 |
+以下命令仍可使用，但不会出现在 Telegram 命令面板中：
 
-### 进群与邀请
-
-| 命令 | 说明 |
-| --- | --- |
-| `/verify` | 重新发起进群验证 |
-| `/invite [次数] [有效分钟]` | 创建邀请链接 |
-| `/invites` | 查看最近邀请链接 |
-
-### 频道、联动与协助管理
-
-| 命令 | 说明 |
-| --- | --- |
-| `/channels` | 查看必关频道 |
-| `/addchannel @频道 [链接]` | 添加必关频道 |
-| `/delchannel @频道` | 删除必关频道 |
-| `/assistant add\|del\|list [用户] [权限]` | 协助管理员，权限：`ban,mute,warn,delete,info,settings` |
-| `/crosslink add\|del\|list [群ID]` | 共享联动群 |
-| `/reportlink add\|del\|list [群ID]` | 通报订阅者（对方接收本群通报） |
-| `/gblacklist add\|del\|list [用户] [原因]` | 全局黑名单（仅全局管理员） |
-
-### 积分与玩法
-
-| 命令 | 说明 |
-| --- | --- |
-| `/points` | 查看积分与排名（别名 `/score` `/balance`） |
-| `/checkin` | 每日签到（别名 `/sign`） |
-| `/shop` | 积分商城（别名 `/mall`） |
-| `/buy 编号` | 购买商品 |
-| `/redpacket 总额 个数 [备注]` | 发拼手气红包（别名 `/rp` `/hongbao`） |
-| `/lottery 标题 \| 奖品 [参与费] [分钟]` | 发起抽奖（别名 `/draw`） |
-| `/auction 物品 \| 起拍价 [加价幅度] [分钟]` | 发起竞拍（别名 `/bidstart`） |
-| `/bid 金额` | 竞拍出价 |
+- 控制台旧别名：`/panel`、`/token`、`/subscription`。
+- 群组旧别名：`/mute`、`/unmute`、`/whitelist`、`/unwhitelist`、`/points`、`/lottery`、`/auction` 等。
+- 群组管理扩展：`/unban`、`/kick`、`/warn`、`/unwarn`、`/resetwarns`、`/del`、`/addkeyword`、`/addreply`、`/keywords`、`/delkeyword`、`/logs`、`/settings`。
+- 设置：`/setrules`、`/setwarn`、`/setflood`、`/setmute`、`/setwelcome`、`/setverify`、`/setai`、`/setquota`、`/setcrossban`、`/setreport`。
+- 进群与邀请：`/verify`、`/invite`、`/invites`。
+- 频道、联动与协助管理：`/channels`、`/addchannel`、`/delchannel`、`/assistant`、`/crosslink`、`/reportlink`、`/gblacklist`。
+- 积分与玩法扩展：`/checkin`、`/shop`、`/buy`、`/redpacket`、`/bid`。
 
 > 抽奖、竞拍、红包的时间在机器人消息中按 UTC 显示；数据库与控制台同样存储/显示 UTC 时间。
-
----
 
 ## AI 功能
 
@@ -475,14 +432,28 @@ http://127.0.0.1:11434/v1
 
 ### AI 学习数据
 
-学习数据用于减少重复内容消耗的 token，同时作为机器人的长期训练数据，默认位于 `data/ai_learning/`：
+学习数据用于减少重复内容消耗的 token，同时作为机器人的长期训练数据，默认位于 `data/ai_learning/`。广告检测、管理助理和闲聊分开存放，互不混用：
 
-- 每个群组一个 `group_<群ID>.jsonl` 文件，私聊与全局数据写入 `global.jsonl`；
-- 同一群组内按规范化后的文本精确匹配，大小写与多余空白不影响命中；
+```text
+data/ai_learning/
+├── ad_detection/          # AI 广告检测
+│   ├── group_<群ID>.jsonl
+│   └── global.jsonl
+├── assistant/             # AI 管理助理
+│   ├── group_<群ID>.jsonl
+│   └── global.jsonl
+└── chat/                  # AI 闲聊
+    ├── group_<群ID>.jsonl
+    └── global.jsonl
+```
+
+- 每个用途、每个群组各一个 `group_<群ID>.jsonl` 文件，私聊与全局数据写入对应目录的 `global.jsonl`；
+- 同一用途、同一群组内按规范化后的文本精确匹配，大小写与多余空白不影响命中；
 - **长期保存，不自动过期**：广告判断、管理助理回答、闲聊数据都会一直保留；
 - 仅保存成功的 AI 结果，调用失败不会写入；
-- 控制台「AI 接口」页显示已学习条目与命中次数，可修改存储目录；更换目录时会自动迁移现有 JSONL 文件；
-- 控制台不提供清空入口。需要删除时请在服务器上操作目录，且不会影响机器人运行。
+- 控制台「AI 接口」页显示已学习条目、命中次数和三个分类目录，可修改存储根目录；更换目录时会自动迁移三个子目录中的 JSONL 文件；
+- 旧版本直接放在 `data/ai_learning/*.jsonl` 的文件会在启动或首次读取时按 `kind` 自动拆分到对应子目录，合并时按缓存键去重；写入失败时保留原文件，不会丢数据；
+- 控制台不提供清空入口。需要删除时请在服务器上操作对应子目录，且不会影响机器人运行。
 
 > 学习数据用于性能优化和历史训练，不是强制规则来源。管理员在「警告」页将 AI 判定标记为误杀后，会覆盖对应广告判断并把该消息记为正常消息；标记「确认违规」会恢复警告并写回广告判定。
 

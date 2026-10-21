@@ -97,7 +97,7 @@
           <span class="k">控制台路径</span>
           <span class="mono break">/console/{{ user.console_path }}</span>
           <span class="k">Token 有效期</span>
-          <span>{% if user.token_expires_at %}{{ user.token_expires_at|dt }}{% else %}<span class="faint">尚未通过 /token 获取</span>{% endif %}</span>
+          <span>{% if user.token_expires_at %}{{ user.token_expires_at|dt }}{% else %}<span class="faint">尚未通过 /console 获取</span>{% endif %}</span>
         </div>
         <form method="post" action="/users/{{ user.id }}/token?q={{ q|urlencode }}"
               data-confirm="重置会立即作废旧 Token 和控制台路径，并生成新的登录地址。确定继续？">
@@ -105,7 +105,7 @@
             <button class="ghost sm" type="submit">重置 Token 和路径</button>
           </div>
         </form>
-        <div class="hint">重置后新的登录地址会显示在页面顶部。Token 有效期为 24 小时，过期后可通过 Bot 的 /token 自动轮换。</div>
+        <div class="hint">重置后新的登录地址会显示在页面顶部。Token 有效期为 24 小时，过期后可在私聊中再次发送 /console 自动轮换。</div>
       </div>
 
       {% if user.role != 'superadmin' %}

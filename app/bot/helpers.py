@@ -260,6 +260,11 @@ async def unmute_user(
     return f"已解除 {target.mention} 的禁言。"
 
 
+async def lift_restrictions(bot: Bot, chat_id: int, user_id: int) -> None:
+    """Best-effort removal of a mute without changing database state."""
+    await bot.restrict_chat_member(int(chat_id), int(user_id), permissions=_UNMUTE)
+
+
 async def apply_rejoin_mute(
     bot: Bot,
     session: AsyncSession,
@@ -456,6 +461,28 @@ async def _same_tenant_scope(session: AsyncSession, group: Group) -> list:
             )
         )
     ]
+
+
+async def tenant_groups(
+    session: AsyncSession, group: Group, *, actor_id: int | None = None
+) -> list[Group]:
+    """Groups an administrator may act on, including the current group.
+
+    Superadmins act platform-wide.  Everyone else is limited to the groups
+    belonging to the current group's console owner, so one subscriber cannot
+    unban or lift restrictions in another subscriber's groups.
+    """
+    if actor_id is not None and is_global_admin(actor_id):
+        result = await session.scalars(select(Group).where(Group.is_active.is_(True)))
+        return list(result.all())
+    scope = await _same_tenant_scope(session, group)
+    result = await session.scalars(
+        select(Group).where(Group.is_active.is_(True), *scope)
+    )
+    groups = list(result.all())
+    if not any(item.id == group.id for item in groups):
+        groups.insert(0, group)
+    return groups
 
 
 async def linked_groups(session: AsyncSession, group: Group) -> list[Group]:

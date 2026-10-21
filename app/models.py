@@ -246,6 +246,41 @@ class Member(Base):
     __table_args__ = (UniqueConstraint("group_id", "user_id", name="uq_member_group_user"),)
 
 
+class MemberDailyStat(Base):
+    """Per-member daily message counters used by ``/fy``.
+
+    ``Member.message_count`` remains the all-time total.  This table starts
+    collecting daily counts when the version is deployed, so recent 10/30 day
+    statistics are accurate from that point onward without rewriting history.
+    """
+
+    __tablename__ = "member_daily_stats"
+
+    id = Column(Integer, primary_key=True)
+    group_id = Column(BigInteger, index=True)
+    user_id = Column(BigInteger, index=True)
+    day = Column(String(10), index=True)
+    messages = Column(Integer, default=0)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "group_id", "user_id", "day", name="uq_member_daily_group_user_day"
+        ),
+    )
+
+
+class UserNotificationPreference(Base):
+    """Private-chat promotion push preferences for lotteries and auctions."""
+
+    __tablename__ = "user_notification_preferences"
+
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(BigInteger, unique=True, index=True, nullable=False)
+    lottery_enabled = Column(Boolean, default=False)
+    auction_enabled = Column(Boolean, default=False)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
 class Whitelist(Base):
     __tablename__ = "whitelist"
 

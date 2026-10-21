@@ -416,7 +416,7 @@ try:
             reviewed == ("false_positive", 0, "冒烟误杀", "冒烟测试广告原文"),
             str(reviewed),
         )
-        learning_file = TMP / "learning" / "group_-1001234567890.jsonl"
+        learning_file = TMP / "learning" / "ad_detection" / "group_-1001234567890.jsonl"
         learned_text = learning_file.read_text(encoding="utf-8") if learning_file.exists() else ""
         check(
             "ai false positive learned",
@@ -484,7 +484,7 @@ try:
             saved_cfg.get("ai", {}).get("learning_dir") == str(new_learning.resolve()),
             str(saved_cfg.get("ai")),
         )
-        moved = new_learning / "group_-1001234567890.jsonl"
+        moved = new_learning / "ad_detection" / "group_-1001234567890.jsonl"
         check(
             "ai learning dir migrates files",
             moved.exists() and not learning_file.exists(),

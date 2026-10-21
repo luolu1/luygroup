@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Iterable
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_config
@@ -16,6 +17,7 @@ from ..models import (
     GroupDailyStat,
     KeywordHit,
     Member,
+    MemberDailyStat,
     PointsTransaction,
     Warning,
     Whitelist,
@@ -158,6 +160,33 @@ async def bump_stat(session: AsyncSession, group_id: int, field: str, delta: int
         session.add(stat)
         await session.flush()
     setattr(stat, field, (getattr(stat, field) or 0) + delta)
+
+
+async def bump_member_daily(
+    session: AsyncSession, group_id: int, user_id: int, delta: int = 1
+) -> None:
+    """Track a member's messages for the current UTC day.
+
+    Uses SQLite's atomic upsert so concurrent messages from the same member
+    cannot race into a unique-constraint failure.
+    """
+    if not delta:
+        return
+    today = day_key()
+    statement = (
+        sqlite_insert(MemberDailyStat)
+        .values(
+            group_id=int(group_id),
+            user_id=int(user_id),
+            day=today,
+            messages=delta,
+        )
+        .on_conflict_do_update(
+            index_elements=["group_id", "user_id", "day"],
+            set_={"messages": MemberDailyStat.messages + delta},
+        )
+    )
+    await session.execute(statement)
 
 
 async def get_usage(session: AsyncSession, group_id: int) -> AIUsage:

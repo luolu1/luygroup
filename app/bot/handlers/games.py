@@ -1,6 +1,7 @@
 """Points, shop, red packets, lotteries and auctions."""
 from __future__ import annotations
 
+import asyncio
 import random
 from datetime import datetime, timedelta
 from html import escape
@@ -12,6 +13,7 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy import func, or_, select
 
 from ...db import session_scope
+from ...entitlements import group_feature_allowed
 from ...models import (
     Auction,
     AuctionBid,
@@ -23,12 +25,18 @@ from ...models import (
     RedPacketClaim,
     ShopItem,
     ShopOrder,
+    UserNotificationPreference,
     utcnow,
 )
 from ...services import repo
 from .. import helpers, keyboards
 
 router = Router(name="games")
+
+# Keep strong references to fire-and-forget promotion pushes.  The event loop
+# only holds weak references to tasks, so an unreferenced task can be collected
+# before its network sends finish.
+_promotion_tasks: set[asyncio.Task] = set()
 
 
 def _tail(message: Message) -> str:
@@ -84,16 +92,108 @@ def _need_group(message: Message) -> bool:
     return message.chat.type in {"group", "supergroup"}
 
 
+async def _feature_denied(session, group, feature: str) -> bool:
+    """Return True when a bound group's plan lacks a feature."""
+    return not await group_feature_allowed(session, group.id, feature)
+
+
+async def _reply_feature_denied(message: Message, feature: str) -> None:
+    label = "积分玩法" if feature == "points" else "抽奖与竞拍"
+    await message.reply(f"⛔ 本群所属订阅未开通{label}，请联系群主升级订阅。")
+
+
+async def _send_promotion(
+    bot: Bot,
+    *,
+    group_id: int,
+    group_title: str,
+    kind: str,
+    title: str,
+    detail: str,
+    exclude_user_id: int | None = None,
+) -> None:
+    """Push a new lottery/auction to members who enabled private notifications."""
+    enabled = (
+        UserNotificationPreference.lottery_enabled
+        if kind == "lottery"
+        else UserNotificationPreference.auction_enabled
+    )
+    async with session_scope() as session:
+        result = await session.scalars(
+            select(UserNotificationPreference.telegram_id)
+            .join(Member, Member.user_id == UserNotificationPreference.telegram_id)
+            .where(
+                Member.group_id == int(group_id),
+                Member.is_member.is_(True),
+                enabled.is_(True),
+            )
+            .limit(300)
+        )
+        recipients = [int(item) for item in result.all()]
+    if exclude_user_id is not None:
+        recipients = [item for item in recipients if item != int(exclude_user_id)]
+    if not recipients:
+        return
+    heading = "🎁 抽奖" if kind == "lottery" else "🔨 竞拍"
+    title_line = f" · {escape(title)}" if title else ""
+    text = (
+        f"<b>{heading}{title_line} · {escape(group_title or '群组')}</b>\n\n"
+        f"{detail}\n\n"
+        "请回到群组参与。不想收到此类推送可私聊机器人发送 "
+        f"/{'cjtz' if kind == 'lottery' else 'jptz'} off。"
+    )
+    semaphore = asyncio.Semaphore(8)
+
+    async def _deliver(user_id: int) -> None:
+        async with semaphore:
+            try:
+                await bot.send_message(
+                    user_id, text, disable_web_page_preview=True
+                )
+            except TelegramAPIError:
+                pass
+
+    await asyncio.gather(*(_deliver(user_id) for user_id in recipients))
+
+
+def _schedule_promotion(
+    bot: Bot,
+    *,
+    group_id: int,
+    group_title: str,
+    kind: str,
+    title: str,
+    detail: str,
+    exclude_user_id: int | None = None,
+) -> None:
+    task = asyncio.create_task(
+        _send_promotion(
+            bot,
+            group_id=group_id,
+            group_title=group_title,
+            kind=kind,
+            title=title,
+            detail=detail,
+            exclude_user_id=exclude_user_id,
+        )
+    )
+    _promotion_tasks.add(task)
+    task.add_done_callback(_promotion_tasks.discard)
+
+
 # ---------------------------------------------------------------------------
 # Points
 # ---------------------------------------------------------------------------
-@router.message(Command("points", "score", "balance"))
+@router.message(Command("points", "score", "balance", "jf"))
 async def cmd_points(message: Message) -> None:
     if not _need_group(message) or not message.from_user:
         await message.reply("请在群组中使用。")
         return
     async with session_scope() as session:
         group = await _group_for_message(session, message)
+        if await _feature_denied(session, group, "points"):
+            await _reply_feature_denied(message, "points")
+            return
         member = await repo.ensure_member(
             session,
             group.id,
@@ -135,6 +235,9 @@ async def cmd_checkin(message: Message) -> None:
         return
     async with session_scope() as session:
         group = await _group_for_message(session, message)
+        if await _feature_denied(session, group, "points"):
+            await _reply_feature_denied(message, "points")
+            return
         if not group.points_enabled:
             await message.reply("本群暂未开启积分系统。")
             return
@@ -181,6 +284,9 @@ async def cmd_shop(message: Message) -> None:
         return
     async with session_scope() as session:
         group = await _group_for_message(session, message)
+        if await _feature_denied(session, group, "points"):
+            await _reply_feature_denied(message, "points")
+            return
         if not group.points_enabled:
             await message.reply("本群暂未开启积分商城。")
             return
@@ -218,6 +324,8 @@ async def _purchase(
     user,
     item_id: int,
 ) -> str:
+    if await _feature_denied(session, group, "points"):
+        return "本群所属订阅未开通积分玩法，请联系群主升级订阅。"
     item = await session.get(ShopItem, item_id)
     if item is None or not item.enabled:
         return "商品不存在或已下架。"
@@ -315,6 +423,9 @@ async def cmd_redpacket(message: Message, bot: Bot) -> None:
         return
     async with session_scope() as session:
         group = await _group_for_message(session, message)
+        if await _feature_denied(session, group, "points"):
+            await _reply_feature_denied(message, "points")
+            return
         if not group.points_enabled:
             await message.reply("本群暂未开启积分系统。")
             return
@@ -387,6 +498,11 @@ async def on_claim_packet(callback: CallbackQuery) -> None:
             await callback.answer("红包已过期或已领完。", show_alert=True)
             return
         group = await repo.ensure_group(session, group_id)
+        if await _feature_denied(session, group, "points"):
+            await callback.answer(
+                "本群所属订阅未开通积分玩法。", show_alert=True
+            )
+            return
         if not group.points_enabled:
             await callback.answer("本群未开启积分系统。", show_alert=True)
             return
@@ -440,7 +556,7 @@ async def on_claim_packet(callback: CallbackQuery) -> None:
 # ---------------------------------------------------------------------------
 # Lottery
 # ---------------------------------------------------------------------------
-@router.message(Command("lottery", "draw"))
+@router.message(Command("lottery", "draw", "cj"))
 async def cmd_lottery(message: Message, bot: Bot) -> None:
     if not _need_group(message) or not message.from_user:
         await message.reply("请在群组中使用。")
@@ -448,12 +564,15 @@ async def cmd_lottery(message: Message, bot: Bot) -> None:
     title, prize, fee, minutes = _parse_game_args(_tail(message))
     if not title or not prize:
         await message.reply(
-            "用法：/lottery 标题 | 奖品 [参与费] [分钟]\n"
-            "例如：/lottery 周末抽奖 | 一个月会员 10 30"
+            "用法：/cj 标题 | 奖品 [参与费] [分钟]\n"
+            "例如：/cj 周末抽奖 | 一个月会员 10 30"
         )
         return
     async with session_scope() as session:
         group = await _group_for_message(session, message)
+        if await _feature_denied(session, group, "games"):
+            await _reply_feature_denied(message, "games")
+            return
         if not group.points_enabled and fee > 0:
             await message.reply("本群未开启积分系统，无法设置参与费。")
             return
@@ -469,11 +588,12 @@ async def cmd_lottery(message: Message, bot: Bot) -> None:
         )
         session.add(lottery)
         await session.flush()
+        ends_text = lottery.ends_at.strftime("%Y-%m-%d %H:%M")
         text = (
             f"🎁 <b>{escape(title)}</b>\n"
             f"奖品：{escape(prize)}\n"
             f"参与费：{fee} {escape(group.points_name or '积分')}\n"
-            f"开奖时间：{lottery.ends_at.strftime('%Y-%m-%d %H:%M')}（UTC）\n"
+            f"开奖时间：{ends_text}（UTC）\n"
             "点击下方按钮参与抽奖。"
         )
         try:
@@ -482,7 +602,21 @@ async def cmd_lottery(message: Message, bot: Bot) -> None:
         except TelegramAPIError as exc:
             await message.reply(f"发送抽奖失败：{exc}")
             return
+        detail = (
+            f"奖品：{escape(prize)}\n"
+            f"参与费：{fee} {escape(group.points_name or '积分')}\n"
+            f"开奖时间：{ends_text}（UTC）"
+        )
     await message.reply("抽奖已发布！")
+    _schedule_promotion(
+        bot,
+        group_id=group.id,
+        group_title=group.title or "",
+        kind="lottery",
+        title=title,
+        detail=detail,
+        exclude_user_id=message.from_user.id,
+    )
 
 
 @router.callback_query(F.data.startswith("lot:"))
@@ -513,6 +647,11 @@ async def on_lottery_join(callback: CallbackQuery) -> None:
             await callback.answer("你已经参与过了。", show_alert=True)
             return
         group = await repo.ensure_group(session, lottery.group_id)
+        if await _feature_denied(session, group, "games"):
+            await callback.answer(
+                "本群所属订阅未开通抽奖与竞拍。", show_alert=True
+            )
+            return
         if lottery.entry_fee > 0:
             result = await repo.adjust_points(
                 session,
@@ -540,7 +679,7 @@ async def on_lottery_join(callback: CallbackQuery) -> None:
 # ---------------------------------------------------------------------------
 # Auction
 # ---------------------------------------------------------------------------
-@router.message(Command("auction", "bidstart"))
+@router.message(Command("auction", "bidstart", "jp"))
 async def cmd_auction(message: Message, bot: Bot) -> None:
     if not _need_group(message) or not message.from_user:
         await message.reply("请在群组中使用。")
@@ -548,8 +687,8 @@ async def cmd_auction(message: Message, bot: Bot) -> None:
     title, start_price, step, minutes = _parse_auction_args(_tail(message))
     if not title:
         await message.reply(
-            "用法：/auction 物品 | 起拍价 [加价幅度] [分钟]\n"
-            "例如：/auction 稀有头像框 | 100 10 30"
+            "用法：/jp 物品 | 起拍价 [加价幅度] [分钟]\n"
+            "例如：/jp 稀有头像框 | 100 10 30"
         )
         return
     if start_price < 0 or step < 0:
@@ -557,6 +696,9 @@ async def cmd_auction(message: Message, bot: Bot) -> None:
         return
     async with session_scope() as session:
         group = await _group_for_message(session, message)
+        if await _feature_denied(session, group, "games"):
+            await _reply_feature_denied(message, "games")
+            return
         if not group.points_enabled:
             await message.reply("本群未开启积分系统，无法竞拍。")
             return
@@ -573,11 +715,12 @@ async def cmd_auction(message: Message, bot: Bot) -> None:
         )
         session.add(auction)
         await session.flush()
+        ends_text = auction.ends_at.strftime("%Y-%m-%d %H:%M")
         text = (
             f"🔨 <b>竞拍：{escape(title)}</b>\n"
             f"起拍价：{start_price} {escape(group.points_name or '积分')}\n"
             f"加价幅度：{max(0, step)}\n"
-            f"截止时间：{auction.ends_at.strftime('%Y-%m-%d %H:%M')}（UTC）\n"
+            f"截止时间：{ends_text}（UTC）\n"
             "发送 /bid 金额 出价，或点击下方按钮查看提示。"
         )
         try:
@@ -586,7 +729,21 @@ async def cmd_auction(message: Message, bot: Bot) -> None:
         except TelegramAPIError as exc:
             await message.reply(f"发送竞拍失败：{exc}")
             return
+        detail = (
+            f"起拍价：{start_price} {escape(group.points_name or '积分')}\n"
+            f"加价幅度：{max(0, step)}\n"
+            f"截止时间：{ends_text}（UTC）"
+        )
     await message.reply("竞拍已开始！")
+    _schedule_promotion(
+        bot,
+        group_id=group.id,
+        group_title=group.title or "",
+        kind="auction",
+        title=title,
+        detail=detail,
+        exclude_user_id=message.from_user.id,
+    )
 
 
 @router.callback_query(F.data.startswith("bid:"))
@@ -607,6 +764,12 @@ async def on_bid_button(callback: CallbackQuery) -> None:
         if auction.status != "open" or (auction.ends_at and auction.ends_at <= utcnow()):
             await callback.answer("竞拍已经结束。", show_alert=True)
             return
+        group = await repo.ensure_group(session, auction.group_id)
+        if await _feature_denied(session, group, "games"):
+            await callback.answer(
+                "本群所属订阅未开通抽奖与竞拍。", show_alert=True
+            )
+            return
         minimum = auction.start_price if auction.current_bidder is None else auction.current_price + max(1, auction.step)
         await callback.answer(f"发送 /bid 金额 出价，最低 {minimum} 积分。", show_alert=True)
 
@@ -623,6 +786,9 @@ async def cmd_bid(message: Message, bot: Bot) -> None:
     amount = int(args[0])
     async with session_scope() as session:
         group = await _group_for_message(session, message)
+        if await _feature_denied(session, group, "games"):
+            await _reply_feature_denied(message, "games")
+            return
         if not group.points_enabled:
             await message.reply("本群未开启积分系统。")
             return

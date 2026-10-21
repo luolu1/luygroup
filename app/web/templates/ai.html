@@ -44,6 +44,8 @@
       {% endif %}
       <span class="k">已学习条目</span><span>{{ learning.entries }}</span>
       <span class="k">累计命中</span><span>{{ learning.hits }}</span>
+      <span class="k">分类目录</span>
+      <span class="mono small">ad_detection · assistant · chat</span>
       <span class="k">分类</span>
       <span>
         {% for kind, count in learning.by_kind.items() %}
@@ -60,11 +62,11 @@
                placeholder="/opt/groupguard/data/ai_learning" style="flex:1;min-width:240px">
         <button class="ghost sm" type="submit">保存目录</button>
       </div>
-      <div class="hint">可填写绝对路径，或相对项目目录的路径。更换目录时会自动迁移现有 JSONL 学习文件。</div>
+      <div class="hint">可填写绝对路径，或相对项目目录的路径。学习数据按用途分别存放在 ad_detection、assistant、chat 三个子目录；更换目录时会自动迁移现有 JSONL 学习文件。</div>
     </form>
     {% endif %}
     <div class="alert">
-      成功调用 AI 后，相同广告或问题会优先从本地学习数据返回，不再消耗 token。学习数据按群组和内容精确匹配，不会按时间自动过期，可作为机器人的长期训练数据。
+      成功调用 AI 后，相同广告或问题会优先从本地学习数据返回，不再消耗 token。学习数据按用途和群组分开保存，不会按时间自动过期，可作为机器人的长期训练数据。
     </div>
   </div>
 </div>

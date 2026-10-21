@@ -38,13 +38,40 @@ async def _reply_error(message: Message, text: str) -> None:
     await message.reply(text)
 
 
+_DURATION_RE = re.compile(
+    r"^(\d+)\s*(s|m|h|d|w|秒|分钟|分|小时|时|天|日|周|星期)?$",
+    re.IGNORECASE,
+)
+
+
+def _duration_minutes(raw: str) -> int | None:
+    """Parse ``10``, ``10m``, ``1h``, ``2d`` or Chinese duration tokens."""
+    match = _DURATION_RE.match((raw or "").strip())
+    if not match:
+        return None
+    amount = int(match.group(1))
+    unit = (match.group(2) or "m").lower()
+    if unit in {"s", "秒"}:
+        minutes = max(1, (amount + 59) // 60)
+    elif unit in {"h", "小时", "时"}:
+        minutes = amount * 60
+    elif unit in {"d", "天", "日"}:
+        minutes = amount * 1440
+    elif unit in {"w", "周", "星期"}:
+        minutes = amount * 10080
+    else:
+        minutes = amount
+    return max(1, min(minutes, 100000))
+
+
 def _admin_help() -> str:
     return (
         "用法：\n"
         "<code>/ban [原因]</code> 回复目标消息\n"
+        "<code>/jy 用户ID 10m [原因]</code> 手动禁言（也支持 1h / 2d）\n"
         "<code>/mute [分钟] [原因]</code>\n"
         "<code>/warn [原因]</code>\n"
-        "<code>/whitelist [用户] [备注]</code>\n"
+        "<code>/wladd 回复用户 [备注]</code>\n"
         "<code>/addkeyword 关键词 [delete|warn|mute|kick|ban]</code>\n"
         "<code>/addreply 关键词 =&gt; 回复内容</code>"
     )
@@ -109,6 +136,90 @@ async def cmd_unban(message: Message, bot: Bot) -> None:
         await message.reply(result)
 
 
+@router.message(Command("iunban"))
+async def cmd_iunban(message: Message, bot: Bot) -> None:
+    """Unban and lift restrictions across the current tenant's groups."""
+    async with session_scope() as session:
+        ctx = await helpers.admin_context(bot, session, message, "ban")
+        if not ctx:
+            return
+        group, actor = ctx
+        target = await helpers.resolve_target(bot, message, helpers.parse_args(message.text))
+        if not target:
+            await _reply_error(message, "请回复要全局解封的用户，或 /iunban 用户ID。")
+            return
+        allowed, why = await helpers.can_moderate_target(bot, session, group.id, target.user_id)
+        if not allowed:
+            await _reply_error(message, why)
+            return
+
+        groups = await helpers.tenant_groups(session, group, actor_id=actor)
+        unlocked: list[str] = []
+        failed: list[str] = []
+        for target_group in groups[:200]:
+            member = await repo.get_member(session, target_group.id, target.user_id)
+            restricted = bool(
+                member
+                and (
+                    member.is_banned
+                    or member.is_muted
+                    or member.mute_on_rejoin
+                )
+            )
+            if not restricted:
+                continue
+            title = target_group.title or str(target_group.id)
+            try:
+                await bot.unban_chat_member(
+                    int(target_group.id), int(target.user_id), only_if_banned=True
+                )
+            except TelegramAPIError:
+                failed.append(title)
+                continue
+            if member is not None:
+                member.is_banned = False
+                member.is_muted = False
+                member.muted_until = None
+                member.mute_on_rejoin = False
+            try:
+                await helpers.lift_restrictions(
+                    bot, int(target_group.id), int(target.user_id)
+                )
+            except TelegramAPIError:
+                pass
+            await repo.add_log(
+                session,
+                target_group.id,
+                actor,
+                "global_unban",
+                target.user_id,
+                "全局解封并解除限制",
+            )
+            unlocked.append(title)
+
+        blacklisted = await session.scalar(
+            select(GlobalBlacklist.id)
+            .where(GlobalBlacklist.user_id == int(target.user_id))
+            .limit(1)
+        )
+
+    if not unlocked and not failed:
+        await message.reply("没有找到该用户在可管理群组中的封禁或禁言记录。")
+        return
+    lines = [f"🔓 已处理 {len(unlocked)} 个群组："]
+    lines.extend(f"· {escape(name)}" for name in unlocked[:10])
+    if len(unlocked) > 10:
+        lines.append(f"…… 其余 {len(unlocked) - 10} 个群组")
+    if failed:
+        lines.append("\n⚠️ 以下群组失败（机器人权限不足）：")
+        lines.extend(f"· {escape(name)}" for name in failed[:10])
+    if blacklisted is not None:
+        lines.append(
+            "\n⚠️ 该用户仍在全局黑名单中，黑名单策略可能会再次限制其入群。"
+        )
+    await message.reply("\n".join(lines))
+
+
 @router.message(Command("kick"))
 async def cmd_kick(message: Message, bot: Bot) -> None:
     async with session_scope() as session:
@@ -137,7 +248,7 @@ async def cmd_kick(message: Message, bot: Bot) -> None:
         await message.reply(result)
 
 
-@router.message(Command("mute"))
+@router.message(Command("mute", "jy"))
 async def cmd_mute(message: Message, bot: Bot) -> None:
     async with session_scope() as session:
         ctx = await helpers.admin_context(bot, session, message, "mute")
@@ -147,7 +258,10 @@ async def cmd_mute(message: Message, bot: Bot) -> None:
         args = helpers.parse_args(message.text)
         target = await helpers.resolve_target(bot, message, args)
         if not target:
-            await _reply_error(message, "请回复要禁言的用户，或 /mute 用户ID [分钟] [原因]。")
+            await _reply_error(
+                message,
+                "请回复要禁言的用户，或 /jy 用户ID 10m [原因]。",
+            )
             return
         allowed, why = await helpers.can_moderate_target(bot, session, group.id, target.user_id)
         if not allowed:
@@ -156,14 +270,18 @@ async def cmd_mute(message: Message, bot: Bot) -> None:
         minutes = group.mute_minutes or 60
         if message.reply_to_message:
             reason_parts = args
-            if args and args[0].isdigit():
-                minutes = max(1, min(int(args[0]), 100000))
-                reason_parts = args[1:]
+            if args:
+                parsed = _duration_minutes(args[0])
+                if parsed is not None:
+                    minutes = parsed
+                    reason_parts = args[1:]
         else:
             reason_parts = args[1:]
-            if len(args) > 1 and args[1].isdigit():
-                minutes = max(1, min(int(args[1]), 100000))
-                reason_parts = args[2:]
+            if len(args) > 1:
+                parsed = _duration_minutes(args[1])
+                if parsed is not None:
+                    minutes = parsed
+                    reason_parts = args[2:]
         reason = " ".join(reason_parts)
         try:
             result = await helpers.mute_user(
@@ -178,7 +296,7 @@ async def cmd_mute(message: Message, bot: Bot) -> None:
         await message.reply(result)
 
 
-@router.message(Command("unmute"))
+@router.message(Command("unmute", "jcjy"))
 async def cmd_unmute(message: Message, bot: Bot) -> None:
     async with session_scope() as session:
         ctx = await helpers.admin_context(bot, session, message, "mute")
@@ -293,7 +411,7 @@ async def cmd_delete(message: Message, bot: Bot) -> None:
 # ---------------------------------------------------------------------------
 # Whitelist / keywords
 # ---------------------------------------------------------------------------
-@router.message(Command("whitelist", "wl"))
+@router.message(Command("whitelist", "wl", "wladd"))
 async def cmd_whitelist(message: Message, bot: Bot) -> None:
     async with session_scope() as session:
         ctx = await helpers.admin_context(bot, session, message, "warn")
@@ -324,7 +442,7 @@ async def cmd_whitelist(message: Message, bot: Bot) -> None:
         await message.reply(f"✅ 已将 {target.mention} 加入免检白名单。")
 
 
-@router.message(Command("unwhitelist", "unwl"))
+@router.message(Command("unwhitelist", "unwl", "wlrm"))
 async def cmd_unwhitelist(message: Message, bot: Bot) -> None:
     async with session_scope() as session:
         ctx = await helpers.admin_context(bot, session, message, "warn")
@@ -507,7 +625,7 @@ async def cmd_settings(message: Message, bot: Bot) -> None:
         f"通报：{'开' if group.report_enabled else '关'} · 接收通报：{'开' if group.report_receive else '关'}\n"
         f"积分：{'开' if group.points_enabled else '关'} · 每条 +{group.points_per_message} · 冷却 {group.points_cooldown}s\n"
         f"AI 日额度：{group.ai_daily_quota} 请求 / {group.sample_daily_quota} 样本\n\n"
-        "完整设置请使用 /panel 打开 Web 控制台。"
+        "完整设置请使用 /console 打开 Web 控制台。"
     )
     await message.reply(text)
 
