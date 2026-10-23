@@ -11,8 +11,10 @@ import os
 import sqlite3
 import sys
 import tempfile
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 TMP = Path(tempfile.mkdtemp(prefix="groupguard-perm-"))
@@ -40,6 +42,9 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.web import pages as web_pages  # noqa: E402
 from app.web.auth import hash_console_token  # noqa: E402
 from app.web.main import app  # noqa: E402
+from app.db import session_scope  # noqa: E402
+from app.entitlements import build_for_user  # noqa: E402
+from app.models import ConsoleUser  # noqa: E402
 
 
 async def fake_bot_membership(chat_id: int) -> dict:
@@ -78,9 +83,15 @@ def connect() -> sqlite3.Connection:
     return sqlite3.connect(DB)
 
 
-def login(client: TestClient, path: str, token: str) -> bool:
-    r = client.get(f"/console/{path}?token={token}", follow_redirects=False)
+def login(client: TestClient, token: str) -> bool:
+    r = client.get(f"/console?token={token}", follow_redirects=False)
     return r.status_code == 303 and r.headers.get("location") == "/"
+
+
+async def group_limit_for(user_id: int) -> int | None:
+    async with session_scope() as session:
+        user = await session.get(ConsoleUser, user_id)
+        return (await build_for_user(session, user)).group_limit
 
 
 try:
@@ -94,21 +105,20 @@ try:
         }
         con = connect()
         plan_id = con.execute("SELECT id FROM subscription_plans ORDER BY id LIMIT 1").fetchone()[0]
-        for telegram_id, path, token, role, name in (
-            (9001, "basicpanel", tokens["basic"], "user", "Basic User"),
-            (9002, "subpanel", tokens["sub"], "subscriber", "Sub User"),
-            (9003, "otherpanel", tokens["other"], "user", "Other User"),
+        for telegram_id, token, role, name in (
+            (9001, tokens["basic"], "user", "Basic User"),
+            (9002, tokens["sub"], "subscriber", "Sub User"),
+            (9003, tokens["other"], "user", "Other User"),
         ):
             con.execute(
                 "INSERT INTO console_users (telegram_id, display_name, token_hash, token_value, "
-                "token_expires_at, console_path, role, is_active) VALUES (?,?,?,?,?,?,?,1)",
+                "token_expires_at, role, is_active, balance_cents) VALUES (?,?,?,?,?,?,1,0)",
                 (
                     telegram_id,
                     name,
                     hash_console_token(token),
                     token,
                     future,
-                    path,
                     role,
                 ),
             )
@@ -184,7 +194,8 @@ try:
         con.close()
 
         # ----------------------------------------------------------- basic user
-        check("basic login", login(client, "basicpanel", tokens["basic"]))
+        check("basic login", login(client, tokens["basic"]))
+        check("ordinary user group limit is two", asyncio.run(group_limit_for(basic_id)) == 2)
         r = client.get("/")
         check(
             "basic role label is not administrator",
@@ -252,18 +263,42 @@ try:
             "/groups/add", data={"chat": "@shouldnotadd"}, follow_redirects=False
         )
         check(
-            "basic group limit enforced",
-            r.status_code == 303 and "err=" in r.headers.get("location", ""),
+            "basic second group is allowed",
+            r.status_code == 303 and "msg=" in r.headers.get("location", ""),
             str(r.headers),
         )
         con = connect()
         stray = con.execute("SELECT COUNT(*) FROM groups WHERE id=-1009999999999").fetchone()[0]
         con.close()
-        check("basic group limit did not create group", stray == 0, str(stray))
+        check("basic second group was created", stray == 1, str(stray))
+        async def third_group(_ref: str) -> dict:
+            return {
+                "id": -1009999999998,
+                "title": "第三个群",
+                "username": "thirdgroup",
+                "type": "supergroup",
+            }
+
+        web_pages._fetch_telegram_group = third_group
+        r = client.post(
+            "/groups/add", data={"chat": "@thirdgroup"}, follow_redirects=False
+        )
+        check(
+            "basic third group is rejected",
+            r.status_code == 303 and "err=" in r.headers.get("location", ""),
+            str(r.headers),
+        )
+        con = connect()
+        third = con.execute("SELECT COUNT(*) FROM groups WHERE id=-1009999999998").fetchone()[0]
+        con.close()
+        check("basic third group was not created", third == 0, str(third))
         client.get("/logout")
 
         # ------------------------------------------------------- subscriber user
-        check("subscriber login", login(client, "subpanel", tokens["sub"]))
+        check("subscriber login", login(client, tokens["sub"]))
+        check("subscriber group limit is five", asyncio.run(group_limit_for(sub_id)) == 5)
+        r = client.get("/account")
+        check("subscriber can access account and renewal page", r.status_code == 200 and "续费一个月" in r.text and "¥8.00" in r.text)
         for path in ("/ai", "/blacklist", "/reports", "/stats"):
             r = client.get(path)
             check(f"subscriber allowed {path}", r.status_code == 200, str(r.status_code))
@@ -273,9 +308,26 @@ try:
             "subscriber AI page hides admin-only details",
             r.status_code == 200
             and "已学习条目" in r.text
+            and "今日 AI 用量" in r.text
+            and "分类目录" not in r.text
+            and '<span class="k">分类</span>' not in r.text
             and '<span class="k">存储目录</span>' not in r.text
             and '<span class="fact-label">接口</span>' not in r.text
             and 'action="/ai/learning/dir"' not in r.text,
+            r.text[:800],
+        )
+        con = connect()
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        con.execute(
+            "INSERT INTO ai_usage (group_id, day, requests, samples, hits) VALUES (?, ?, ?, ?, ?)",
+            (-1002222222222, today, 7, 3, 2),
+        )
+        con.commit()
+        con.close()
+        r = client.get("/ai")
+        check(
+            "subscriber AI summary scopes bound groups",
+            r.status_code == 200 and "已用 7" in r.text and "总额 200" in r.text,
             r.text[:800],
         )
 
@@ -457,7 +509,7 @@ try:
         client.get("/logout")
 
         # -------------------------------------------------- subscription by user
-        check("other user login", login(client, "otherpanel", tokens["other"]))
+        check("other user login", login(client, tokens["other"]))
         r = client.get("/groups")
         check(
             "user without access sees no groups",

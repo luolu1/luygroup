@@ -15,6 +15,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+from sqlalchemy import create_engine
+
 ROOT = Path(__file__).resolve().parents[1]
 TMP = Path(tempfile.mkdtemp(prefix="groupguard-smoke-"))
 DB = TMP / "smoke.db"
@@ -31,10 +33,8 @@ if not admin_ids:
     print("config.json 的 bot.admin_ids 为空，无法执行登录测试。")
     sys.exit(2)
 ADMIN_ID = admin_ids[0]
-PASSWORD = "smoke-pass"
 
 cfg["database"]["url"] = f"sqlite+aiosqlite:///{DB}"
-cfg["web"]["password"] = PASSWORD
 cfg.setdefault("ai", {})["learning_dir"] = str(TMP / "learning")
 TMP_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
 os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
@@ -80,12 +80,48 @@ try:
         token = "smoke-console-token"
         con = connect()
         con.execute(
-            "UPDATE console_users SET display_name=?, token_hash=?, console_path=?, "
-            "role=?, is_active=1 WHERE telegram_id=?",
-            ("Smoke Admin", hash_console_token(token), "smokepanel", "superadmin", ADMIN_ID),
+            "UPDATE console_users SET display_name=?, token_hash=?, "
+            "role=?, token_value=NULL, token_expires_at=datetime('now', '+15 minutes'), "
+            "is_active=1 WHERE telegram_id=?",
+            ("Smoke Admin", hash_console_token(token), "superadmin", ADMIN_ID),
+        )
+        con.execute(
+            "INSERT OR REPLACE INTO console_users "
+            "(telegram_id, display_name, username, token_hash, token_expires_at, role, is_active, balance_cents) "
+            "VALUES (?, ?, ?, ?, datetime('now', '+15 minutes'), 'user', 1, 800)",
+            (ADMIN_ID + 10000, "Balance User", "balance_user", hash_console_token("balance-user-token")),
         )
         con.commit()
         con.close()
+
+        legacy_db = TMP / "legacy-console.db"
+        legacy_engine = create_engine(f"sqlite:///{legacy_db}")
+        with legacy_engine.begin() as connection:
+            from app.models import Base
+            from app.db import _upgrade_sqlite_schema
+
+            Base.metadata.create_all(connection)
+            connection.exec_driver_sql(
+                "ALTER TABLE console_users ADD COLUMN console_path VARCHAR(32) NOT NULL DEFAULT 'legacy'"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO console_users (telegram_id, display_name, token_hash, role, is_active, balance_cents) "
+                "VALUES (123, 'Legacy', 'legacy-hash', 'user', 1, 0)"
+            )
+            _upgrade_sqlite_schema(connection)
+            columns = {
+                row[1]
+                for row in connection.exec_driver_sql("PRAGMA table_info(console_users)")
+            }
+            legacy_user = connection.exec_driver_sql(
+                "SELECT telegram_id, display_name FROM console_users WHERE telegram_id=123"
+            ).one()
+        legacy_engine.dispose()
+        check(
+            "legacy console path migration preserves account",
+            "console_path" not in columns and legacy_user == (123, "Legacy"),
+            f"{columns} {legacy_user}",
+        )
 
         r = client.get("/login")
         check("login page", r.status_code == 200 and "GroupGuard 控制台" in r.text, r.text[:200])
@@ -107,22 +143,89 @@ try:
 
         r = client.post(
             "/login",
-            data={"token": token, "next": "/"},
+            data={"token": token},
+            headers={"Origin": "http://evil.example"},
             follow_redirects=False,
         )
-        check("login ok", r.status_code == 303 and r.headers["location"] == "/", str(r.headers))
+        check(
+            "cross-origin login rejected",
+            r.status_code == 403 and "CSRF" in r.text,
+            f"{r.status_code} {r.text[:200]}",
+        )
+        r = client.get("/", follow_redirects=False)
+        check(
+            "cross-origin login did not create session",
+            r.status_code == 303 and r.headers["location"].startswith("/login"),
+            str(r.headers),
+        )
+
+        r = client.get(f"/console?token={token}", follow_redirects=False)
+        check("direct console token login", r.status_code == 303 and r.headers["location"] == "/", str(r.headers))
+        check(
+            "random path login route removed",
+            client.get("/console/some-random-path?token=" + token, follow_redirects=False).status_code == 404,
+        )
+
+        r = client.get(f"/console?token={token}", follow_redirects=False)
+        check("login code one-time", r.status_code == 200 and "无效、已过期或已被使用" in r.text, r.text[:200])
+
+        con = connect()
+        balance_row = con.execute(
+            "SELECT id, balance_cents FROM console_users WHERE telegram_id=?", (ADMIN_ID + 10000,)
+        ).fetchone()
+        con.close()
+        admin_db_id, initial_balance = balance_row
+        r = client.post(
+            f"/users/{admin_db_id}/balance",
+            data={"balance": "12.34"},
+            follow_redirects=False,
+        )
+        con = connect()
+        balance = con.execute(
+            "SELECT balance_cents FROM console_users WHERE telegram_id=?", (ADMIN_ID + 10000,)
+        ).fetchone()[0]
+        con.close()
+        check("admin can update account balance", r.status_code == 303 and balance == 1234, f"{r.status_code} {balance}")
+        r = client.post(
+            f"/users/{admin_db_id}/balance",
+            data={"balance": "12.345"},
+            follow_redirects=False,
+        )
+        con = connect()
+        unchanged = con.execute(
+            "SELECT balance_cents FROM console_users WHERE telegram_id=?", (ADMIN_ID + 10000,)
+        ).fetchone()[0]
+        con.close()
+        check(
+            "invalid balance keeps stored value",
+            r.status_code == 303 and unchanged == 1234 and "err=" in r.headers.get("location", ""),
+            f"{r.status_code} {unchanged} {r.headers.get('location')}",
+        )
+
+        r = client.get("/")
+        check(
+            "logout form in header",
+            'action="/logout"' in r.text and 'method="post"' in r.text and "余额 ¥0.00" in r.text,
+            r.text[:300],
+        )
 
         for path in ["/", "/groups", "/users", "/ai", "/ai/add", "/blacklist", "/reports", "/stats"]:
             r = client.get(path)
             check(f"GET {path}", r.status_code == 200, f"{r.status_code} {r.text[:300]}")
 
-        r = client.get("/users?q=Smoke")
+        r = client.get("/users?q=Balance")
         check(
             "users search and edit modal",
             r.status_code == 200
-            and "Smoke Admin" in r.text
+            and "Balance User" in r.text
             and "data-modal-open=" in r.text
-            and "重置 Token 和路径" in r.text,
+            and "重置登录码" in r.text
+            and "绑定群组数量" in r.text
+            and "<th>角色</th>" not in r.text
+            and "<th>订阅</th><th>绑定群组数量</th><th>状态</th><th>操作</th>" in r.text
+            and "当前结果绑定" in r.text
+            and "保存余额" in r.text
+            and "控制台路径" not in r.text,
             f"{r.status_code} {r.text[:300]}",
         )
 
@@ -132,6 +235,75 @@ try:
             r.status_code == 200 and "没有匹配的用户" in r.text,
             f"{r.status_code} {r.text[:300]}",
         )
+
+        client.post("/logout", follow_redirects=False)
+        con = connect()
+        con.execute(
+            "UPDATE console_users SET balance_cents=800 WHERE telegram_id=?",
+            (ADMIN_ID + 10000,),
+        )
+        con.commit()
+        con.close()
+        r = client.get("/console?token=balance-user-token", follow_redirects=False)
+        check("balance user can open account page", r.status_code == 303 and r.headers.get("location") == "/")
+        r = client.get("/account")
+        check(
+            "account page shows CNY subscription purchase",
+            r.status_code == 200
+            and "¥8.00 CNY" in r.text
+            and "购买一个月" in r.text
+            and "余额 ¥8.00" in r.text,
+            r.text[:500],
+        )
+        r = client.post("/account/subscribe", follow_redirects=False)
+        con = connect()
+        account_balance = con.execute(
+            "SELECT balance_cents FROM console_users WHERE telegram_id=?", (ADMIN_ID + 10000,)
+        ).fetchone()[0]
+        subscription = con.execute(
+            "SELECT status, expires_at FROM subscriptions WHERE user_id=(SELECT id FROM console_users WHERE telegram_id=?)",
+            (ADMIN_ID + 10000,),
+        ).fetchone()
+        con.close()
+        check(
+            "account purchase charges eight CNY and activates subscription",
+            r.status_code == 303 and account_balance == 0 and subscription and subscription[0] == "active",
+            f"{r.status_code} {account_balance} {subscription}",
+        )
+        client.post("/logout", follow_redirects=False)
+        con = connect()
+        con.execute(
+            "UPDATE console_users SET balance_cents=799 WHERE telegram_id=?",
+            (ADMIN_ID + 10000,),
+        )
+        con.execute(
+            "UPDATE console_users SET token_hash=?, token_expires_at=datetime('now', '+15 minutes') WHERE telegram_id=?",
+            (hash_console_token("balance-user-low-token"), ADMIN_ID + 10000),
+        )
+        con.commit()
+        con.close()
+        client.get("/console?token=balance-user-low-token", follow_redirects=False)
+        r = client.post("/account/subscribe", follow_redirects=False)
+        con = connect()
+        unchanged = con.execute(
+            "SELECT balance_cents FROM console_users WHERE telegram_id=?", (ADMIN_ID + 10000,)
+        ).fetchone()[0]
+        con.close()
+        check(
+            "account purchase rejects insufficient funds",
+            r.status_code == 303 and unchanged == 799 and "err=" in r.headers.get("location", ""),
+            f"{r.status_code} {unchanged} {r.headers.get('location')}",
+        )
+        client.post("/logout", follow_redirects=False)
+        admin_token = "smoke-admin-after-purchase"
+        con = connect()
+        con.execute(
+            "UPDATE console_users SET token_hash=?, token_expires_at=datetime('now', '+15 minutes') WHERE telegram_id=?",
+            (hash_console_token(admin_token), ADMIN_ID),
+        )
+        con.commit()
+        con.close()
+        client.get(f"/console?token={admin_token}", follow_redirects=False)
 
         con = connect()
         con.execute(
@@ -866,13 +1038,54 @@ try:
             r.status_code == 303 and "msg=" in r.headers["location"],
             str(r.headers),
         )
+        con = connect()
+        added_owner = con.execute(
+            "SELECT telegram_id FROM console_users cu JOIN console_group_access ga ON ga.user_id=cu.id "
+            "WHERE ga.group_id=-100777 AND ga.role='owner'"
+        ).fetchone()
+        con.close()
+        check(
+            "added group is owned by current console user",
+            added_owner is not None and int(added_owner[0]) == ADMIN_ID,
+            repr(added_owner),
+        )
         r = client.get("/groups?q=手动添加")
-        check("added group visible", "手动添加群" in r.text, r.text[:400])
+        check(
+            "added group visible with owner",
+            "手动添加群" in r.text and "Smoke Admin" in r.text,
+            r.text[:400],
+        )
 
         r = client.get("/logout", follow_redirects=False)
         check(
+            "logout GET rejected",
+            r.status_code == 405,
+            f"{r.status_code} {r.text[:200]}",
+        )
+
+        r = client.post(
+            "/groups/-1001234567890/settings",
+            data={"title": "csrf"},
+            headers={"Referer": "http://evil.example/x"},
+            follow_redirects=False,
+        )
+        check(
+            "cross-origin referer rejected",
+            r.status_code == 403 and "CSRF" in r.text,
+            f"{r.status_code} {r.text[:200]}",
+        )
+
+        r = client.post("/logout", follow_redirects=False)
+        check(
             "logout",
             r.status_code == 303 and r.headers["location"] == "/login",
+            str(r.headers),
+        )
+
+        r = client.get("/", follow_redirects=False)
+        check(
+            "logout cleared session",
+            r.status_code == 303 and r.headers["location"].startswith("/login"),
             str(r.headers),
         )
 finally:
