@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import signal
 from contextlib import suppress
 
 from aiogram import Bot, Dispatcher
@@ -21,6 +22,8 @@ from ..services.scheduler import run_scheduler
 from .handlers import admin, ai_chat, commands, games, join, moderation, report
 
 log = logging.getLogger(__name__)
+RETRY_INITIAL_SECONDS = 1
+RETRY_MAX_SECONDS = 60
 
 PRIVATE_COMMANDS = [
     BotCommand(command="start", description="快速开始"),
@@ -109,7 +112,7 @@ def build_dispatcher() -> Dispatcher:
     return dp
 
 
-async def run_bot() -> None:
+async def run_bot(*, handle_signals: bool = True) -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
@@ -118,27 +121,79 @@ async def run_bot() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     await init_db()
-    bot = build_bot()
+    # aiogram forbids attaching the same router to a second Dispatcher, so the
+    # Dispatcher is built once and shared by every reconnect attempt.
     dp = build_dispatcher()
-    scheduler = asyncio.create_task(run_scheduler(bot))
+    loop = asyncio.get_running_loop()
+    current_task = asyncio.current_task()
+    signal_handlers: list[signal.Signals] = []
+    if handle_signals and current_task is not None:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, current_task.cancel)
+            except NotImplementedError:
+                continue
+            signal_handlers.append(sig)
+    active_bot: list[Bot | None] = [None]
+
+    class ActiveBot:
+        def __getattr__(self, name: str):
+            bot = active_bot[0]
+            if bot is None:
+                raise RuntimeError("Telegram bot is not connected")
+            return getattr(bot, name)
+
+    scheduler: asyncio.Task[None] | None = None
+    retry_delay = RETRY_INITIAL_SECONDS
+    bot: Bot | None = None
     try:
-        # Remove the legacy unscoped menu, then publish separate private and
-        # group menus.  Telegram clients use the most specific scope, so old
-        # commands cannot leak into the wrong chat type.
-        await bot.delete_my_commands()
-        await bot.set_my_commands(
-            PRIVATE_COMMANDS, scope=BotCommandScopeAllPrivateChats()
-        )
-        await bot.set_my_commands(GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats())
-        me = await bot.me()
-        log.info("Bot started as @%s (id=%s)", me.username, me.id)
-        await bot.delete_webhook(drop_pending_updates=False)
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        scheduler = asyncio.create_task(run_scheduler(ActiveBot()))
+        while True:
+            try:
+                if bot is None:
+                    bot = build_bot()
+                    active_bot[0] = bot
+                await bot.delete_my_commands()
+                await bot.set_my_commands(
+                    PRIVATE_COMMANDS, scope=BotCommandScopeAllPrivateChats()
+                )
+                await bot.set_my_commands(
+                    GROUP_COMMANDS, scope=BotCommandScopeAllGroupChats()
+                )
+                me = await bot.me()
+                log.info("Bot started as @%s (id=%s)", me.username, me.id)
+                await bot.delete_webhook(drop_pending_updates=False)
+                retry_delay = RETRY_INITIAL_SECONDS
+                await dp.start_polling(
+                    bot,
+                    allowed_updates=dp.resolve_used_update_types(),
+                    handle_signals=False,
+                )
+                # Only a stop request ends start_polling(); returning keeps
+                # shutdown from spinning into another reconnect.
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception(
+                    "Telegram attempt failed; retrying in %ss", retry_delay
+                )
+                if bot is not None:
+                    failed_bot = bot
+                    bot = None
+                    active_bot[0] = None
+                    await failed_bot.session.close()
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, RETRY_MAX_SECONDS)
     finally:
-        scheduler.cancel()
-        with suppress(asyncio.CancelledError):
-            await scheduler
-        await bot.session.close()
+        for sig in signal_handlers:
+            loop.remove_signal_handler(sig)
+        if scheduler is not None:
+            scheduler.cancel()
+            with suppress(asyncio.CancelledError):
+                await scheduler
+        if bot is not None:
+            await bot.session.close()
         await dispose_db()
 
 

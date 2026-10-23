@@ -15,7 +15,7 @@ log = logging.getLogger(__name__)
 
 async def _run_bot_safely() -> None:
     try:
-        await run_bot()
+        await run_bot(handle_signals=False)
     except asyncio.CancelledError:
         raise
     except Exception:
