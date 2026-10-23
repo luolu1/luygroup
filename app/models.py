@@ -9,6 +9,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     Column,
+    Date,
     DateTime,
     Index,
     Integer,
@@ -122,14 +123,11 @@ class ConsoleUser(Base):
     username = Column(String(128), default="")
     display_name = Column(String(255), default="")
     token_hash = Column(String(64), unique=True, index=True, nullable=False)
-    # The bot must be able to show the same temporary token again within its
-    # validity window. This value is only exposed to the owning admin in a
-    # private chat; token authentication still uses token_hash.
     token_value = Column(String(128), nullable=True)
     token_expires_at = Column(DateTime, nullable=True, index=True)
-    console_path = Column(String(32), unique=True, index=True, nullable=False)
     role = Column(String(24), default="user")  # superadmin / subscriber / user
     is_active = Column(Boolean, default=True, index=True)
+    balance_cents = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, default=utcnow)
     last_login_at = Column(DateTime, nullable=True)
 
@@ -472,6 +470,10 @@ class Report(Base):
     target_user_id = Column(BigInteger, nullable=True)
     reason = Column(String(512), default="")
     excerpt = Column(Text, default="")
+    review_status = Column(String(16), default="pending")
+    reviewed_by = Column(BigInteger, nullable=True)
+    reviewed_at = Column(DateTime, nullable=True)
+    review_note = Column(String(512), default="")
     message_id = Column(BigInteger, nullable=True)
     created_at = Column(DateTime, default=utcnow)
 
@@ -486,6 +488,18 @@ class PointsTransaction(Base):
     balance_after = Column(Integer, default=0)
     reason = Column(String(255), default="")
     created_at = Column(DateTime, default=utcnow)
+
+
+class DailyCheckin(Base):
+    __tablename__ = "daily_checkins"
+
+    id = Column(Integer, primary_key=True)
+    group_id = Column(BigInteger, index=True)
+    user_id = Column(BigInteger, index=True)
+    day = Column(Date, index=True)
+    created_at = Column(DateTime, default=utcnow)
+
+    __table_args__ = (UniqueConstraint("group_id", "user_id", "day", name="uq_daily_checkin"),)
 
 
 class ShopItem(Base):
@@ -640,6 +654,7 @@ __all__ = [
     "ReportLink",
     "Report",
     "PointsTransaction",
+    "DailyCheckin",
     "ShopItem",
     "ShopOrder",
     "RedPacket",

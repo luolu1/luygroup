@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import (
 from .config import get_config
 from .entitlements import ADVANCED_FEATURES
 from .models import AIProvider, Base, ConsoleUser, SubscriptionPlan, utcnow
-from .web.auth import hash_console_token, new_console_token, new_console_path
+from .web.auth import hash_console_token, new_console_token
 
 log = logging.getLogger(__name__)
 
@@ -105,12 +105,19 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
         "console_users": {
             "token_value": "VARCHAR(128)",
             "token_expires_at": "DATETIME",
+            "balance_cents": "INTEGER NOT NULL DEFAULT 0",
         },
         "ai_providers": {
             "owner_user_id": "INTEGER",
         },
         "global_blacklist": {
             "owner_user_id": "INTEGER",
+        },
+        "reports": {
+            "review_status": "TEXT DEFAULT 'pending'",
+            "reviewed_by": "BIGINT",
+            "reviewed_at": "DATETIME",
+            "review_note": "VARCHAR(512) DEFAULT ''",
         },
     }
     for table, additions in columns.items():
@@ -138,6 +145,52 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
         "CREATE INDEX IF NOT EXISTS ix_global_blacklist_owner_user_id "
         "ON global_blacklist (owner_user_id)"
     )
+
+    console_columns = {
+        str(row[1])
+        for row in conn.exec_driver_sql("PRAGMA table_info(console_users)").fetchall()
+    }
+    if "console_path" in console_columns:
+        conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        conn.exec_driver_sql(
+            "CREATE TABLE console_users_new ("
+            "id INTEGER NOT NULL PRIMARY KEY, telegram_id BIGINT, username VARCHAR(128), "
+            "display_name VARCHAR(255), token_hash VARCHAR(64) NOT NULL, "
+            "token_value VARCHAR(128), token_expires_at DATETIME, role VARCHAR(24), "
+            "is_active BOOLEAN, balance_cents INTEGER NOT NULL DEFAULT 0, "
+            "created_at DATETIME, last_login_at DATETIME)"
+        )
+        kept_columns = [
+            "id", "telegram_id", "username", "display_name", "token_hash",
+            "token_value", "token_expires_at", "role", "is_active",
+            "balance_cents", "created_at", "last_login_at",
+        ]
+        names = ", ".join(kept_columns)
+        conn.exec_driver_sql(
+            f"INSERT INTO console_users_new ({names}) SELECT {names} FROM console_users"
+        )
+        conn.exec_driver_sql("DROP TABLE console_users")
+        conn.exec_driver_sql("ALTER TABLE console_users_new RENAME TO console_users")
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_console_users_telegram_id "
+            "ON console_users (telegram_id)"
+        )
+        conn.exec_driver_sql(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_console_users_token_hash "
+            "ON console_users (token_hash)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_console_users_token_expires_at "
+            "ON console_users (token_expires_at)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_console_users_role ON console_users (role)"
+        )
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_console_users_is_active "
+            "ON console_users (is_active)"
+        )
+        conn.exec_driver_sql("PRAGMA foreign_keys=ON")
 
     # Backfill the new warning metadata for records created before the columns
     # existed. This is additive and safe to run on every startup.
@@ -274,17 +327,13 @@ async def init_db() -> None:
                     username="",
                     display_name=f"管理员 {telegram_id}",
                     token_hash=hash_console_token(token),
-                    token_value=token,
-                    token_expires_at=utcnow() + timedelta(days=1),
-                    console_path=new_console_path(),
+                    token_value=None,
+                    token_expires_at=utcnow() + timedelta(minutes=15),
                     role="superadmin",
                 )
                 session.add(user)
                 await session.flush()
-                log.warning(
-                    "控制台用户已创建，请保存一次性登录地址: %s/console/%s?token=%s",
-                    cfg.web.base_url.rstrip("/"), user.console_path, token,
-                )
+                log.warning("控制台超管账号已创建，请私聊机器人发送 /token 获取一次性登录码。")
 
 
 async def dispose_db() -> None:
