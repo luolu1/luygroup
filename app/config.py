@@ -30,7 +30,6 @@ class WebConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8090
     secret_key: str = "change-me"
-    password: str = "admin123456"
     base_url: str = "http://127.0.0.1:8090"
     session_max_age: int = 86400
 

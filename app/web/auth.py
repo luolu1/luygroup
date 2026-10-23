@@ -3,11 +3,8 @@ from __future__ import annotations
 
 import secrets
 import hashlib
-import string
 
 from fastapi import Request
-
-from ..config import get_config
 
 
 class LoginRequired(Exception):
@@ -20,11 +17,6 @@ def hash_console_token(token: str) -> str:
 
 def new_console_token() -> str:
     return secrets.token_urlsafe(32)
-
-
-def new_console_path() -> str:
-    alphabet = string.ascii_lowercase
-    return "".join(secrets.choice(alphabet) for _ in range(12))
 
 
 def current_admin_id(request: Request) -> int | None:
@@ -47,12 +39,6 @@ def require_admin(request: Request) -> int:
     if admin_id is None:
         raise LoginRequired()
     return admin_id
-
-
-def verify_credentials(admin_id: int, password: str) -> bool:
-    # Kept as a compatibility shim for integrations; web login no longer uses IDs.
-    config = get_config()
-    return secrets.compare_digest(password or "", config.web.password or "")
 
 
 def safe_next(raw: str | None, default: str = "/") -> str:

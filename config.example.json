@@ -9,7 +9,6 @@
     "host": "0.0.0.0",
     "port": 8090,
     "secret_key": "CHANGE_ME_TO_A_LONG_RANDOM_STRING",
-    "password": "CHANGE_ME_PANEL_PASSWORD",
     "base_url": "http://127.0.0.1:8090",
     "session_max_age": 86400
   },
