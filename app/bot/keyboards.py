@@ -27,6 +27,12 @@ def close_button() -> InlineKeyboardMarkup:
     return builder.as_markup()
 
 
+def console_login_kb(url: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🌐 访问控制台", url=url))
+    return builder.as_markup()
+
+
 def verification_kb(
     token: str,
     channels: list[tuple[str, str]],

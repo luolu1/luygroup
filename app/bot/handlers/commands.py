@@ -28,7 +28,7 @@ from ...models import (
     day_key,
     utcnow,
 )
-from ...web.auth import hash_console_token, new_console_path, new_console_token
+from ...web.auth import hash_console_token, new_console_token
 from ...services import repo
 from .. import helpers, keyboards
 
@@ -167,7 +167,6 @@ async def cmd_panel(message: Message, bot: Bot) -> None:
 
 
 async def _issue_console_access(message: Message) -> None:
-    """Show the user's current token, rotating it every 24 hours."""
     user_id = message.from_user.id if message.from_user else None
     if not user_id or message.chat.type != "private":
         return
@@ -177,27 +176,64 @@ async def _issue_console_access(message: Message) -> None:
         )
         if user is None:
             user = await _ensure_console_user(message, session)
+        else:
+            user.username = (message.from_user.username or user.username or "")[:128]
+            user.display_name = (
+                message.from_user.full_name
+                or message.from_user.first_name
+                or user.display_name
+                or ""
+            )[:255]
         if not user.is_active:
             return
         now = utcnow()
-        # Repeated /console calls within the validity window must return the
-        # same credential. Legacy users without a stored value are rotated
-        # once so the URL can be displayed safely.
-        if not user.token_value or not user.token_expires_at or user.token_expires_at <= now:
-            token = new_console_token()
-            user.token_hash = hash_console_token(token)
-            user.token_value = token
-            user.token_expires_at = now + timedelta(days=1)
-        else:
-            token = user.token_value
+        token = new_console_token()
+        user.token_hash = hash_console_token(token)
+        user.token_value = None
+        user.token_expires_at = now + timedelta(minutes=15)
+        entitlements = await build_for_user(session, user)
+        bound = int(
+            await session.scalar(
+                select(func.count(ConsoleGroupAccess.id)).where(
+                    ConsoleGroupAccess.user_id == user.id
+                )
+            )
+            or 0
+        )
         await session.flush()
         web = get_config().web
-        url = f"{web.base_url.rstrip('/')}/console/{user.console_path}?token={token}"
+        url = f"{web.base_url.rstrip('/')}/console?token={token}"
+        group_limit = "不限" if entitlements.group_limit is None else str(entitlements.group_limit)
+        if entitlements.subscription is not None:
+            plan = entitlements.plan
+            plan_name = plan.name if plan else "订阅版"
+            expiry = "永久" if entitlements.subscription.expires_at is None else repo.dt(entitlements.subscription.expires_at)
+            subscription_text = f"{plan_name}，到期 {expiry}"
+        elif entitlements.is_superadmin:
+            subscription_text = "超级管理员（长期有效）"
+        else:
+            subscription_text = "无"
+        account = (
+            f"{user.telegram_id} (@{user.username})"
+            if user.username
+            else str(user.telegram_id)
+        )
+        balance_cents = int(user.balance_cents or 0)
+        balance = f"{balance_cents // 100}.{balance_cents % 100:02d}"
+        text = (
+            f"账号: {escape(account)}\n"
+            f"余额: {balance}\n"
+            f"绑定上限: {group_limit}，当前已绑定 {bound}\n"
+            f"token: <code>{token}</code>\n"
+            f"控制台: {escape(web.base_url.rstrip('/'))}/console\n"
+            f"当前订阅: {escape(subscription_text)}\n\n"
+            "登录码 15 分钟内有效，只能使用一次。\n"
+            "登录后可使用已开通的订阅功能并配置自己的 AI 接口。"
+        )
     await message.reply(
-        "🌐 <b>GroupGuard 订阅控制台</b>\n\n"
-        "以下是你的控制台登录地址（24 小时内重复发送 /console 不会变化）：\n"
-        f"<code>{escape(url)}</code>\n\n"
-        "⚠️ Token 有效期 24 小时，过期后再次发送 /console 将自动生成新的 Token。"
+        text,
+        reply_markup=keyboards.console_login_kb(url),
+        disable_web_page_preview=True,
     )
 
 
@@ -297,10 +333,11 @@ async def cmd_sub(message: Message) -> None:
         f"📅 状态：{status} · 到期：{expires}",
         f"🏘 可绑定群组：{group_limit} · 已绑定：{bound}",
         f"🤖 AI 每日额度：{ai_quota}",
+        f"💰 账户余额：¥{int(current.balance_cents or 0) // 100}.{int(current.balance_cents or 0) % 100:02d} CNY",
         "",
         feature_text,
         "",
-        "发送 /console 打开订阅控制台。",
+        "发送 /console 打开控制台，在「账户与订阅」中以 ¥8.00 CNY/月购买或续费。",
     ]
     await message.reply("\n".join(lines))
 
@@ -373,7 +410,6 @@ async def _ensure_console_user(
                 display_name=(telegram_user.full_name or telegram_user.first_name or "")[:255],
                 role="superadmin" if is_global_admin(telegram_user.id) else "user",
                 token_hash=hash_console_token(new_console_token()),
-                console_path=new_console_path(),
             )
             # The first token is issued by /console, so do not expose
             # a credential merely because the user sent /start.

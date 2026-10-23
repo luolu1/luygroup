@@ -36,8 +36,9 @@ sys.path.insert(0, str(ROOT))
 
 from sqlalchemy import select  # noqa: E402
 
-from app.bot.handlers import admin as admin_handlers, commands  # noqa: E402
-from app.bot.keyboards import main_menu  # noqa: E402
+from app.bot.handlers import admin as admin_handlers, commands, report as report_handlers  # noqa: E402
+from app.bot.helpers import has_permission  # noqa: E402
+from app.bot.keyboards import console_login_kb, main_menu  # noqa: E402
 from app.bot.main import GROUP_COMMANDS, PRIVATE_COMMANDS  # noqa: E402
 from app.db import init_db, session_scope  # noqa: E402
 from app.entitlements import group_feature_allowed  # noqa: E402
@@ -48,6 +49,7 @@ from app.models import (  # noqa: E402
     Group,
     Member,
     MemberDailyStat,
+    Report,
     UserNotificationPreference,
     utcnow,
 )
@@ -93,6 +95,7 @@ class FakeUser:
     def __init__(self, user_id: int, first_name: str = "Tester") -> None:
         self.id = user_id
         self.first_name = first_name
+        self.full_name = first_name
         self.username = f"user{user_id}"
         self.is_bot = False
 
@@ -123,12 +126,14 @@ class FakeMessage:
         self.reply_to_message = None
         self.answers: list[str] = []
         self.replies: list[str] = []
+        self.reply_kwargs: dict[str, object] = {}
 
     async def answer(self, text: str, **kwargs) -> None:
         self.answers.append(text)
 
     async def reply(self, text: str, **kwargs) -> None:
         self.replies.append(text)
+        self.reply_kwargs = kwargs
 
 
 class FakeBot:
@@ -147,6 +152,12 @@ class FakeBot:
 
     async def get_chat_member(self, chat_id, user_id):
         return SimpleNamespace(status="member")
+
+    async def me(self):
+        return SimpleNamespace(id=999999)
+
+    async def send_message(self, *args, **kwargs):
+        return None
 
 
 def command_names_from_menu(text: str) -> set[str]:
@@ -174,12 +185,18 @@ async def create_console_user(telegram_id: int, role: str = "user") -> int:
             username=f"user{telegram_id}",
             display_name="Smoke User",
             token_hash=hashlib.sha256(raw.encode()).hexdigest(),
-            console_path=hashlib.sha1(raw.encode()).hexdigest()[:20],
             role=role,
         )
         session.add(user)
         await session.flush()
         return int(user.id)
+
+
+async def get_console_user(telegram_id: int) -> ConsoleUser | None:
+    async with session_scope() as session:
+        return await session.scalar(
+            select(ConsoleUser).where(ConsoleUser.telegram_id == int(telegram_id))
+        )
 
 
 async def bind_group(user_id: int, group_id: int) -> None:
@@ -268,6 +285,65 @@ async def run_tests() -> None:
         {"help:group", "help:private", "panel:close"}.issubset(callbacks),
         str(callbacks),
     )
+    login_kb = console_login_kb("https://example.test/console?token=code")
+    login_button = login_kb.inline_keyboard[0][0]
+    check(
+        "console login keyboard uses URL button",
+        login_button.url == "https://example.test/console?token=code",
+        str(login_button),
+    )
+
+    token_user_id = 915001
+    token_user_pk = await create_console_user(token_user_id, "subscriber")
+    await create_group(-100915001, "Token summary")
+    await create_group(-100915002, "Token summary 2")
+    await bind_group(token_user_pk, -100915001)
+    await bind_group(token_user_pk, -100915002)
+    token_msg = FakeMessage(
+        user_id=token_user_id, chat_id=token_user_id, chat_type="private", text="/token"
+    )
+    token_msg.from_user.username = "token_tester"
+    await commands.cmd_token(token_msg)
+    token_text = "\n".join(token_msg.replies)
+    check(
+        "token summary includes account and balance",
+        f"{token_user_id} (@token_tester)" in token_text and "余额: 0.00" in token_text,
+        token_text,
+    )
+    check(
+        "token summary includes binding and one-time expiry",
+        "绑定上限: 5，当前已绑定 2" in token_text
+        and "15 分钟内有效，只能使用一次" in token_text,
+        token_text,
+    )
+    sub_msg = FakeMessage(
+        user_id=token_user_id,
+        chat_id=token_user_id,
+        chat_type="private",
+        text="/sub",
+    )
+    await commands.cmd_sub(sub_msg)
+    sub_text = "\n".join(sub_msg.replies)
+    check(
+        "/sub includes CNY balance and monthly purchase instructions",
+        "账户余额：¥0.00 CNY" in sub_text
+        and "¥8.00 CNY/月" in sub_text
+        and "账户与订阅" in sub_text,
+        sub_text,
+    )
+    token_url = token_msg.reply_kwargs["reply_markup"].inline_keyboard[0][0].url
+    login_token = token_text.split("token: <code>")[1].split("</code>")[0]
+    async with session_scope() as session:
+        token_user = await session.get(ConsoleUser, token_user_pk)
+        check(
+            "token expires in fifteen minutes and is hash-only",
+            token_user is not None
+            and token_user.token_expires_at is not None
+            and 0 < (token_user.token_expires_at - utcnow()).total_seconds() <= 900
+            and token_user.token_value is None
+            and token_url.endswith("/console?token=" + login_token),
+            token_url,
+        )
 
     # ------------------------------------------------------------------
     # `/ads` switches menu by chat type
@@ -385,6 +461,14 @@ async def run_tests() -> None:
             "basic bound group keeps settings",
             await group_feature_allowed(session, -100920001, "settings"),
         )
+        check(
+            "bound group owner can manage group despite Telegram lookup failure",
+            await has_permission(FakeBot(), session, -100920001, 920001, "ban"),
+        )
+        check(
+            "unbound user cannot manage another group",
+            not await has_permission(FakeBot(), session, -100920001, 920099, "ban"),
+        )
     async with session_scope() as session:
         user = await session.get(ConsoleUser, basic_id)
         assert user is not None
@@ -398,6 +482,33 @@ async def run_tests() -> None:
             "subscriber bound group allows ai",
             await group_feature_allowed(session, -100920001, "ai"),
         )
+
+    report_group_id = -100920010
+    await create_group(report_group_id, "Report learning")
+    report_owner_id = await create_console_user(920010, "subscriber")
+    await bind_group(report_owner_id, report_group_id)
+    reporter = FakeMessage(
+        user_id=920011, chat_id=report_group_id, text="/report 诈骗广告"
+    )
+    reporter.reply_to_message = SimpleNamespace(
+        from_user=FakeUser(920012, "Target"),
+        chat=reporter.chat,
+        text="投资返利，点击 example.invalid",
+        caption=None,
+        message_id=77,
+    )
+    await report_handlers.cmd_report(reporter, FakeBot())
+    report_entry = ai_learning.learning_store.get(
+        "ad", report_group_id, "投资返利，点击 example.invalid"
+    )
+    check(
+        "member ad report is learned immediately with provenance",
+        report_entry is not None
+        and report_entry.get("is_ad") is True
+        and report_entry.get("provider") == "member-report"
+        and report_entry.get("report_id") is not None,
+        str(report_entry),
+    )
 
     # Atomic daily counter keeps concurrent messages from colliding.
     daily_group = -100920003

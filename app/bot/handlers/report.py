@@ -14,6 +14,7 @@ from ...db import session_scope
 from ...entitlements import group_feature_allowed
 from ...models import Report, ReportLink
 from ...services import repo
+from ...services.ai import learning_store
 from .. import helpers
 
 router = Router(name="report")
@@ -85,6 +86,20 @@ async def cmd_report(message: Message, bot: Bot) -> None:
         session.add(report)
         await session.flush()
         report_id = report.id
+        if excerpt:
+            await learning_store.put(
+                "ad",
+                group.id,
+                excerpt,
+                "广告举报（待管理员审核）",
+                meta={
+                    "provider": "member-report",
+                    "is_ad": True,
+                    "reason": reason,
+                    "report_id": report_id,
+                    "reporter_id": message.from_user.id,
+                },
+            )
 
         destinations: set[int] = set()
         if group.report_chat_id:
