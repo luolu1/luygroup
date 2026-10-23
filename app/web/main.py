@@ -4,10 +4,10 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
@@ -51,6 +51,31 @@ class ConsoleContextMiddleware(BaseHTTPMiddleware):
                             request.session["console_role"] = user.role
                 except Exception:  # never let a context lookup break the panel
                     log.exception("加载控制台权限失败")
+        return await call_next(request)
+
+
+UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+class CSRFOriginMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
+        path = request.url.path
+        if request.method in UNSAFE_METHODS and not path.startswith("/static") and path != "/healthz":
+            origin = request.headers.get("origin")
+            referer = request.headers.get("referer")
+            if origin == "null":
+                return PlainTextResponse("CSRF check failed", status_code=403)
+            candidate = origin or referer
+            if candidate:
+                netloc = urlsplit(candidate).netloc.lower()
+                allowed = {
+                    (request.headers.get("host") or "").lower(),
+                    urlsplit(get_config().web.base_url).netloc.lower(),
+                }
+                if netloc not in allowed:
+                    return PlainTextResponse("CSRF check failed", status_code=403)
+            # Missing Origin/Referer means a non-browser client; real cross-site
+            # browser POSTs carry Origin and are already blocked by SameSite=Lax.
         return await call_next(request)
 
 
@@ -101,6 +126,7 @@ def create_app() -> FastAPI:
 
     app.include_router(pages.public_router)
     app.include_router(pages.router)
+    app.add_middleware(CSRFOriginMiddleware)
     return app
 
 
