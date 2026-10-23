@@ -10,13 +10,15 @@ from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command
 from aiogram.types import CallbackQuery, Message
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from ...db import session_scope
 from ...entitlements import group_feature_allowed
 from ...models import (
     Auction,
     AuctionBid,
+    DailyCheckin,
     Lottery,
     LotteryEntry,
     Member,
@@ -100,6 +102,67 @@ async def _feature_denied(session, group, feature: str) -> bool:
 async def _reply_feature_denied(message: Message, feature: str) -> None:
     label = "积分玩法" if feature == "points" else "抽奖与竞拍"
     await message.reply(f"⛔ 本群所属订阅未开通{label}，请联系群主升级订阅。")
+
+
+async def _claim_auction_slot(
+    session,
+    auction_id: int,
+    observed_price: int,
+    observed_bidder: int | None,
+    new_bidder: int,
+    new_price: int,
+    now,
+) -> bool:
+    """CAS the auction price/bidder so only one of two racing bids can win."""
+    stmt = update(Auction).where(
+        Auction.id == auction_id,
+        Auction.status == "open",
+        Auction.current_price == observed_price,
+        or_(Auction.ends_at.is_(None), Auction.ends_at > now),
+    )
+    if observed_bidder is None:
+        stmt = stmt.where(Auction.current_bidder.is_(None))
+    else:
+        stmt = stmt.where(Auction.current_bidder == observed_bidder)
+    stmt = (
+        stmt.values(current_price=new_price, current_bidder=new_bidder)
+        .returning(Auction.id)
+        .execution_options(synchronize_session=False)
+    )
+    row = (await session.execute(stmt)).first()
+    return row is not None
+
+
+async def _claim_packet_slot(
+    session,
+    packet_id: int,
+    remaining_count: int,
+    remaining_amount: int,
+    amount: int,
+    now,
+) -> bool:
+    """CAS the packet remainder so concurrent claims cannot overdraw it."""
+    new_count = remaining_count - 1
+    new_amount = remaining_amount - amount
+    stmt = (
+        update(RedPacket)
+        .where(
+            RedPacket.id == packet_id,
+            RedPacket.status == "open",
+            RedPacket.remaining_count == remaining_count,
+            RedPacket.remaining_amount == remaining_amount,
+            or_(RedPacket.expires_at.is_(None), RedPacket.expires_at > now),
+        )
+        .values(
+            remaining_amount=new_amount,
+            remaining_count=new_count,
+            status="finished" if (new_count <= 0 or new_amount <= 0) else "open",
+        )
+        .returning(RedPacket.id)
+        .execution_options(synchronize_session=False)
+    )
+    row = (await session.execute(stmt)).first()
+    return row is not None
 
 
 async def _send_promotion(
@@ -254,6 +317,17 @@ async def cmd_checkin(message: Message) -> None:
         if exists:
             await message.reply("今天已经签到过了，明天再来吧～")
             return
+        claimed = (
+            await session.execute(
+                sqlite_insert(DailyCheckin)
+                .values(group_id=group.id, user_id=message.from_user.id, day=now.date())
+                .on_conflict_do_nothing(index_elements=["group_id", "user_id", "day"])
+                .returning(DailyCheckin.id)
+            )
+        ).first()
+        if claimed is None:
+            await message.reply("今天已经签到过了，明天再来吧～")
+            return
         bonus = max(1, int(group.daily_bonus or 1))
         result = await repo.adjust_points(
             session,
@@ -265,6 +339,7 @@ async def cmd_checkin(message: Message) -> None:
             first_name=message.from_user.first_name or "",
         )
         if result is None:
+            await session.rollback()
             await message.reply("签到失败，请稍后再试。")
             return
         _member, balance = result
@@ -335,6 +410,24 @@ async def _purchase(
         return "商品库存不足。"
     if not group.points_enabled:
         return "本群未开启积分商城。"
+    if item.stock > 0:
+        stock_row = (
+            await session.execute(
+                update(ShopItem)
+                .where(
+                    ShopItem.id == item.id,
+                    ShopItem.enabled.is_(True),
+                    ShopItem.cost == int(item.cost),
+                    func.coalesce(ShopItem.stock, 0) >= 1,
+                )
+                .values(stock=func.coalesce(ShopItem.stock, 0) - 1)
+                .returning(ShopItem.stock)
+                .execution_options(synchronize_session=False)
+            )
+        ).first()
+        if stock_row is None:
+            await session.rollback()
+            return "商品库存不足。"
     result = await repo.adjust_points(
         session,
         group.id,
@@ -345,9 +438,8 @@ async def _purchase(
         first_name=user.first_name or "",
     )
     if result is None:
+        await session.rollback()
         return "积分不足，无法购买。"
-    if item.stock > 0:
-        item.stock -= 1
     session.add(
         ShopOrder(
             group_id=group.id,
@@ -493,8 +585,8 @@ async def on_claim_packet(callback: CallbackQuery) -> None:
         if packet.sender_id == callback.from_user.id:
             await callback.answer("不能领取自己发的红包。", show_alert=True)
             return
-        if packet.status != "open" or (packet.expires_at and packet.expires_at <= utcnow()):
-            packet.status = "expired" if packet.status == "open" else packet.status
+        now = utcnow()
+        if packet.status != "open" or (packet.expires_at and packet.expires_at <= now):
             await callback.answer("红包已过期或已领完。", show_alert=True)
             return
         group = await repo.ensure_group(session, group_id)
@@ -516,14 +608,25 @@ async def on_claim_packet(callback: CallbackQuery) -> None:
             await callback.answer(f"你已经领过 {claim.amount} 积分了。", show_alert=True)
             return
 
-        remaining_count = max(1, int(packet.remaining_count or 0))
-        remaining_amount = max(1, int(packet.remaining_amount or 0))
+        remaining_count = int(packet.remaining_count or 0)
+        remaining_amount = int(packet.remaining_amount or 0)
+        if remaining_count <= 0 or remaining_amount <= 0:
+            await callback.answer("红包已领完。", show_alert=True)
+            return
         if remaining_count == 1:
             amount = remaining_amount
         else:
             safe_max = max(1, remaining_amount - (remaining_count - 1))
             average = max(1, remaining_amount // remaining_count)
             amount = min(safe_max, random.randint(1, max(1, average * 2)))
+        if not await _claim_packet_slot(
+            session, packet.id, remaining_count, remaining_amount, amount, now
+        ):
+            await session.rollback()
+            await callback.answer(
+                "手慢了，红包已被抢完或已过期。", show_alert=True
+            )
+            return
         await repo.adjust_points(
             session,
             group_id,
@@ -540,17 +643,16 @@ async def on_claim_packet(callback: CallbackQuery) -> None:
                 amount=amount,
             )
         )
-        packet.remaining_amount = remaining_amount - amount
-        packet.remaining_count = remaining_count - 1
-        if packet.remaining_count <= 0 or packet.remaining_amount <= 0:
-            packet.status = "finished"
-        status_text = "🎉 最后一个红包！" if packet.status == "finished" else "继续抢"
-        await callback.answer(f"抢到 {amount} 积分！{status_text}", show_alert=True)
-        try:
-            if callback.message:
-                await callback.message.edit_reply_markup(reply_markup=None if packet.status == "finished" else keyboards.redpacket_kb(packet.id))
-        except TelegramAPIError:
-            pass
+        finished = remaining_count - 1 <= 0 or remaining_amount - amount <= 0
+    status_text = "🎉 最后一个红包！" if finished else "继续抢"
+    await callback.answer(f"抢到 {amount} 积分！{status_text}", show_alert=True)
+    try:
+        if callback.message:
+            await callback.message.edit_reply_markup(
+                reply_markup=None if finished else keyboards.redpacket_kb(packet_id)
+            )
+    except TelegramAPIError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +754,18 @@ async def on_lottery_join(callback: CallbackQuery) -> None:
                 "本群所属订阅未开通抽奖与竞拍。", show_alert=True
             )
             return
+        claimed = (
+            await session.execute(
+                sqlite_insert(LotteryEntry)
+                .values(lottery_id=lottery.id, user_id=callback.from_user.id)
+                .on_conflict_do_nothing(index_elements=["lottery_id", "user_id"])
+                .returning(LotteryEntry.id)
+            )
+        ).first()
+        if claimed is None:
+            await session.rollback()
+            await callback.answer("你已经参与过了。", show_alert=True)
+            return
         if lottery.entry_fee > 0:
             result = await repo.adjust_points(
                 session,
@@ -663,17 +777,16 @@ async def on_lottery_join(callback: CallbackQuery) -> None:
                 first_name=callback.from_user.first_name or "",
             )
             if result is None:
+                await session.rollback()
                 await callback.answer("积分不足，无法参与。", show_alert=True)
                 return
-        session.add(LotteryEntry(lottery_id=lottery.id, user_id=callback.from_user.id))
-        await session.flush()
         total = int(
             await session.scalar(
                 select(func.count(LotteryEntry.id)).where(LotteryEntry.lottery_id == lottery.id)
             )
             or 0
         )
-        await callback.answer(f"参与成功！当前共 {total} 人")
+    await callback.answer(f"参与成功！当前共 {total} 人")
 
 
 # ---------------------------------------------------------------------------
@@ -803,10 +916,13 @@ async def cmd_bid(message: Message, bot: Bot) -> None:
         if auction is None:
             await message.reply("当前没有进行中的竞拍。")
             return
-        if auction.ends_at and auction.ends_at <= utcnow():
+        now = utcnow()
+        if auction.ends_at and auction.ends_at <= now:
             await message.reply("竞拍已经结束，等待结算。")
             return
-        minimum = auction.start_price if auction.current_bidder is None else auction.current_price + max(1, auction.step)
+        observed_price = int(auction.current_price or 0)
+        observed_bidder = auction.current_bidder
+        minimum = auction.start_price if observed_bidder is None else observed_price + max(1, auction.step)
         if amount < minimum:
             await message.reply(f"出价太低，最低需要 {minimum} 积分。")
             return
@@ -820,12 +936,26 @@ async def cmd_bid(message: Message, bot: Bot) -> None:
         if int(member.points or 0) < amount:
             await message.reply(f"积分不足，当前余额 {int(member.points or 0)}。")
             return
-        if auction.current_bidder is not None:
+        if not await _claim_auction_slot(
+            session,
+            auction.id,
+            observed_price,
+            observed_bidder,
+            message.from_user.id,
+            amount,
+            now,
+        ):
+            await session.rollback()
+            await message.reply(
+                "出价未生效：已有其他用户抢先出价，请重新出价。"
+            )
+            return
+        if observed_bidder is not None:
             await repo.adjust_points(
                 session,
                 group.id,
-                auction.current_bidder,
-                auction.current_price,
+                observed_bidder,
+                observed_price,
                 f"竞拍被超过退款：{auction.item}",
             )
         result = await repo.adjust_points(
@@ -836,10 +966,9 @@ async def cmd_bid(message: Message, bot: Bot) -> None:
             f"竞拍出价：{auction.item}",
         )
         if result is None:
+            await session.rollback()
             await message.reply("积分不足，出价失败。")
             return
-        auction.current_price = amount
-        auction.current_bidder = message.from_user.id
         session.add(
             AuctionBid(
                 auction_id=auction.id,

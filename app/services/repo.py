@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Iterable
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -299,9 +299,20 @@ async def adjust_points(
     member = await ensure_member(
         session, group_id, user_id, username=username, first_name=first_name
     )
-    new_balance = int(member.points or 0) + int(amount)
-    if new_balance < 0 and not allow_negative:
+    # 原子累加，避免并发读写同一余额时丢更新。
+    stmt = (
+        update(Member)
+        .where(Member.id == member.id)
+        .values(points=func.coalesce(Member.points, 0) + int(amount))
+        .returning(Member.points)
+        .execution_options(synchronize_session=False)
+    )
+    if not allow_negative:
+        stmt = stmt.where(func.coalesce(Member.points, 0) + int(amount) >= 0)
+    row = (await session.execute(stmt)).first()
+    if row is None:
         return None
+    new_balance = int(row[0] or 0)
     member.points = new_balance
     session.add(
         PointsTransaction(

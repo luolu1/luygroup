@@ -9,7 +9,7 @@ from html import escape
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from ..db import session_scope
 from ..models import (
@@ -226,6 +226,64 @@ async def expire_verifications(bot: Bot) -> None:
         await _delete_verification_message(bot, chat_id, message_id)
 
 
+async def _claim_lottery(session, lottery_id: int) -> bool:
+    """Atomically take ownership of a due lottery.
+
+    Only one transaction can flip ``open`` to ``drawn`` and get a RETURNING
+    row; the loser sees no row and must skip all side effects.
+    """
+    stmt = (
+        update(Lottery)
+        .where(Lottery.id == lottery_id, Lottery.status == "open")
+        .values(status="drawn")
+        .returning(Lottery.id)
+        .execution_options(synchronize_session=False)
+    )
+    row = (await session.execute(stmt)).first()
+    return row is not None
+
+
+async def _claim_auction(
+    session, auction_id: int, current_bidder: int | None, current_price: int
+) -> bool:
+    """Atomically finish (or cancel) a due auction.
+
+    The bidder/price predicates are part of the CAS so a bid that arrives
+    between the scan and the claim makes the claim fail; the next tick then
+    settles the auction with the newer price instead of announcing a stale one.
+    """
+    stmt = update(Auction).where(Auction.id == auction_id, Auction.status == "open")
+    if current_bidder is None:
+        stmt = stmt.where(Auction.current_bidder.is_(None)).values(status="cancelled")
+    else:
+        stmt = stmt.where(
+            Auction.current_bidder.is_not(None),
+            Auction.current_price == current_price,
+        ).values(status="finished")
+    stmt = stmt.returning(Auction.id).execution_options(synchronize_session=False)
+    row = (await session.execute(stmt)).first()
+    return row is not None
+
+
+async def _claim_red_packet(session, packet_id: int) -> int | None:
+    """Atomically expire a due red packet and return its refundable remainder.
+
+    ``None`` means another worker already settled it; callers must not refund
+    or announce anything in that case.
+    """
+    stmt = (
+        update(RedPacket)
+        .where(RedPacket.id == packet_id, RedPacket.status == "open")
+        .values(status="expired")
+        .returning(RedPacket.remaining_amount)
+        .execution_options(synchronize_session=False)
+    )
+    row = (await session.execute(stmt)).first()
+    if row is None:
+        return None
+    return int(row[0] or 0)
+
+
 async def draw_lotteries(bot: Bot) -> None:
     messages: list[tuple[int, str]] = []
     async with session_scope() as session:
@@ -240,6 +298,8 @@ async def draw_lotteries(bot: Bot) -> None:
             )
         ).all()
         for lottery in lotteries:
+            if not await _claim_lottery(session, lottery.id):
+                continue
             entries = (
                 await session.scalars(
                     select(LotteryEntry).where(LotteryEntry.lottery_id == lottery.id)
@@ -248,7 +308,6 @@ async def draw_lotteries(bot: Bot) -> None:
             if entries:
                 count = max(1, int(lottery.winners_count or 1))
                 winners = random.sample(entries, min(count, len(entries)))
-                lottery.status = "drawn"
                 winner_text = "、".join(_mention(w.user_id) for w in winners)
                 text = (
                     f"🎉 <b>抽奖开奖：{lottery.title}</b>\n"
@@ -258,7 +317,6 @@ async def draw_lotteries(bot: Bot) -> None:
                     "请中奖者联系管理员领奖。"
                 )
             else:
-                lottery.status = "drawn"
                 text = f"🎲 抽奖「{lottery.title}」已到期，但无人参与，本轮流奖。"
             await repo.add_log(
                 session, lottery.group_id, None, "lottery_draw", None, lottery.title
@@ -285,8 +343,11 @@ async def finish_auctions(bot: Bot) -> None:
             )
         ).all()
         for auction in auctions:
+            if not await _claim_auction(
+                session, auction.id, auction.current_bidder, auction.current_price
+            ):
+                continue
             if auction.current_bidder is not None:
-                auction.status = "finished"
                 text = (
                     f"🔨 <b>竞拍结束：{auction.item}</b>\n"
                     f"成交价：{auction.current_price} 积分\n"
@@ -294,7 +355,6 @@ async def finish_auctions(bot: Bot) -> None:
                     "积分已在出价时扣除，请联系管理员领取拍品。"
                 )
             else:
-                auction.status = "cancelled"
                 text = f"🔨 竞拍「{auction.item}」已到期，无人出价，已流拍。"
             await repo.add_log(
                 session, auction.group_id, None, "auction_finish", auction.current_bidder, auction.item
@@ -321,9 +381,10 @@ async def refund_red_packets(bot: Bot) -> None:
             )
         ).all()
         for packet in packets:
-            remaining = max(0, int(packet.remaining_amount or 0))
-            packet.status = "expired"
-            if remaining:
+            remaining = await _claim_red_packet(session, packet.id)
+            if remaining is None:
+                continue
+            if remaining > 0:
                 await repo.adjust_points(
                     session,
                     packet.group_id,
