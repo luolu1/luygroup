@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
+from ..models import utcnow
+
 # Strong advertising signals. Keep this list conservative: false positives annoy
 # members, while the AI layer can catch the subtle cases.
 AD_PATTERNS: list[tuple[re.Pattern[str], str]] = [
@@ -133,10 +135,10 @@ class RecentTracker:
 
     def __init__(self) -> None:
         self._messages: dict[tuple[int, int], list[tuple[str, datetime]]] = {}
-        self._last_cleanup = datetime.utcnow()
+        self._last_cleanup = utcnow()
 
     def add(self, chat_id: int, user_id: int, text: str) -> tuple[int, int]:
-        now = datetime.utcnow()
+        now = utcnow()
         key = (chat_id, user_id)
         items = self._messages.setdefault(key, [])
         items.append((text, now))
@@ -277,7 +279,7 @@ def check_flood(
     window_seconds: int,
     action: str,
 ) -> Detection:
-    cutoff = datetime.utcnow() - timedelta(seconds=window_seconds)
+    cutoff = utcnow() - timedelta(seconds=window_seconds)
     count = sum(1 for ts in message_times if ts >= cutoff)
     if limit > 0 and count > limit:
         return Detection(

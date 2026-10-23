@@ -6,7 +6,7 @@ import logging
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Iterable
 
 from aiogram import Bot
@@ -16,7 +16,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_config, is_global_admin
-from ..models import Group, utcnow
+from ..models import ConsoleGroupAccess, ConsoleUser, Group, utcnow
 from ..services import repo
 
 log = logging.getLogger(__name__)
@@ -53,6 +53,19 @@ async def has_permission(
     if user_id is None:
         return False
     if is_global_admin(user_id):
+        return True
+    bound_owner = await session.scalar(
+        select(ConsoleUser.id)
+        .join(ConsoleGroupAccess, ConsoleGroupAccess.user_id == ConsoleUser.id)
+        .where(
+            ConsoleGroupAccess.group_id == int(group_id),
+            ConsoleGroupAccess.role == "owner",
+            ConsoleUser.telegram_id == int(user_id),
+            ConsoleUser.is_active.is_(True),
+        )
+        .limit(1)
+    )
+    if bound_owner is not None:
         return True
     if await is_telegram_admin(bot, group_id, user_id):
         return True
@@ -619,7 +632,7 @@ async def bot_is_admin(bot: Bot, chat_id: int) -> bool:
 
 
 def now_str() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    return utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 
 _username_cache: str | None = None

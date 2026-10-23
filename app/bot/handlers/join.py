@@ -19,11 +19,14 @@ from aiogram.types import (
     Message,
     User,
 )
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 
 from ...db import session_scope
-from ...entitlements import group_feature_allowed, group_owner_user_id
+from ...config import is_global_admin
+from ...entitlements import build_for_user, group_feature_allowed, group_owner_user_id
 from ...models import (
+    ConsoleGroupAccess,
+    ConsoleUser,
     GlobalBlacklist,
     Group,
     InviteCode,
@@ -31,6 +34,7 @@ from ...models import (
     Verification,
     utcnow,
 )
+from ...web.auth import hash_console_token, new_console_token
 from ...services import repo
 from .. import captcha, helpers, keyboards
 
@@ -575,6 +579,57 @@ async def on_my_chat_member(update: ChatMemberUpdated, bot: Bot) -> None:
             username=chat.username or "",
             chat_type=chat.type,
         )
+        actor_id = update.from_user.id if update.from_user else None
+        if actor_id is not None:
+            owner = await session.scalar(
+                select(ConsoleUser).where(
+                    ConsoleUser.telegram_id == int(actor_id),
+                )
+            )
+            if owner is None:
+                owner = ConsoleUser(
+                    telegram_id=int(actor_id),
+                    username=update.from_user.username or "",
+                    display_name=(
+                        update.from_user.full_name
+                        or update.from_user.first_name
+                        or ""
+                    )[:255],
+                    token_hash=hash_console_token(new_console_token()),
+                    role="superadmin" if is_global_admin(actor_id) else "user",
+                )
+                session.add(owner)
+                await session.flush()
+            if owner.is_active:
+                access = await session.scalar(
+                    select(ConsoleGroupAccess).where(
+                        ConsoleGroupAccess.group_id == group.id,
+                        ConsoleGroupAccess.role == "owner",
+                    )
+                )
+                if access is None:
+                    entitlements = await build_for_user(session, owner)
+                    bound_count = int(
+                        await session.scalar(
+                            select(func.count(ConsoleGroupAccess.id)).where(
+                                ConsoleGroupAccess.user_id == owner.id
+                            )
+                        )
+                        or 0
+                    )
+                    if entitlements.group_limit is None or bound_count < entitlements.group_limit:
+                        session.add(
+                            ConsoleGroupAccess(
+                                user_id=owner.id, group_id=group.id, role="owner"
+                            )
+                        )
+                    else:
+                        log.warning(
+                            "group binding quota reached user=%s group=%s limit=%s",
+                            owner.id,
+                            group.id,
+                            entitlements.group_limit,
+                        )
         try:
             group.member_count = await bot.get_chat_member_count(group.id)
         except TelegramAPIError:

@@ -23,7 +23,7 @@ _flood: dict[tuple[int, int], list[datetime]] = {}
 
 
 def _flood_add(chat_id: int, user_id: int) -> list[datetime]:
-    now = datetime.utcnow()
+    now = utcnow()
     key = (chat_id, user_id)
     items = _flood.setdefault(key, [])
     items.append(now)

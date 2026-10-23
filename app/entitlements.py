@@ -235,12 +235,12 @@ async def build_for_user(
             user=user,
             features=BASIC_FEATURES,
             advanced=False,
-            group_limit=1,
+            group_limit=2,
             ai_daily_quota=0,
             sample_daily_quota=0,
         )
 
-    group_limit = int(plan.group_limit) if plan and plan.group_limit else 5
+    group_limit = 5
     ai_quota = int(plan.ai_daily_quota) if plan and plan.ai_daily_quota else 200
     sample_quota = int(plan.sample_daily_quota) if plan and plan.sample_daily_quota else 500
     return Entitlements(
