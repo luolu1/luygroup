@@ -5,6 +5,7 @@ import json
 import re
 import time
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
@@ -13,7 +14,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import delete, func, or_, select
+from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_config, save_learning_dir
@@ -59,13 +60,15 @@ from ..models import (
 )
 from ..services import ai as ai_service
 from ..services import repo
-from .auth import current_admin_id, hash_console_token, new_console_path, new_console_token, require_admin, safe_next
-from .utils import fmt_date, fmt_dt, n, short, user_label
+from ..services.subscriptions import MONTHLY_PRICE_CENTS, purchase_month
+from .auth import LoginRequired, current_admin_id, hash_console_token, new_console_token, require_admin, safe_next
+from .utils import fmt_date, fmt_dt, fmt_money, n, short, user_label
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 templates.env.filters["dt"] = fmt_dt
 templates.env.filters["date"] = fmt_date
+templates.env.filters["money"] = fmt_money
 templates.env.filters["short"] = short
 templates.env.filters["n"] = n
 templates.env.globals["short"] = short
@@ -169,6 +172,10 @@ def _render(request: Request, name: str, **context: Any) -> HTMLResponse:
     context.setdefault("console_user", ent.user)
     context.setdefault("role_label", ent.role_label)
     context.setdefault("can", ent.can)
+    context.setdefault(
+        "available_balance",
+        fmt_money(ent.user.balance_cents if ent.user is not None else 0),
+    )
     return templates.TemplateResponse(request, name, context)
 
 
@@ -188,6 +195,15 @@ def _require_superadmin(request: Request) -> Entitlements:
     if not ent.is_superadmin:
         raise HTTPException(status_code=403, detail="仅超级管理员可执行此操作")
     return ent
+
+
+def _subscription_message(status: str) -> str:
+    return {
+        "insufficient_balance": "余额不足，需要 ¥8.00 才能购买一个月订阅",
+        "account_unavailable": "当前账号不可用",
+        "plan_unavailable": "订阅套餐暂不可用，请稍后再试",
+        "permanent_subscription": "当前账号已是长期订阅，无需重复购买",
+    }.get(status, "订阅购买失败，请稍后再试")
 
 
 async def _accessible_group_ids(
@@ -292,46 +308,48 @@ async def _login_with_token(
     token: str,
     session: AsyncSession,
     next_url: str,
-    console_path: str | None = None,
 ) -> Response:
     token = token.strip()
     if not token:
         return _render(request, "login.html", error="请输入控制台 Token。", admin_id_input="", next_url=next_url)
-    conditions = [
-        ConsoleUser.token_hash == hash_console_token(token),
-        ConsoleUser.is_active.is_(True),
-        ConsoleUser.token_expires_at.is_not(None),
-        ConsoleUser.token_expires_at > utcnow(),
-    ]
-    if console_path is not None:
-        conditions.append(ConsoleUser.console_path == console_path)
-    user = await session.scalar(select(ConsoleUser).where(*conditions))
-    if user is None:
-        return _render(request, "login.html", error="Token 无效或已被撤销。", admin_id_input="", next_url=next_url)
-    user.last_login_at = utcnow()
+    consumed = await session.execute(
+        update(ConsoleUser)
+        .where(
+            ConsoleUser.token_hash == hash_console_token(token),
+            ConsoleUser.is_active.is_(True),
+            ConsoleUser.token_expires_at.is_not(None),
+            ConsoleUser.token_expires_at > utcnow(),
+        )
+        .values(
+            token_hash=hash_console_token(new_console_token()),
+            token_value=None,
+            token_expires_at=None,
+            last_login_at=utcnow(),
+        )
+        .returning(ConsoleUser.id, ConsoleUser.role)
+    )
+    identity = consumed.one_or_none()
+    if identity is None:
+        return _render(request, "login.html", error="登录码无效、已过期或已被使用。", admin_id_input="", next_url=next_url)
     request.session.clear()
-    request.session["admin_id"] = int(user.id)
-    request.session["console_role"] = user.role
+    request.session["admin_id"] = int(identity.id)
+    request.session["console_role"] = identity.role
     request.session["console_auth"] = True
     return RedirectResponse(next_url, status_code=303)
 
 
-@public_router.get("/console/{console_path}")
-async def console_token_login(
-    console_path: str,
+@public_router.get("/console", response_class=HTMLResponse)
+async def console_code_page(
     request: Request,
     token: str = "",
     session: AsyncSession = Depends(get_session),
 ) -> Response:
-    user = await session.scalar(
-        select(ConsoleUser).where(
-            ConsoleUser.console_path == console_path,
-            ConsoleUser.is_active.is_(True),
-        )
-    )
-    if user is None:
-        raise HTTPException(status_code=404, detail="控制台地址不存在")
-    return await _login_with_token(request, token, session, "/", console_path)
+    if not token:
+        return RedirectResponse("/login", status_code=303)
+    response = await _login_with_token(request, token, session, "/")
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    return response
 
 
 @public_router.post("/login")
@@ -342,7 +360,7 @@ async def login_submit(request: Request, session: AsyncSession = Depends(get_ses
     return await _login_with_token(request, token, session, next_url)
 
 
-@public_router.get("/logout")
+@public_router.post("/logout")
 async def logout(request: Request):
     request.session.clear()
     return RedirectResponse("/login", status_code=303)
@@ -355,7 +373,6 @@ async def _users_context(session: AsyncSession, q: str = "") -> dict[str, Any]:
         conditions = [
             ConsoleUser.display_name.ilike(f"%{q}%"),
             ConsoleUser.username.ilike(f"%{q}%"),
-            ConsoleUser.console_path.ilike(f"%{q}%"),
         ]
         telegram_id = q.lstrip("-")
         if telegram_id.isdigit():
@@ -386,11 +403,23 @@ async def _users_context(session: AsyncSession, q: str = "") -> dict[str, Any]:
         ).all()
         for item in rows:
             subscription_by_user.setdefault(item.user_id, item)
+    binding_count_by_user: dict[int, int] = {}
+    if users:
+        counts = await session.execute(
+            select(ConsoleGroupAccess.user_id, func.count(ConsoleGroupAccess.id))
+            .where(ConsoleGroupAccess.user_id.in_([user.id for user in users]))
+            .group_by(ConsoleGroupAccess.user_id)
+        )
+        binding_count_by_user = {
+            int(user_id): int(count) for user_id, count in counts.all()
+        }
     return {
         "users": users,
         "plans": plans,
         "plan_by_id": plan_by_id,
         "subscription_by_user": subscription_by_user,
+        "binding_count_by_user": binding_count_by_user,
+        "binding_count_total": sum(binding_count_by_user.values()),
         "q": q,
     }
 
@@ -479,7 +508,7 @@ async def update_user_subscription(
     user.role = "subscriber"
     return _redirect(
         "/users",
-        msg=f"已为 {user.display_name or user.id} 开通 {plan.label or plan.name}，到期 {expires_at:%Y-%m-%d}",
+        msg=f"已为 {user.display_name or user.id} 开通 {plan.label or plan.name}，群组上限为 5，到期 {expires_at:%Y-%m-%d}",
         q=q,
     )
 
@@ -501,6 +530,31 @@ async def toggle_console_user(
     return _redirect("/users", msg="用户状态已更新", q=q)
 
 
+@router.post("/users/{user_id}/balance")
+async def update_user_balance(
+    user_id: int,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+):
+    _require_superadmin(request)
+    q = str(request.query_params.get("q") or "").strip()
+    user = await session.get(ConsoleUser, user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    if user.role == "superadmin":
+        return _redirect("/users", err="不能修改超级管理员余额", q=q)
+    raw = str((await request.form()).get("balance") or "").strip()
+    try:
+        amount = Decimal(raw)
+        if not amount.is_finite() or amount < 0 or amount.as_tuple().exponent < -2:
+            raise InvalidOperation
+        cents = int((amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    except (InvalidOperation, ValueError):
+        return _redirect("/users", err="余额必须是非负金额，最多保留两位小数", q=q)
+    user.balance_cents = cents
+    return _redirect("/users", msg="用户余额已更新", q=q)
+
+
 @router.post("/users/{user_id}/token", response_class=HTMLResponse)
 async def reset_console_token(
     user_id: int,
@@ -513,12 +567,10 @@ async def reset_console_token(
     if user is None:
         raise HTTPException(status_code=404, detail="用户不存在")
     token = new_console_token()
-    path = new_console_path()
     user.token_hash = hash_console_token(token)
-    user.token_value = token
-    user.token_expires_at = utcnow() + timedelta(days=1)
-    user.console_path = path
-    url = f"{get_config().web.base_url.rstrip('/')}/console/{path}?token={token}"
+    user.token_value = None
+    user.token_expires_at = utcnow() + timedelta(minutes=15)
+    url = f"{get_config().web.base_url.rstrip('/')}/console?token={token}"
     return _render(
         request,
         "users.html",
@@ -530,6 +582,48 @@ async def reset_console_token(
 # ---------------------------------------------------------------------------
 # Dashboard / groups
 # ---------------------------------------------------------------------------
+@router.get("/account", response_class=HTMLResponse)
+async def account_page(
+    request: Request, session: AsyncSession = Depends(get_session)
+) -> HTMLResponse:
+    ent = _current_entitlements(request)
+    if ent.user is None:
+        raise LoginRequired
+    subscription = await session.scalar(
+        select(Subscription)
+        .where(Subscription.user_id == ent.user.id, Subscription.status == "active")
+        .order_by(Subscription.id.desc())
+        .limit(1)
+    )
+    plan = await session.get(SubscriptionPlan, subscription.plan_id) if subscription else None
+    return _render(
+        request,
+        "account.html",
+        subscription=subscription,
+        plan=plan,
+        now_utc=utcnow(),
+        monthly_price_cents=MONTHLY_PRICE_CENTS,
+    )
+
+
+@router.post("/account/subscribe")
+async def account_subscribe(
+    request: Request, session: AsyncSession = Depends(get_session)
+) -> RedirectResponse:
+    ent = _current_entitlements(request)
+    if ent.user is None:
+        raise LoginRequired
+    if ent.is_superadmin:
+        return _redirect("/account", err="超级管理员无需购买订阅")
+    status, expires_at, new_balance = await purchase_month(session, ent.user.id)
+    if status != "ok":
+        return _redirect("/account", err=_subscription_message(status))
+    return _redirect(
+        "/account",
+        msg=f"订阅已购买/续费至 {expires_at:%Y-%m-%d}，扣款 ¥8.00，余额 ¥{new_balance / 100:.2f}",
+    )
+
+
 @router.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request, session: AsyncSession = Depends(get_session)) -> HTMLResponse:
     ent = _current_entitlements(request)
@@ -678,6 +772,7 @@ async def groups_page(
         stmt = stmt.where(or_(Group.title.ilike(f"%{q}%"), Group.username.ilike(f"%{q}%")))
     groups = (await session.scalars(stmt.limit(300))).all()
     counts: dict[int, int] = {}
+    owners: dict[int, ConsoleUser] = {}
     if groups:
         rows = await session.execute(
             select(Member.group_id, func.count(Member.id))
@@ -685,11 +780,25 @@ async def groups_page(
             .group_by(Member.group_id)
         )
         counts = {int(gid): int(count) for gid, count in rows.all()}
+        owner_rows = (
+            await session.execute(
+                select(ConsoleGroupAccess.group_id, ConsoleUser)
+                .join(ConsoleUser, ConsoleUser.id == ConsoleGroupAccess.user_id)
+                .where(
+                    ConsoleGroupAccess.group_id.in_([g.id for g in groups]),
+                    ConsoleGroupAccess.role == "owner",
+                )
+                .order_by(ConsoleGroupAccess.id.asc())
+            )
+        ).all()
+        for group_id, owner in owner_rows:
+            owners.setdefault(int(group_id), owner)
     return _render(
         request,
         "groups.html",
         groups=groups,
         counts=counts,
+        owners=owners,
         q=q,
         bot_username=get_config().bot.username,
     )
@@ -881,7 +990,7 @@ async def add_group(
         username=chat.get("username") or "",
         chat_type=chat.get("type") or "supergroup",
     )
-    if not ent.is_superadmin and existing_access is None:
+    if existing_access is None:
         session.add(ConsoleGroupAccess(user_id=admin_id, group_id=group.id, role="owner"))
     group.is_active = True
     await repo.add_log(
@@ -2188,6 +2297,56 @@ async def ai_page(request: Request, session: AsyncSession = Depends(get_session)
         event_stmt = event_stmt.where(AIEvent.group_id.in_(gids))
     usage = (await session.scalars(usage_stmt)).all()
     events = (await session.scalars(event_stmt)).all()
+    provider_usage_stmt = (
+        select(
+            AIEvent.provider,
+            func.count(AIEvent.id),
+            func.coalesce(func.sum(case((AIEvent.hit.is_(True), 1), else_=0)), 0),
+        )
+        .where(AIEvent.created_at >= utcnow() - timedelta(days=13))
+        .group_by(AIEvent.provider)
+        .order_by(func.count(AIEvent.id).desc(), AIEvent.provider.asc())
+    )
+    if gids is not None:
+        provider_usage_stmt = provider_usage_stmt.where(AIEvent.group_id.in_(gids))
+    provider_usage = (await session.execute(provider_usage_stmt)).all()
+    today = day_key()
+    today_stmt = select(
+        func.coalesce(func.sum(AIUsage.requests), 0),
+        func.coalesce(func.sum(AIUsage.samples), 0),
+        func.coalesce(func.sum(AIUsage.hits), 0),
+    ).where(AIUsage.day == today)
+    if gids is not None:
+        today_stmt = today_stmt.where(AIUsage.group_id.in_(gids))
+    today_requests, today_samples, today_hits = (
+        await session.execute(today_stmt)
+    ).one()
+    request_limit = ent.ai_daily_quota
+    sample_limit = ent.sample_daily_quota
+    if gids is not None:
+        bound_groups = (
+            await session.scalars(select(Group).where(Group.id.in_(gids)))
+        ).all() if gids else []
+        def capped(limit: int | None, configured: int | None) -> int:
+            if limit is None:
+                return int(configured or 0)
+            configured_value = int(configured or 0)
+            return int(limit) if configured_value <= 0 else min(int(limit), configured_value)
+
+        request_limit = sum(
+            capped(ent.ai_daily_quota, group.ai_daily_quota) for group in bound_groups
+        )
+        sample_limit = sum(
+            capped(ent.sample_daily_quota, group.sample_daily_quota) for group in bound_groups
+        )
+    ai_summary = {
+        "day": today,
+        "requests": int(today_requests or 0),
+        "samples": int(today_samples or 0),
+        "hits": int(today_hits or 0),
+        "request_limit": request_limit,
+        "sample_limit": sample_limit,
+    }
     group_ids = {item.group_id for item in usage} | {item.group_id for item in events}
     groups = (
         await session.scalars(select(Group).where(Group.id.in_(group_ids)))
@@ -2208,6 +2367,8 @@ async def ai_page(request: Request, session: AsyncSession = Depends(get_session)
         defaults=get_config().ai,
         presets=ai_service.PROVIDER_PRESETS,
         learning=ai_service.learning_store.stats(),
+        ai_summary=ai_summary,
+        provider_usage=provider_usage,
     )
 
 
@@ -2488,6 +2649,76 @@ async def delete_report(
         raise HTTPException(status_code=403, detail="无权删除其他群组的举报")
     await session.delete(entry)
     return _redirect("/reports", msg="举报记录已删除")
+
+
+@router.post("/reports/{entry_id}/review")
+async def review_report(
+    entry_id: int,
+    request: Request,
+    admin_id: int = Depends(require_admin),
+    session: AsyncSession = Depends(get_session),
+):
+    _require_feature(request, "reports")
+    report = await session.get(Report, entry_id)
+    if report is None:
+        raise HTTPException(status_code=404, detail="举报记录不存在")
+    allowed = await _accessible_group_ids(session, request)
+    if allowed is not None and report.group_id not in allowed:
+        raise HTTPException(status_code=403, detail="无权审核其他群组的举报")
+    form = await request.form()
+    decision = _text(form, "decision", 16)
+    note = _text(form, "note", 500)
+    if decision not in {"confirmed", "rejected"}:
+        return _redirect("/reports", err="未知审核操作")
+    if report.review_status != "pending":
+        return _redirect("/reports", err="该举报已审核")
+    excerpt = (report.excerpt or "").strip()
+    if decision == "confirmed" and not excerpt:
+        return _redirect("/reports", err="举报没有原文内容，无法写入广告学习")
+    report.review_status = decision
+    report.reviewed_by = admin_id
+    report.reviewed_at = utcnow()
+    report.review_note = note
+    if decision == "confirmed":
+        await ai_service.learning_store.put(
+            "ad",
+            report.group_id,
+            excerpt,
+            note or "管理员确认举报为广告",
+            meta={
+                "provider": "admin-report-review",
+                "is_ad": True,
+                "reason": note or "管理员确认举报为广告",
+                "reviewed_by": admin_id,
+                "report_id": report.id,
+            },
+        )
+    elif excerpt:
+        await ai_service.learning_store.put(
+            "ad",
+            report.group_id,
+            excerpt,
+            note or "管理员驳回举报，判定为正常消息",
+            meta={
+                "provider": "admin-report-review",
+                "is_ad": False,
+                "reason": note or "管理员驳回举报，判定为正常消息",
+                "reviewed_by": admin_id,
+                "report_id": report.id,
+            },
+        )
+    await repo.add_log(
+        session,
+        report.group_id,
+        admin_id,
+        f"report_{decision}",
+        report.target_user_id,
+        f"举报 #{report.id} {note}".strip(),
+    )
+    return _redirect(
+        "/reports",
+        msg="已确认并写入 AI 广告学习" if decision == "confirmed" else "已驳回举报",
+    )
 
 
 @router.get("/stats", response_class=HTMLResponse)

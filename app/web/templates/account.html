@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}账户与订阅{% endblock %}
+{% block content %}
+<section class="page-head">
+  <div>
+    <div class="eyebrow">ACCOUNT &amp; SUBSCRIPTION</div>
+    <h1>账户与订阅</h1>
+    <p class="muted small">账户余额以人民币 CNY 计价，订阅购买与续费会直接从余额扣款。</p>
+  </div>
+</section>
+
+<div class="grid cols-2">
+  <div class="card">
+    <div class="eyebrow">ACCOUNT BALANCE</div>
+    <h2>可用余额</h2>
+    <div class="stat-value">{{ console_user.balance_cents|money }} <span class="muted small">CNY</span></div>
+    <div class="hint">订阅价格：¥8.00 / 月。请联系管理员为账户充值。</div>
+  </div>
+  <div class="card">
+    <div class="eyebrow">CURRENT PLAN</div>
+    <h2>当前订阅</h2>
+    {% if ent.is_superadmin %}
+    <div class="stat-value">超级管理员</div>
+    <div class="hint">超级管理员无需购买订阅。</div>
+    {% elif subscription and subscription.expires_at is none %}
+    <div class="stat-value">{{ plan.label if plan else '订阅版' }} · 长期有效</div>
+    <div class="hint">此订阅无需续费。</div>
+    {% elif subscription and subscription.expires_at and subscription.expires_at > now_utc %}
+    <div class="stat-value">{{ plan.label if plan else '订阅版' }}</div>
+    <div class="muted">有效至 {{ subscription.expires_at|dt }}</div>
+    <form method="post" action="/account/subscribe" style="margin-top:14px">
+      <button type="submit" data-confirm="将扣除 ¥8.00 CNY，并在当前到期日基础上续订一个月。继续吗？">续费一个月 · ¥8.00</button>
+    </form>
+    {% else %}
+    <div class="stat-value">未开通</div>
+    <div class="hint">购买后立即开通一个月订阅。</div>
+    <form method="post" action="/account/subscribe" style="margin-top:14px">
+      <button type="submit" data-confirm="将扣除 ¥8.00 CNY，开通一个月订阅。继续吗？">购买一个月 · ¥8.00</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <h2>订阅说明</h2>
+  <div class="kv">
+    <span class="k">月费</span><span>¥8.00 CNY</span>
+    <span class="k">订阅周期</span><span>一个日历月</span>
+    <span class="k">续费规则</span><span>未到期时从当前到期日顺延；已过期时从购买当日起算。</span>
+    <span class="k">余额不足</span><span>不会扣款或更改订阅，请联系管理员充值后再购买。</span>
+  </div>
+</div>
+{% endblock %}

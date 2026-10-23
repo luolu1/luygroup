@@ -17,7 +17,7 @@
 {% if issued_url %}
 <div class="banner ok">
   <strong>新的控制台登录地址已生成</strong>
-  <div class="faint small">Token 24 小时内有效；旧 Token 和旧控制台路径已立即失效。</div>
+  <div class="faint small">登录码 15 分钟内有效，且只能使用一次；旧登录码立即失效。</div>
   <div class="codebox" style="margin-top:8px">{{ issued_url }}</div>
   <div class="form-actions" style="margin-top:10px;padding-top:0;border-top:0">
     <button class="ghost sm" type="button" data-copy="{{ issued_url }}">复制登录地址</button>
@@ -28,43 +28,38 @@
 <div class="card">
   <div class="spread" style="margin-bottom:12px">
     <h2 style="margin:0">用户列表</h2>
-    <div class="muted small">
-      共 {{ users|length }} 个用户{% if q %}，搜索“{{ q }}”{% endif %}
-    </div>
+     <div class="muted small">
+       共 {{ users|length }} 个用户{% if q %}，搜索“{{ q }}”{% endif %} · 当前结果绑定 {{ binding_count_total }} 个群组
+     </div>
   </div>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>用户</th><th>角色</th><th>订阅</th><th>状态</th><th>控制台路径</th><th>操作</th></tr></thead>
+       <thead><tr><th>用户</th><th>订阅</th><th>绑定群组数量</th><th>状态</th><th>操作</th></tr></thead>
       <tbody>
       {% for user in users %}
         {% set sub = subscription_by_user.get(user.id) %}
-        <tr>
+         <tr>
           <td>
             {{ user.display_name or user.username or user.id }}
             <div class="faint mono small">{{ user.telegram_id or '未绑定 Telegram ID' }}{% if user.username %} · @{{ user.username }}{% endif %}</div>
           </td>
-          <td>
-            <span class="badge {% if user.role == 'superadmin' %}purple{% elif user.role == 'subscriber' %}ok{% endif %}">
-              {{ {'superadmin': '超级管理员', 'subscriber': '订阅用户', 'user': '普通用户'}.get(user.role, user.role) }}
-            </span>
-          </td>
-          <td>
-            {% if user.role == 'superadmin' %}<span class="faint">平台管理员</span>
-            {% elif sub %}
-              <span class="badge ok">生效中</span>
+           <td>
+             {% if user.role == 'superadmin' %}<span class="faint">平台管理员</span>
+             {% elif sub %}
+               <span class="badge ok">生效中</span>
               <div class="faint small">到期 {{ sub.expires_at|dt }}</div>
-            {% else %}<span class="faint">未订阅</span>{% endif %}
-          </td>
-          <td>
+             {% else %}<span class="faint">未订阅</span>{% endif %}
+           </td>
+           <td class="num">{{ binding_count_by_user.get(user.id, 0) }}</td>
+           <td>
             <span class="badge {% if user.is_active %}ok{% else %}bad{% endif %}">{{ '启用' if user.is_active else '停用' }}</span>
           </td>
-          <td><code>/console/{{ user.console_path }}</code></td>
           <td>
             <button class="ghost sm" type="button" data-modal-open="user-modal-{{ user.id }}">编辑</button>
           </td>
         </tr>
       {% else %}
-        <tr><td colspan="6"><div class="empty">没有匹配的用户。</div></td></tr>
+        <tr><td colspan="5"><div class="empty">没有匹配的用户。</div></td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -83,29 +78,41 @@
       <button class="ghost sm" type="button" data-modal-close>关闭</button>
     </div>
     <div class="modal-body">
-      <div class="modal-summary">
+       <div class="modal-summary">
         <span class="badge {% if user.role == 'superadmin' %}purple{% elif user.role == 'subscriber' %}ok{% endif %}">
           {{ {'superadmin': '超级管理员', 'subscriber': '订阅用户', 'user': '普通用户'}.get(user.role, user.role) }}
         </span>
         <span class="badge {% if user.is_active %}ok{% else %}bad{% endif %}">{{ '启用' if user.is_active else '停用' }}</span>
         {% if sub %}<span class="badge info">订阅至 {{ sub.expires_at|date }}</span>{% endif %}
-      </div>
+       </div>
+
+       <div class="modal-section">
+         <h3>账户余额</h3>
+         <div class="kv"><span class="k">可用余额</span><span class="mono">{{ user.balance_cents|money }}</span></div>
+         {% if user.role != 'superadmin' %}
+         <form method="post" action="/users/{{ user.id }}/balance?q={{ q|urlencode }}" class="row" style="margin-top:12px;align-items:flex-end">
+           <label class="field" style="flex:1;margin:0">
+             <span class="muted small">设置余额（元）</span>
+             <input name="balance" type="number" min="0" step="0.01" value="{{ '%.2f'|format((user.balance_cents or 0) / 100) }}">
+           </label>
+           <button class="ghost sm" type="submit">保存余额</button>
+         </form>
+         {% endif %}
+       </div>
 
       <div class="modal-section">
         <h3>控制台登录</h3>
         <div class="kv">
-          <span class="k">控制台路径</span>
-          <span class="mono break">/console/{{ user.console_path }}</span>
           <span class="k">Token 有效期</span>
           <span>{% if user.token_expires_at %}{{ user.token_expires_at|dt }}{% else %}<span class="faint">尚未通过 /console 获取</span>{% endif %}</span>
         </div>
         <form method="post" action="/users/{{ user.id }}/token?q={{ q|urlencode }}"
-              data-confirm="重置会立即作废旧 Token 和控制台路径，并生成新的登录地址。确定继续？">
+              data-confirm="重置会立即作废旧登录码，并生成新的登录地址。确定继续？">
           <div class="form-actions" style="margin-top:12px;padding-top:12px">
-            <button class="ghost sm" type="submit">重置 Token 和路径</button>
+            <button class="ghost sm" type="submit">重置登录码</button>
           </div>
         </form>
-        <div class="hint">重置后新的登录地址会显示在页面顶部。Token 有效期为 24 小时，过期后可在私聊中再次发送 /console 自动轮换。</div>
+        <div class="hint">重置后新的登录地址会显示在页面顶部。登录码有效期为 15 分钟，且只能使用一次。</div>
       </div>
 
       {% if user.role != 'superadmin' %}
@@ -149,7 +156,7 @@
             {% endif %}
           </div>
         </form>
-        <div class="hint">开通或续费会替换当前订阅，有效期从操作时起重新计算。支付尚未接入，由超级管理员手动管理。</div>
+        <div class="hint">此处为超级管理员人工开通/变更，不扣用户余额；用户自助购买或续费请使用「账户与订阅」页面。</div>
       </div>
 
       <div class="modal-section">
@@ -178,6 +185,6 @@
   {% for plan in plans %}<tr><td>{{ plan.label or plan.name }}</td><td>{{ plan.group_limit }}</td><td class="num">{{ plan.ai_daily_quota }}</td><td class="num">{{ plan.sample_daily_quota }}</td></tr>{% endfor %}
   </tbody></table></div>
   {% else %}<div class="empty">暂无套餐。</div>{% endif %}
-  <div class="hint">支付尚未接入，订阅由超级管理员在此手动开通或取消。</div>
+  <div class="hint">普通用户可在「账户与订阅」页面自助购买或续费，每月 ¥8.00 CNY；超级管理员也可在用户编辑窗口人工调整订阅。</div>
 </div>
 {% endblock %}

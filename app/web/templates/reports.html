@@ -5,7 +5,7 @@
   <div>
     <div class="eyebrow">REPORTS</div>
     <h1>举报与通报</h1>
-    <div class="muted small">成员举报记录，以及跨群通报的投递情况。</div>
+    <div class="muted small">成员举报记录、审核结果与跨群通报投递情况。</div>
   </div>
   <form method="get" action="/reports">
     <select name="group_id" onchange="this.form.submit()" style="min-width:200px">
@@ -20,7 +20,7 @@
 <div class="card">
   <div class="spread">
     <h2>举报记录（{{ reports|length }}）</h2>
-    <span class="faint small">最多显示 300 条</span>
+     <span class="faint small">举报提交后进入待审核学习，审核结果会更新广告判断；最多显示 300 条</span>
   </div>
   {% if reports %}
   <div class="table-wrap">
@@ -33,7 +33,7 @@
           <th>被举报人</th>
           <th>原因</th>
           <th>内容摘录</th>
-          <th></th>
+          <th>审核</th>
         </tr>
       </thead>
       <tbody>
@@ -48,12 +48,19 @@
           <td class="mono small">{{ r.target_user_id or '—' }}</td>
           <td>{{ r.reason or '—' }}</td>
           <td class="small">{{ r.excerpt|short(70) }}</td>
-          <td>
-            <form method="post" action="/reports/{{ r.id }}/delete"
-                  data-confirm="确定删除该举报记录？">
-              <button class="danger sm" type="submit">删除</button>
-            </form>
-          </td>
+           <td>
+             {% if r.review_status == 'pending' %}
+             <form method="post" action="/reports/{{ r.id }}/review" class="row" style="gap:6px">
+               <input type="text" name="note" placeholder="备注" style="width:100px">
+               <button class="sm" type="submit" name="decision" value="confirmed">确认广告</button>
+               <button class="ghost sm" type="submit" name="decision" value="rejected">驳回</button>
+             </form>
+             {% elif r.review_status == 'confirmed' %}<span class="badge bad">已确认广告</span>
+             {% else %}<span class="badge">已驳回</span>{% endif %}
+             <form method="post" action="/reports/{{ r.id }}/delete" data-confirm="确定删除该举报记录？" style="margin-top:5px">
+               <button class="danger sm" type="submit">删除</button>
+             </form>
+           </td>
         </tr>
       {% endfor %}
       </tbody>

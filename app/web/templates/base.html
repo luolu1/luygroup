@@ -24,8 +24,11 @@
       {% if can('reports') %}<a href="/reports" class="{% if path == '/reports' %}active{% endif %}">通报</a>{% endif %}
       {% if can('stats_global') %}<a href="/stats" class="{% if path == '/stats' %}active{% endif %}">统计</a>{% endif %}
       {% if ent and ent.is_superadmin %}<a href="/users" class="{% if path.startswith('/users') %}active{% endif %}">用户</a>{% endif %}
-      <span class="ident hide-sm" title="{{ console_user.telegram_id if console_user else '' }}">{{ role_label }}{% if ent and ent.display_name %} · {{ ent.display_name }}{% endif %}</span>
-      <a href="/logout" class="ident">退出</a>
+      <a href="/account" class="{% if path.startswith('/account') %}active{% endif %}">账户与订阅</a>
+       <span class="ident hide-sm" title="{{ console_user.telegram_id if console_user else '' }}">{{ role_label }}{% if ent and ent.display_name %} · {{ ent.display_name }}{% endif %} · 余额 {{ available_balance }}</span>
+      <form method="post" action="/logout" class="logout-form">
+        <button type="submit" class="ident linklike">退出</button>
+      </form>
     </nav>
   </header>
 

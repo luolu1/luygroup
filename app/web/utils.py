@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import escape
 
 
@@ -38,6 +39,16 @@ def n(value: int | None) -> int:
     return int(value or 0)
 
 
+def fmt_money(cents: int | None, fallback: str = "¥0.00") -> str:
+    try:
+        amount = (Decimal(int(cents or 0)) / Decimal(100)).quantize(
+            Decimal("0.01"), rounding=ROUND_HALF_UP
+        )
+    except (TypeError, ValueError, InvalidOperation):
+        return fallback
+    return f"¥{amount:.2f}"
+
+
 def user_label(user_id: int | None, name: str | None = None, username: str | None = None) -> str:
     if name:
         return f"{name} (@{username})" if username else name
@@ -46,4 +57,13 @@ def user_label(user_id: int | None, name: str | None = None, username: str | Non
     return f"ID {user_id}" if user_id else "未知"
 
 
-__all__ = ["fmt_dt", "fmt_date", "short", "yes_no", "n", "user_label", "escape"]
+__all__ = [
+    "fmt_dt",
+    "fmt_date",
+    "fmt_money",
+    "short",
+    "yes_no",
+    "n",
+    "user_label",
+    "escape",
+]

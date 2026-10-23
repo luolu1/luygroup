@@ -111,6 +111,12 @@ header.top nav a.active {
   border-color: rgba(79, 140, 255, .32);
 }
 header.top nav a.ident { color: var(--faint); font-family: var(--mono); font-size: 12px; }
+header.top nav .logout-form { display: inline; margin: 0; }
+header.top nav button.linklike {
+  background: none; border: 0; padding: 0; cursor: pointer;
+  color: var(--faint); font-family: var(--mono); font-size: 12px;
+}
+header.top nav button.linklike:hover { filter: none; text-decoration: underline; }
 
 /* ---------------------------------------------------------------- layout */
 main { max-width: 1220px; margin: 0 auto; padding: 30px 22px 96px; }

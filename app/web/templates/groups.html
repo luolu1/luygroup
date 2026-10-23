@@ -30,6 +30,7 @@
       <thead>
         <tr>
           <th>群组</th>
+          <th>所属用户</th>
           <th class="num">成员</th>
           <th class="num">消息</th>
           <th>状态</th>
@@ -44,6 +45,11 @@
           <td>
             <a href="/groups/{{ g.id }}">{{ g.title or ('群组 ' ~ g.id) }}</a>
             <div class="faint mono small">{{ g.id }}{% if g.username %} · @{{ g.username }}{% endif %}</div>
+          </td>
+          <td class="small">
+            {% set owner = owners.get(g.id) %}
+            {% if owner %}{{ owner.display_name or owner.username or owner.telegram_id }}{% if owner.username %}<div class="faint">@{{ owner.username }}</div>{% endif %}
+            {% else %}<span class="faint">平台管理</span>{% endif %}
           </td>
           <td class="num">{{ counts.get(g.id, g.member_count or 0) }}</td>
           <td class="num">{{ g.message_count or 0 }}</td>

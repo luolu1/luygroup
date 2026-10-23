@@ -44,6 +44,7 @@
       {% endif %}
       <span class="k">已学习条目</span><span>{{ learning.entries }}</span>
       <span class="k">累计命中</span><span>{{ learning.hits }}</span>
+      {% if ent and ent.is_superadmin %}
       <span class="k">分类目录</span>
       <span class="mono small">ad_detection · assistant · chat</span>
       <span class="k">分类</span>
@@ -52,6 +53,7 @@
         <span class="badge info">{{ kind }} {{ count }}</span>
         {% else %}<span class="faint">暂无</span>{% endfor %}
       </span>
+      {% endif %}
     </div>
     {% if ent and ent.is_superadmin %}
     <form method="post" action="/ai/learning/dir" style="margin-top:14px">
@@ -70,6 +72,42 @@
     </div>
   </div>
 </div>
+
+{% if ent and not ent.is_superadmin %}
+<div class="card">
+  <div class="spread">
+    <h2>近 14 天接口调用</h2>
+    <span class="faint small">按接口统计已记录的 AI 事件</span>
+  </div>
+  {% if provider_usage %}
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>接口</th><th class="num">调用事件</th><th class="num">命中</th></tr></thead>
+      <tbody>
+      {% for provider, calls, hits in provider_usage %}
+      <tr><td class="mono small">{{ provider or '未标记' }}</td><td class="num">{{ calls }}</td><td class="num">{{ hits }}</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}<div class="empty">暂无接口调用记录。</div>{% endif %}
+</div>
+{% endif %}
+
+{% if ent and not ent.is_superadmin %}
+<div class="card">
+  <div class="spread">
+    <h2>今日 AI 用量</h2>
+    <span class="faint small">{{ ai_summary.day }} · 仅统计已绑定群组</span>
+  </div>
+    <div class="grid cols-3">
+    <div class="stat"><div class="stat-label">套餐每日请求额度</div><div class="stat-value">已用 {{ ai_summary.requests }}{% if ai_summary.request_limit is not none %} <span class="muted small">/ 总额 {{ ai_summary.request_limit }}</span>{% endif %}</div></div>
+    <div class="stat"><div class="stat-label">抽样样本</div><div class="stat-value">{{ ai_summary.samples }}{% if ai_summary.sample_limit is not none %} <span class="muted small">/ {{ ai_summary.sample_limit }}</span>{% endif %}</div></div>
+    <div class="stat"><div class="stat-label">命中</div><div class="stat-value">{{ ai_summary.hits }}</div></div>
+  </div>
+  <div class="hint">这里统计当前账户绑定群组的调用情况。套餐额度按请求尝试次数计量；供应商 token 用量目前不在系统内统计。</div>
+</div>
+{% endif %}
 
 <div class="card">
   <div class="spread">
