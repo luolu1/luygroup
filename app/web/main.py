@@ -1,4 +1,4 @@
-"""FastAPI application that serves the GroupGuard control panel."""
+"""FastAPI application that serves the luygroup control panel."""
 from __future__ import annotations
 
 import logging
@@ -83,7 +83,7 @@ class CSRFOriginMiddleware(BaseHTTPMiddleware):
 async def lifespan(_app: FastAPI):
     await init_db()
     cfg = get_config()
-    log.info("GroupGuard panel ready on %s", cfg.web.base_url)
+    log.info("luygroup panel ready on %s", cfg.web.base_url)
     yield
     await dispose_db()
 
@@ -91,7 +91,7 @@ async def lifespan(_app: FastAPI):
 def create_app() -> FastAPI:
     cfg = get_config()
     app = FastAPI(
-        title="GroupGuard 控制台",
+        title="luygroup 控制台",
         version="1.0.0",
         lifespan=lifespan,
         docs_url=None,
