@@ -6,7 +6,7 @@ PIP := $(VENV)/bin/pip
 .PHONY: help venv install init-config run run-bot run-web check smoke smoke-permissions smoke-captcha smoke-scheduler smoke-scheduler-idempotency smoke-bot-recovery smoke-subscription-purchase smoke-commands smoke-games-race smoke-economy-claims docker-build docker-up docker-down docker-logs clean
 
 help:
-	@echo "GroupGuard 常用命令："
+	@echo "luygroup 常用命令："
 	@echo "  make install       创建虚拟环境并安装依赖"
 	@echo "  make init-config   若无 config.json，则从示例复制"
 	@echo "  make run           同进程启动 Bot + Web"

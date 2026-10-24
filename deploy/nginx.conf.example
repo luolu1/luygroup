@@ -1,4 +1,4 @@
-# GroupGuard Nginx 反向代理示例
+# luygroup Nginx 反向代理示例
 # 将 gg.example.com 替换为你的域名，证书路径替换为实际路径。
 # 同时把 config.json 的 web.base_url 改为 https://gg.example.com
 
