@@ -110,6 +110,10 @@ async def cmd_ban(message: Message, bot: Bot) -> None:
         except TelegramAPIError as exc:
             await _reply_error(message, f"封禁失败：{exc}")
             return
+        if message.reply_to_message is not None:
+            await helpers.delete_message_safe(
+                bot, group.id, message.reply_to_message.message_id
+            )
         await helpers.send_group_log(
             bot, group, f"🔨 {target.label} 被 {actor} 封禁\n原因：{reason or '-'}"
         )

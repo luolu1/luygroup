@@ -541,9 +541,12 @@ async def on_new_members(message: Message, bot: Bot) -> None:
             if not _claim(message.chat.id, user.id):
                 continue
             try:
+                username = await helpers.get_bot_username(bot) or "luygroup"
                 await message.answer(
-                    "👋 我是 <b>群卫 GroupGuard</b>。\n"
-                    "请把我设为管理员，并授予删除消息、封禁用户、邀请用户权限。\n\n"
+                    f"👋 我是 <b>@{escape(username)}</b>，luygroup 群组管理机器人。\n"
+                    "我可以提供进群验证、反广告/刷屏、关键词处理、警告/禁言/封禁、"
+                    "举报、AI 助理、积分、抽奖和竞拍等功能。\n\n"
+                    "请把我设为管理员，并授予删除消息、封禁用户、邀请用户权限。\n"
                     "管理员发送 /help 查看命令；面板地址请私聊我发送 /console。"
                 )
             except TelegramAPIError:
@@ -645,8 +648,10 @@ async def on_my_chat_member(update: ChatMemberUpdated, bot: Bot) -> None:
 
     if joined and not _claim(chat.id, me.id):
         return
+    username = await helpers.get_bot_username(bot) or "luygroup"
     lines = [
-        "👋 我是 <b>群卫 GroupGuard</b>，已加入本群。",
+        f"👋 我是 <b>@{escape(username)}</b>，luygroup 群组管理机器人，已加入本群。",
+        "我可以提供进群验证、反广告/刷屏、关键词处理、警告/禁言/封禁、举报、AI 助理、积分、抽奖和竞拍。",
         "管理员发送 /help 查看命令；面板地址请私聊我发送 /console。",
     ]
     if new == "administrator":

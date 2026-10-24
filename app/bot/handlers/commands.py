@@ -36,7 +36,7 @@ router = Router(name="commands")
 
 
 PRIVATE_MENU_TEXT = (
-    "🛡 <b>群卫 GroupGuard · 私聊菜单</b>\n"
+    "🛡 <b>luygroup · 私聊菜单</b>\n"
     "/start —— 快速开始\n"
     "/console —— 订阅控制台\n"
     "/sub —— 查看订阅\n"
@@ -48,7 +48,7 @@ PRIVATE_MENU_TEXT = (
 )
 
 GROUP_MENU_TEXT = (
-    "🛡 <b>群卫 GroupGuard · 总菜单</b>\n"
+    "🛡 <b>luygroup · 总菜单</b>\n"
     "/ads —— 总菜单\n"
     "/ban —— 回复广告消息封禁\n"
     "/iunban —— 全局解封并尝试跨群解除限制\n"
@@ -72,7 +72,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
     if message.chat.type == "private":
         await _ensure_console_user(message)
         greeting = (
-            "👋 你好，我是 <b>群卫 GroupGuard</b>。\n"
+            f"👋 你好，我是 <b>@{escape(await helpers.get_bot_username(bot) or 'luygroup')}</b>，luygroup 群组管理机器人。\n"
             "把我拉进群并设为管理员，即可使用进群验证、反广告、警告、积分、抽奖与 AI 功能。\n\n"
             "发送 /console 打开订阅控制台，发送 /sub 查看订阅。\n"
             "群组管理请把机器人设为管理员，并在群内发送 /ads 查看总菜单。"
@@ -89,7 +89,7 @@ async def cmd_start(message: Message, bot: Bot) -> None:
         )
         _ = group
     await message.answer(
-        "🛡 群卫已就位。发送 /ads 查看总菜单，/rules 查看群规。"
+        "🛡 luygroup 已就位。发送 /ads 查看总菜单，/rules 查看群规。"
     )
 
 
@@ -960,7 +960,7 @@ async def on_help_menu(callback: CallbackQuery) -> None:
         text = PRIVATE_MENU_TEXT
         markup = keyboards.back_menu()
     else:
-        text = "🛡 <b>群卫 GroupGuard</b>\n请选择要查看的命令菜单。"
+        text = "🛡 <b>luygroup</b>\n请选择要查看的命令菜单。"
         markup = keyboards.main_menu()
     if callback.message:
         try:

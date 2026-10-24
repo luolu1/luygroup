@@ -127,6 +127,7 @@ class FakeMessage:
         self.answers: list[str] = []
         self.replies: list[str] = []
         self.reply_kwargs: dict[str, object] = {}
+        self.message_id = 7001
 
     async def answer(self, text: str, **kwargs) -> None:
         self.answers.append(text)
@@ -150,6 +151,9 @@ class FakeBot:
         self.calls.append("restrict")
         self.restricted.append((int(chat_id), int(user_id)))
 
+    async def ban_chat_member(self, chat_id, user_id, **kwargs) -> None:
+        self.calls.append(f"ban:{chat_id}:{user_id}")
+
     async def get_chat_member(self, chat_id, user_id):
         return SimpleNamespace(status="member")
 
@@ -158,6 +162,9 @@ class FakeBot:
 
     async def send_message(self, *args, **kwargs):
         return None
+
+    async def delete_message(self, chat_id, message_id):
+        self.calls.append(f"delete_message:{message_id}")
 
 
 def command_names_from_menu(text: str) -> set[str]:
@@ -291,6 +298,32 @@ async def run_tests() -> None:
         "console login keyboard uses URL button",
         login_button.url == "https://example.test/console?token=code",
         str(login_button),
+    )
+
+    command_group_id = -100915000
+    command_user_id = 915000
+    command_user_pk = await create_console_user(command_user_id, "subscriber")
+    await create_group(command_group_id, "Command cleanup")
+    await bind_group(command_user_pk, command_group_id)
+    command_msg = FakeMessage(
+        user_id=command_user_id,
+        chat_id=command_group_id,
+        chat_type="supergroup",
+        text="/ban",
+    )
+    command_bot = FakeBot()
+    command_msg.reply_to_message = SimpleNamespace(
+        message_id=7000,
+        from_user=FakeUser(915099, "Target"),
+    )
+    await admin_handlers.cmd_ban(command_msg, command_bot)
+    await asyncio.sleep(2.1)
+    check(
+        "/ban deletes its command message when enabled",
+        "ban:-100915000:915099" in command_bot.calls
+        and "delete_message:7000" in command_bot.calls
+        and "delete_message:7001" in command_bot.calls,
+        str(command_bot.calls),
     )
 
     token_user_id = 915001
