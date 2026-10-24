@@ -1,8 +1,9 @@
 services:
-  groupguard:
+  groupguard-web:
     build: .
     image: groupguard:latest
-    container_name: groupguard
+    container_name: groupguard-web
+    command: ["python", "run_web.py"]
     environment:
       GROUPGUARD_CONFIG: /app/config.json
       TZ: ${TZ:-Asia/Shanghai}
@@ -25,3 +26,22 @@ services:
       timeout: 5s
       retries: 3
       start_period: 15s
+
+  groupguard-bot:
+    build: .
+    image: groupguard:latest
+    container_name: groupguard-bot
+    command: ["python", "run_bot.py"]
+    environment:
+      GROUPGUARD_CONFIG: /app/config.json
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ./config.json:/app/config.json:ro
+      - ./data:/app/data
+    restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      disable: true
+    depends_on:
+      groupguard-web:
+        condition: service_started
