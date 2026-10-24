@@ -221,7 +221,86 @@ python -c "import secrets; print(secrets.token_urlsafe(32))"
 
 ### 4. 启动
 
-同进程启动（推荐，Bot 与控制台一起运行）：
+一键部署（默认 Docker Compose）：
+
+```bash
+sudo bash deploy/install.sh
+```
+
+选择部署方式：
+
+```bash
+sudo bash deploy/install.sh docker-compose
+sudo bash deploy/install.sh docker
+sudo bash deploy/install.sh systemd
+```
+
+脚本会创建 `data/`，仅在 `config.json` 不存在时从 `config.example.json` 复制配置；不会覆盖现有配置或数据库。首次部署后请填写 `config.json` 中的 `bot.token`、`bot.admin_ids` 和随机 `web.secret_key`，然后重新启动对应服务。
+
+#### 方式一：Docker Compose（推荐）
+
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs -f --tail=200
+```
+
+Compose 会启动两个服务：`groupguard-web` 监听 8090，`groupguard-bot` 运行 Telegram Bot。两个服务共享宿主机的 `config.json` 和 `data/`，容器异常退出会自动重启。停止时使用：
+
+```bash
+docker compose down
+```
+
+如需查看控制台健康状态：
+
+```bash
+curl http://127.0.0.1:8090/healthz
+```
+
+#### 方式二：Docker
+
+不使用 Compose 时，使用一键脚本：
+
+```bash
+sudo bash deploy/install.sh docker
+docker ps --filter name=groupguard-
+docker logs -f groupguard-bot
+```
+
+该模式创建 `groupguard` Docker network，并分别启动 `groupguard-web` 与 `groupguard-bot`。停止服务：
+
+```bash
+docker rm -f groupguard-web groupguard-bot
+```
+
+#### 方式三：systemd
+
+适用于使用 systemd 的 Linux 服务器：
+
+```bash
+sudo bash deploy/install.sh systemd
+systemctl status groupguard-web groupguard-bot
+journalctl -u groupguard-web -f
+journalctl -u groupguard-bot -f
+```
+
+手动安装 systemd 单元时，复制 `deploy/groupguard-web.service` 和 `deploy/groupguard-bot.service` 到 `/etc/systemd/system/`，然后执行：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now groupguard-web groupguard-bot
+```
+
+停止或重启：
+
+```bash
+sudo systemctl stop groupguard-web groupguard-bot
+sudo systemctl restart groupguard-web groupguard-bot
+```
+
+#### 本地开发启动
+
+本地非 Docker 启动方式仍可使用同进程模式：
 
 ```bash
 python -m app.main
@@ -239,6 +318,10 @@ make run
 python run_bot.py    # 仅 Telegram Bot
 python run_web.py    # 仅 Web 控制台
 ```
+
+生产环境不要同时运行这些本地进程和 Compose 服务，否则会造成 8090 端口冲突，或让同一个 Bot Token 被多个进程轮询。
+
+三种生产部署方式只能选择一种。迁移已有进程时，先启动目标部署并验证 `healthz`/Bot 日志，再停止旧的 `run_web.py` 与 `run_bot.py`；不要让两个部署同时运行同一个 Bot Token。
 
 启动后：
 
