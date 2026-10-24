@@ -73,12 +73,30 @@ class AIConfig(BaseModel):
     providers: list[AIProviderSeed] = Field(default_factory=list)
 
 
+class EpayConfig(BaseModel):
+    base_url: str = ""
+    pid: str = ""
+    key: str = ""
+    type: str = ""
+    method: str = ""
+    timeout: int = 15
+
+
+class PaymentConfig(BaseModel):
+    enabled: bool = False
+    provider: str = "epay"
+    min_amount_cents: int = 100
+    max_amount_cents: int = 100000
+    epay: EpayConfig = Field(default_factory=EpayConfig)
+
+
 class AppConfig(BaseModel):
     bot: BotConfig
     web: WebConfig = Field(default_factory=WebConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     defaults: DefaultsConfig = Field(default_factory=DefaultsConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
+    payments: PaymentConfig = Field(default_factory=PaymentConfig)
     config_path: Path = Path("config.json")
 
     @property

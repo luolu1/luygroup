@@ -158,6 +158,69 @@ class Subscription(Base):
     created_at = Column(DateTime, default=utcnow)
 
 
+class PaymentOrder(Base):
+    __tablename__ = "payment_orders"
+
+    id = Column(Integer, primary_key=True)
+    order_no = Column(String(64), unique=True, index=True, nullable=False)
+    user_id = Column(Integer, index=True, nullable=False)
+    provider = Column(String(32), default="epay")
+    purpose = Column(String(16), default="recharge")
+    amount_cents = Column(Integer, nullable=False)
+    currency = Column(String(8), default="CNY")
+    status = Column(String(16), default="pending", index=True)
+    trade_no = Column(String(64), default="")
+    pay_url = Column(Text, default="")
+    pay_type = Column(String(32), default="")
+    last_error = Column(String(255), default="")
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+    paid_at = Column(DateTime, nullable=True)
+    expires_at = Column(DateTime, nullable=True, index=True)
+    fee_cents = Column(Integer, default=0, nullable=False)
+    channel_id = Column(Integer, nullable=True, index=True)
+    charge_cents = Column(Integer, default=0, nullable=False)
+    charge_currency = Column(String(8), default="CNY")
+
+
+class PaymentChannel(Base):
+    __tablename__ = "payment_channels"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String(64), default="")
+    icon = Column(String(255), default="")
+    channel_type = Column(String(32), default="epay")
+    pay_type = Column(String(32), default="alipay")
+    interact_type = Column(String(16), default="qrcode")
+    sort_weight = Column(Integer, default=10)
+    fee_percent = Column(Integer, default=0)  # basis points, 300 = 3.00%
+    fee_fixed_cents = Column(Integer, default=0)
+    enabled = Column(Boolean, default=True, index=True)
+    version = Column(String(8), default="V1")
+    gateway = Column(String(255), default="")
+    merchant_id = Column(String(64), default="")
+    merchant_key = Column(String(255), default="")
+    notify_url = Column(String(255), default="")
+    return_url = Column(String(255), default="")
+    currency = Column(String(8), default="CNY")
+    rate_base = Column(String(16), default="")
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+
+class AccountLedgerEntry(Base):
+    __tablename__ = "account_ledger_entries"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, index=True, nullable=False)
+    order_id = Column(Integer, nullable=True, index=True)
+    kind = Column(String(24), default="adjustment")
+    amount_cents = Column(Integer, nullable=False)
+    balance_after_cents = Column(Integer, nullable=False)
+    description = Column(String(255), default="")
+    created_at = Column(DateTime, default=utcnow, index=True)
+
+
 class ConsoleGroupAccess(Base):
     __tablename__ = "console_group_access"
 

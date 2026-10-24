@@ -15,6 +15,20 @@
   "database": {
     "url": "sqlite+aiosqlite:///./data/groupguard.db"
   },
+  "payments": {
+    "enabled": false,
+    "provider": "epay",
+    "min_amount_cents": 100,
+    "max_amount_cents": 100000,
+    "epay": {
+      "base_url": "https://pay.example.com",
+      "pid": "",
+      "key": "",
+      "type": "alipay",
+      "method": "",
+      "timeout": 15
+    }
+  },
   "defaults": {
     "warn_limit": 3,
     "warn_action": "mute",

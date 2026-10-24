@@ -122,6 +122,13 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
         "groups": {
             "auto_delete_messages": "BOOLEAN DEFAULT 1",
         },
+        "payment_orders": {
+            "fee_cents": "INTEGER NOT NULL DEFAULT 0",
+            "channel_id": "INTEGER",
+            "charge_cents": "INTEGER NOT NULL DEFAULT 0",
+            "charge_currency": "VARCHAR(8) DEFAULT 'CNY'",
+            "expires_at": "DATETIME",
+        },
     }
     for table, additions in columns.items():
         existing = {
