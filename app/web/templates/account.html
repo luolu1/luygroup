@@ -14,7 +14,17 @@
     <div class="eyebrow">ACCOUNT BALANCE</div>
     <h2>可用余额</h2>
     <div class="stat-value">{{ console_user.balance_cents|money }} <span class="muted small">CNY</span></div>
-    <div class="hint">订阅价格：¥8.00 / 月。请联系管理员为账户充值。</div>
+    <div class="hint">订阅价格：¥8.00 / 月。</div>
+    {% if payments_enabled and not ent.is_superadmin %}
+    <form method="post" action="/account/recharge" style="margin-top:14px">
+      <label for="amount">充值金额（CNY）</label>
+      <input id="amount" name="amount" type="text" inputmode="decimal" placeholder="例如 20.00" required>
+      <div class="hint">单笔 ¥{{ '%.2f'|format(min_recharge / 100) }} ~ ¥{{ '%.2f'|format(max_recharge / 100) }}，支付成功后自动到账。</div>
+      <button type="submit" style="margin-top:10px">前往支付</button>
+    </form>
+    {% else %}
+    <div class="hint">在线充值尚未启用，请联系管理员为账户充值。</div>
+    {% endif %}
   </div>
   <div class="card">
     <div class="eyebrow">CURRENT PLAN</div>
@@ -28,17 +38,89 @@
     {% elif subscription and subscription.expires_at and subscription.expires_at > now_utc %}
     <div class="stat-value">{{ plan.label if plan else '订阅版' }}</div>
     <div class="muted">有效至 {{ subscription.expires_at|dt }}</div>
-    <form method="post" action="/account/subscribe" style="margin-top:14px">
-      <button type="submit" data-confirm="将扣除 ¥8.00 CNY，并在当前到期日基础上续订一个月。继续吗？">续费一个月 · ¥8.00</button>
-    </form>
     {% else %}
     <div class="stat-value">未开通</div>
     <div class="hint">购买后立即开通一个月订阅。</div>
-    <form method="post" action="/account/subscribe" style="margin-top:14px">
-      <button type="submit" data-confirm="将扣除 ¥8.00 CNY，开通一个月订阅。继续吗？">购买一个月 · ¥8.00</button>
-    </form>
+    {% endif %}
+    {% set can_renew = subscription and subscription.expires_at and subscription.expires_at > now_utc %}
+    {% if not ent.is_superadmin and not (subscription and subscription.expires_at is none) %}
+    <button type="button" style="margin-top:14px" data-subscription-choice aria-expanded="false">{{ '续费一个月' if can_renew else '开通一个月' }} · ¥8.00</button>
+    <div data-subscription-options hidden style="margin-top:12px">
+      <div class="hint">选择支付方式</div>
+      <div class="actions" style="margin-top:8px">
+        <form method="post" action="/account/subscribe">
+          <button type="submit" class="ghost sm" data-confirm="将从余额扣除 ¥8.00 CNY，继续吗？">余额抵扣</button>
+        </form>
+        {% if payments_enabled %}
+        <form method="post" action="/account/subscribe/pay">
+          <button type="submit" class="ghost sm" data-confirm="将通过在线支付 ¥8.00 CNY，继续吗？">在线支付</button>
+        </form>
+        {% endif %}
+      </div>
+    </div>
     {% endif %}
   </div>
+</div>
+
+<div class="card">
+  <div class="spread">
+    <h2>待支付订单</h2>
+    <span class="faint small">创建后 5 分钟内有效</span>
+  </div>
+  {% if pending_orders %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>订单号</th><th>类型</th><th>应付金额</th><th>有效至</th><th>操作</th></tr>
+      </thead>
+      <tbody>
+        {% for order in pending_orders %}
+        <tr>
+          <td class="mono small">{{ order.order_no }}</td>
+          <td>{{ '订阅购买/续费' if order.purpose == 'subscription' else '余额充值' }}</td>
+          <td>{{ (order.charge_cents or order.amount_cents + order.fee_cents)|money }} {{ order.charge_currency }}</td>
+          <td class="muted small">{{ order.expires_at|dt if order.expires_at else '—' }}</td>
+          <td>
+            <form method="post" action="/account/orders/{{ order.order_no }}/pay">
+              <button type="submit" class="ghost sm">继续付款</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="hint">没有待支付订单。</div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <div class="spread">
+    <h2>账单记录</h2>
+    <span class="faint small">充值与订阅订单</span>
+  </div>
+  {% if bills %}
+  <table>
+    <thead>
+      <tr><th>账单号</th><th>类型</th><th>金额</th><th>余额变动</th><th>余额</th><th>时间</th></tr>
+    </thead>
+    <tbody>
+      {% for bill in bills %}
+      <tr>
+        <td class="mono small">{{ bill.id }}{% if bill.order_id %} · {{ bill.order_id }}{% endif %}</td>
+        <td>{{ {'recharge': '余额充值', 'subscription_balance': '余额购买订阅', 'subscription_online': '在线购买订阅', 'adjustment': '余额调整'}.get(bill.kind, bill.kind) }}</td>
+        <td>{{ bill.amount_cents|abs|money }}</td>
+        <td class="{{ 'ok' if bill.amount_cents > 0 else 'muted' }}">{{ '+' if bill.amount_cents > 0 else '' }}{{ bill.amount_cents|money }}</td>
+        <td>{{ bill.balance_after_cents|money }}</td>
+        <td class="muted small">{{ bill.created_at|dt }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="hint">暂无账单记录。</div>
+  {% endif %}
 </div>
 
 <div class="card">
@@ -50,4 +132,17 @@
     <span class="k">余额不足</span><span>不会扣款或更改订阅，请联系管理员充值后再购买。</span>
   </div>
 </div>
+{% endblock %}
+{% block scripts %}
+<script>
+(() => {
+  const trigger = document.querySelector("[data-subscription-choice]");
+  const choices = document.querySelector("[data-subscription-options]");
+  if (!trigger || !choices) return;
+  trigger.addEventListener("click", () => {
+    choices.hidden = !choices.hidden;
+    trigger.setAttribute("aria-expanded", String(!choices.hidden));
+  });
+})();
+</script>
 {% endblock %}

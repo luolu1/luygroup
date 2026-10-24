@@ -1,0 +1,187 @@
+{% extends "base.html" %}
+{% set editing = channel is not none %}
+{% block title %}{{ '编辑' if editing else '添加' }}支付渠道{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">PAYMENT CHANNELS · {{ 'EDIT' if editing else 'ADD' }}</div>
+    <h1>{{ '编辑支付渠道' if editing else '添加支付渠道' }}</h1>
+    <div class="muted small">填写渠道信息和 Epay 商户配置，保存后即可在在线支付中使用。</div>
+  </div>
+  <a class="btn ghost sm" href="/payments">返回渠道列表</a>
+</div>
+
+<form method="post" action="{{ '/payments/' ~ channel.id ~ '/update' if editing else '/payments/new' }}" enctype="multipart/form-data">
+  <div class="card">
+    <h2>渠道信息</h2>
+    <div class="form-grid">
+      <div class="field">
+        <label for="name">渠道名称</label>
+        <input id="name" name="name" type="text" maxlength="64" required
+               value="{{ channel.name if editing else '' }}" placeholder="例如：支付宝收款">
+        <div class="hint">用于管理后台和支付页面识别渠道。</div>
+      </div>
+      <div class="field">
+        <label for="channel_type">渠道类型</label>
+        <select id="channel_type" name="channel_type" required>
+          <option value="epay" {% if not editing or channel.channel_type == 'epay' %}selected{% endif %}>Epay 易支付</option>
+        </select>
+        <div class="hint">当前支持 Epay 易支付接口。</div>
+      </div>
+      <div class="field">
+        <label for="pay_type">支付方式</label>
+        <select id="pay_type" name="pay_type" required>
+          <option value="alipay" {% if editing and channel.pay_type == 'alipay' %}selected{% endif %}>支付宝</option>
+          <option value="wxpay" {% if editing and channel.pay_type == 'wxpay' %}selected{% endif %}>微信支付</option>
+          <option value="qqpay" {% if editing and channel.pay_type == 'qqpay' %}selected{% endif %}>QQ 钱包</option>
+          <option value="bank" {% if editing and channel.pay_type == 'bank' %}selected{% endif %}>网银支付</option>
+          <option value="usdt" {% if editing and channel.pay_type == 'usdt' %}selected{% endif %}>USDT</option>
+        </select>
+        <div class="hint">所选方式需与 Epay 商户已开通的支付类型一致。</div>
+      </div>
+      <div class="field">
+        <label for="interact_type">交互方式</label>
+        <select id="interact_type" name="interact_type" required>
+          <option value="qrcode" {% if not editing or channel.interact_type == 'qrcode' %}selected{% endif %}>二维码</option>
+          <option value="redirect" {% if editing and channel.interact_type == 'redirect' %}selected{% endif %}>跳转支付</option>
+        </select>
+        <div class="hint">二维码适用于扫码完成支付；跳转方式会打开支付网关页面。</div>
+      </div>
+      <div class="field">
+        <label for="sort_weight">排序权重</label>
+        <input id="sort_weight" name="sort_weight" type="number" min="0" max="100000"
+               value="{{ channel.sort_weight if editing else 10 }}">
+        <div class="hint">数值越小越靠前；权重相同时按渠道 ID 排序。</div>
+      </div>
+      <div class="field">
+        <label for="fee_percent">百分比手续费（%）</label>
+        <input id="fee_percent" name="fee_percent" type="number" min="0" max="100" step="0.01"
+               value="{{ '%.2f'|format((channel.fee_percent or 0) / 100) if editing else '0' }}">
+        <div class="hint">填写 0 到 100 之间的百分比，例如 3 表示 3%。</div>
+      </div>
+      <div class="field">
+        <label for="fee_fixed">固定手续费（元）</label>
+        <input id="fee_fixed" name="fee_fixed" type="number" min="0" step="0.01"
+               value="{{ '%.2f'|format((channel.fee_fixed_cents or 0) / 100) if editing else '0' }}">
+        <div class="hint">每笔订单额外收取的固定费用，单位为人民币元。</div>
+      </div>
+      <div class="field">
+        <label>渠道状态</label>
+        <label class="inline"><input class="check" type="checkbox" name="enabled" {% if not editing or channel.enabled %}checked{% endif %}> 启用</label>
+        <div class="hint">停用后用户端将不再显示该支付渠道。</div>
+      </div>
+      <div class="field span-2">
+        <label for="icon">渠道图标</label>
+        <div data-icon-drop style="padding:14px;background:var(--bg);border:1px dashed var(--border);border-radius:9px">
+          <div class="row" style="align-items:center">
+            {% if editing and channel.icon %}
+            <img src="/payments/icons/{{ channel.icon }}" alt="当前渠道图标" width="48" height="48" style="border-radius:9px">
+            {% endif %}
+            <input id="icon" name="icon" type="file" accept="image/png,image/jpeg,image/webp,image/gif" data-icon-input>
+          </div>
+          <div class="hint" data-icon-name>点击选择图标，或将图片拖拽到此区域。支持 PNG、JPG、WebP、GIF。</div>
+        </div>
+        {% if editing and channel.icon %}
+        <label class="inline" style="margin-top:8px"><input class="check" type="checkbox" name="remove_icon"> 移除当前图标</label>
+        {% endif %}
+        <div class="hint">建议使用清晰的正方形图标。上传新图标会替换当前图标。</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="spread">
+      <h2>Epay 商户配置</h2>
+      <span class="badge info">Epay</span>
+    </div>
+    <div class="form-grid">
+      <div class="field">
+        <label for="version">接口版本</label>
+        <select id="version" name="version">
+          <option value="V1" {% if not editing or channel.version == 'V1' %}selected{% endif %}>V1</option>
+          <option value="V2" {% if editing and channel.version == 'V2' %}selected{% endif %}>V2</option>
+        </select>
+        <div class="hint">选择商户平台对应的易支付接口版本。</div>
+      </div>
+      <div class="field span-2">
+        <label for="gateway">支付网关</label>
+        <input id="gateway" name="gateway" type="text" maxlength="255" required
+               value="{{ channel.gateway if editing else '' }}" placeholder="https://pay.example.com">
+        <div class="hint">填写完整的 HTTP 或 HTTPS 网关地址，不要附加接口路径。</div>
+      </div>
+      <div class="field">
+        <label for="merchant_id">商户 ID</label>
+        <input id="merchant_id" name="merchant_id" type="text" maxlength="64" required
+               value="{{ channel.merchant_id if editing else '' }}" placeholder="Epay 商户 PID">
+        <div class="hint">填写 Epay 商户后台分配的商户 ID（PID）。</div>
+      </div>
+      <div class="field">
+        <label for="merchant_key">商户密钥</label>
+        <input id="merchant_key" name="merchant_key" type="password" maxlength="255" autocomplete="new-password"
+               placeholder="{{ '已配置，留空保持不变' if editing else '输入 Epay 商户密钥' }}">
+        <div class="hint">编辑时留空会保留当前密钥；新建渠道时必须填写。</div>
+      </div>
+      <div class="field span-2">
+        <label for="notify_url">异步回调地址</label>
+        <input id="notify_url" name="notify_url" type="text" maxlength="255"
+               value="{{ channel.notify_url if editing else '' }}" placeholder="{{ default_notify }}">
+        <div class="hint">支付平台服务器通知地址。留空时使用默认回调：{{ default_notify }}</div>
+      </div>
+      <div class="field span-2">
+        <label for="return_url">支付返回地址</label>
+        <input id="return_url" name="return_url" type="text" maxlength="255"
+               value="{{ channel.return_url if editing else '' }}" placeholder="{{ default_return }}">
+        <div class="hint">用户完成支付后返回的页面地址。留空时使用默认返回地址：{{ default_return }}</div>
+      </div>
+      <div class="field">
+        <label for="currency">结算货币</label>
+        <input id="currency" name="currency" type="text" maxlength="8"
+               value="{{ channel.currency if editing else 'CNY' }}" placeholder="CNY">
+        <div class="hint">按网关要求填写币种代码，例如 CNY 或 USD。</div>
+      </div>
+      <div class="field">
+        <label for="rate_base">汇率基数</label>
+        <input id="rate_base" name="rate_base" type="number" min="0" step="any"
+               value="{{ channel.rate_base if editing else '' }}" placeholder="留空使用面额">
+        <div class="hint">可选。填写 1 元人民币对应的目标币种金额；留空按面额结算。</div>
+      </div>
+    </div>
+    <div class="alert">请核对网关地址、商户 ID 和密钥，并确保 Epay 后台回调配置与此处一致。敏感密钥不会在编辑表单中回显。</div>
+    <div class="form-actions">
+      <button type="submit">{{ '保存修改' if editing else '添加渠道' }}</button>
+      <a class="btn ghost" href="/payments">取消</a>
+    </div>
+  </div>
+</form>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(() => {
+  const drop = document.querySelector("[data-icon-drop]");
+  const input = document.querySelector("[data-icon-input]");
+  const name = document.querySelector("[data-icon-name]");
+  if (!drop || !input || !name) return;
+  const guidance = name.textContent;
+  const updateName = () => {
+    name.textContent = input.files && input.files.length ? input.files[0].name : guidance;
+  };
+  input.addEventListener("change", updateName);
+  drop.addEventListener("dragover", (event) => {
+    event.preventDefault();
+    drop.style.borderColor = "var(--accent)";
+  });
+  drop.addEventListener("dragleave", () => {
+    drop.style.borderColor = "var(--border)";
+  });
+  drop.addEventListener("drop", (event) => {
+    event.preventDefault();
+    drop.style.borderColor = "var(--border)";
+    if (event.dataTransfer && event.dataTransfer.files.length) {
+      input.files = event.dataTransfer.files;
+      updateName();
+    }
+  });
+})();
+</script>
+{% endblock %}

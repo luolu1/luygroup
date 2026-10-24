@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}支付渠道{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">PAYMENT CHANNELS</div>
+    <h1>支付渠道</h1>
+    <div class="muted small">配置在线支付渠道与费率，按权重升序优先尝试；停用后用户将看不到该支付方式。</div>
+  </div>
+  <div class="actions">
+    <form class="row" method="get" action="/payments">
+      <select name="channel_type" aria-label="渠道类型筛选" onchange="this.form.submit()">
+        <option value="">全部渠道类型</option>
+        <option value="epay" {% if channel_type == 'epay' %}selected{% endif %}>Epay 易支付</option>
+      </select>
+      <select name="pay_type" aria-label="支付方式筛选" onchange="this.form.submit()">
+        <option value="">全部支付方式</option>
+        <option value="alipay" {% if pay_type == 'alipay' %}selected{% endif %}>支付宝</option>
+        <option value="wxpay" {% if pay_type == 'wxpay' %}selected{% endif %}>微信支付</option>
+        <option value="qqpay" {% if pay_type == 'qqpay' %}selected{% endif %}>QQ 钱包</option>
+        <option value="bank" {% if pay_type == 'bank' %}selected{% endif %}>网银支付</option>
+        <option value="usdt" {% if pay_type == 'usdt' %}selected{% endif %}>USDT</option>
+      </select>
+      <button class="ghost sm" type="submit">筛选</button>
+    </form>
+    <a class="btn ghost sm" href="/payments">刷新</a>
+    <a class="btn ghost sm" href="/payments/orders">所有订单</a>
+    <a class="btn sm" href="/payments/new">＋ 添加渠道</a>
+  </div>
+</div>
+
+<div class="card">
+  <div class="spread">
+    <h2>渠道列表（{{ channels|length }}）</h2>
+    <span class="faint small">按权重升序排列</span>
+  </div>
+  {% if channels %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>图标</th>
+          <th>名称</th>
+          <th>渠道类型</th>
+          <th>支付方式</th>
+          <th>状态</th>
+          <th class="num">权重</th>
+          <th>手续费</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for channel in channels %}
+        {% set percent = ((channel.fee_percent or 0) / 100)|round(2) %}
+        {% set fixed = ((channel.fee_fixed_cents or 0) / 100)|round(2) %}
+        <tr>
+          <td>
+            {% if channel.icon %}
+            <img src="/payments/icons/{{ channel.icon }}" alt="{{ channel.name }} 图标" width="32" height="32" style="border-radius:7px;vertical-align:middle">
+            {% else %}
+            <span class="faint small">未设置</span>
+            {% endif %}
+          </td>
+          <td>
+            <a href="/payments/{{ channel.id }}/edit">{{ channel.name }}</a>
+            <div class="faint mono small">#{{ channel.id }}</div>
+          </td>
+          <td><span class="badge info">{{ {'epay': 'Epay 易支付'}.get(channel.channel_type, channel.channel_type) }}</span></td>
+          <td>{{ {'alipay': '支付宝', 'wxpay': '微信支付', 'qqpay': 'QQ 钱包', 'bank': '网银支付', 'usdt': 'USDT'}.get(channel.pay_type, channel.pay_type) }}</td>
+          <td>
+            {% if channel.enabled %}<span class="badge ok">已启用</span>
+            {% else %}<span class="badge bad">已停用</span>{% endif %}
+          </td>
+          <td class="num">{{ channel.sort_weight }}</td>
+          <td class="small">
+            {{ percent }}%{% if fixed %} + ¥{{ fixed }}{% endif %}
+          </td>
+          <td>
+            <div class="actions">
+              <a class="btn ghost sm" href="/payments/{{ channel.id }}/edit">编辑</a>
+              <form method="post" action="/payments/{{ channel.id }}/toggle">
+                <button class="ghost sm" type="submit">{{ '停用' if channel.enabled else '启用' }}</button>
+              </form>
+              <form method="post" action="/payments/{{ channel.id }}/delete"
+                    data-confirm="确定删除支付渠道 {{ channel.name }}？">
+                <button class="danger sm" type="submit">删除</button>
+              </form>
+            </div>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">
+    {% if channel_type or pay_type %}没有匹配当前筛选条件的支付渠道。{% else %}尚未配置支付渠道，用户暂时无法在线充值。{% endif %}
+  </div>
+  {% endif %}
+</div>
+
+<div class="card tight">
+  <div class="row">
+    <span class="badge info">提示</span>
+    <span class="muted small">权重数值越小越靠前；相同权重时按渠道 ID 升序排序。删除渠道不会删除已完成的支付订单记录。</span>
+  </div>
+</div>
+{% endblock %}

@@ -58,9 +58,15 @@ UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 class CSRFOriginMiddleware(BaseHTTPMiddleware):
+    EXEMPT_PATHS = {"/healthz", "/payments/epay/notify"}
+
     async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
         path = request.url.path
-        if request.method in UNSAFE_METHODS and not path.startswith("/static") and path != "/healthz":
+        if (
+            request.method in UNSAFE_METHODS
+            and not path.startswith("/static")
+            and path not in self.EXEMPT_PATHS
+        ):
             origin = request.headers.get("origin")
             referer = request.headers.get("referer")
             if origin == "null":

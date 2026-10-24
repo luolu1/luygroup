@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block title %}所有订单{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">PAYMENT ORDERS</div>
+    <h1>所有用户订单</h1>
+    <div class="muted small">充值和订阅支付记录，最多显示最近 1000 笔。</div>
+  </div>
+  <div class="actions">
+    <a class="btn ghost sm" href="/payments">支付渠道</a>
+  </div>
+</div>
+
+<div class="card">
+  <form class="actions" method="get" action="/payments/orders">
+    <input name="q" value="{{ q }}" type="search" placeholder="订单号、用户名或显示名称" style="min-width:240px">
+    <select name="purpose" aria-label="订单类型">
+      <option value="">全部类型</option>
+      <option value="recharge" {% if purpose == 'recharge' %}selected{% endif %}>余额充值</option>
+      <option value="subscription" {% if purpose == 'subscription' %}selected{% endif %}>订阅购买</option>
+    </select>
+    <select name="status" aria-label="订单状态">
+      <option value="">全部状态</option>
+      <option value="pending" {% if status == 'pending' %}selected{% endif %}>待支付</option>
+      <option value="paid" {% if status == 'paid' %}selected{% endif %}>已完成</option>
+      <option value="failed" {% if status == 'failed' %}selected{% endif %}>失败</option>
+      <option value="expired" {% if status == 'expired' %}selected{% endif %}>已过期</option>
+    </select>
+    <button class="ghost sm" type="submit">筛选</button>
+    <a class="btn ghost sm" href="/payments/orders">清除</a>
+  </form>
+</div>
+
+<div class="card">
+  <div class="spread">
+    <h2>订单（{{ orders|length }}）</h2>
+    <span class="faint small">按创建时间倒序</span>
+  </div>
+  {% if orders %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>用户</th><th>订单号</th><th>类型</th><th>订单金额</th>
+          <th>手续费</th><th>实付</th><th>渠道</th><th>状态</th>
+          <th>创建时间</th><th>支付时间</th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for order in orders %}
+        <tr>
+          <td>
+            {{ order.user.display_name or order.user.username or ('用户 ' ~ order.user.id) }}
+            <div class="faint small">{{ order.user.username or '—' }} · ID {{ order.user.id }}</div>
+          </td>
+          <td class="mono small">{{ order.order_no }}</td>
+          <td>{{ {'subscription': '在线订阅', 'subscription_balance': '余额订阅', 'recharge': '余额充值'}.get(order.purpose, order.purpose) }}</td>
+          <td>{{ order.amount_cents|money }}</td>
+          <td>{{ order.fee_cents|money }}</td>
+          <td>{{ (order.charge_cents or order.amount_cents + order.fee_cents)|money }} {{ order.charge_currency }}</td>
+          <td>{{ order.provider }}{% if order.pay_type %} · {{ order.pay_type }}{% endif %}</td>
+          <td>
+            {% if order.status == 'paid' %}<span class="badge ok">已完成</span>
+            {% elif order.status == 'pending' %}<span class="badge info">待支付</span>
+            {% elif order.status == 'failed' %}<span class="badge bad">失败</span>
+            {% else %}<span class="badge">{{ order.status }}</span>{% endif %}
+          </td>
+          <td class="muted small">{{ order.created_at|dt }}</td>
+          <td class="muted small">{{ order.paid_at|dt if order.paid_at else '—' }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">没有符合条件的订单。</div>
+  {% endif %}
+</div>
+{% endblock %}

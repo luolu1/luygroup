@@ -2,17 +2,25 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import case, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -31,6 +39,7 @@ from ..entitlements import (
 from ..models import (
     Admin,
     AdminLog,
+    AccountLedgerEntry,
     AIEvent,
     AIProvider,
     AIUsage,
@@ -45,6 +54,8 @@ from ..models import (
     KeywordHit,
     Lottery,
     Member,
+    PaymentChannel,
+    PaymentOrder,
     RedPacket,
     Report,
     ReportLink,
@@ -60,12 +71,14 @@ from ..models import (
 )
 from ..services import ai as ai_service
 from ..services import repo
+from ..services.payments import service as payment_service
 from ..services.subscriptions import MONTHLY_PRICE_CENTS, purchase_month
 from .auth import LoginRequired, current_admin_id, hash_console_token, new_console_token, require_admin, safe_next
 from .utils import fmt_date, fmt_dt, fmt_money, n, short, user_label
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+log = logging.getLogger(__name__)
 templates.env.filters["dt"] = fmt_dt
 templates.env.filters["date"] = fmt_date
 templates.env.filters["money"] = fmt_money
@@ -590,6 +603,8 @@ async def account_page(
     ent = _current_entitlements(request)
     if ent.user is None:
         raise LoginRequired
+    await payment_service.expire_pending_orders(session, ent.user.id)
+    await session.commit()
     subscription = await session.scalar(
         select(Subscription)
         .where(Subscription.user_id == ent.user.id, Subscription.status == "active")
@@ -597,6 +612,23 @@ async def account_page(
         .limit(1)
     )
     plan = await session.get(SubscriptionPlan, subscription.plan_id) if subscription else None
+    pay_cfg = payment_service.payment_config()
+    bills = await session.scalars(
+        select(AccountLedgerEntry)
+        .where(AccountLedgerEntry.user_id == ent.user.id)
+        .order_by(AccountLedgerEntry.id.desc())
+        .limit(500)
+    )
+    pending_orders = await session.scalars(
+        select(PaymentOrder)
+        .where(
+            PaymentOrder.user_id == ent.user.id,
+            PaymentOrder.status == "pending",
+        )
+        .order_by(PaymentOrder.id.desc())
+        .limit(100)
+    )
+    payments_enabled = await payment_service.checkout_enabled(session)
     return _render(
         request,
         "account.html",
@@ -604,6 +636,11 @@ async def account_page(
         plan=plan,
         now_utc=utcnow(),
         monthly_price_cents=MONTHLY_PRICE_CENTS,
+        bills=list(bills.all()),
+        pending_orders=list(pending_orders.all()),
+        payments_enabled=payments_enabled,
+        min_recharge=pay_cfg.min_amount_cents,
+        max_recharge=pay_cfg.max_amount_cents,
     )
 
 
@@ -623,6 +660,476 @@ async def account_subscribe(
         "/account",
         msg=f"订阅已购买/续费至 {expires_at:%Y-%m-%d}，扣款 ¥8.00，余额 ¥{new_balance / 100:.2f}",
     )
+
+
+def _parse_amount_cents(raw: str) -> int | None:
+    try:
+        raw_amount = Decimal(raw.strip())
+        if not raw_amount.is_finite():
+            return None
+        amount = raw_amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, AttributeError):
+        return None
+    if amount <= 0 or amount != raw_amount:
+        return None
+    return int(amount * 100)
+
+
+@router.post("/account/recharge")
+async def account_recharge(
+    request: Request, session: AsyncSession = Depends(get_session)
+) -> RedirectResponse:
+    ent = _current_entitlements(request)
+    if ent.user is None:
+        raise LoginRequired
+    if ent.is_superadmin:
+        return _redirect("/account", err="超级管理员无需充值")
+    raw = str((await request.form()).get("amount") or "")
+    cents = _parse_amount_cents(raw)
+    if cents is None:
+        return _redirect("/account", err="请输入有效的充值金额，最多两位小数")
+    order, error = await payment_service.create_recharge_order(session, ent.user.id, cents)
+    if order is None:
+        return _redirect("/account", err=error)
+    await session.commit()
+    provider = await payment_service.provider_for_order(session, order)
+    notify_url, return_url = await payment_service.checkout_urls_for_order(session, order)
+    creation, error = await payment_service.start_checkout(
+        provider,
+        order,
+        request.client.host if request.client else "0.0.0.0",
+        notify_url,
+        return_url,
+    )
+    if creation is None:
+        await session.commit()
+        return _redirect("/account", err=f"发起支付失败：{error}")
+    await session.commit()
+    return RedirectResponse(creation.pay_url, status_code=303)
+
+
+@router.get("/account/recharge/return")
+async def account_recharge_return(
+    request: Request, session: AsyncSession = Depends(get_session)
+) -> RedirectResponse:
+    ent = _current_entitlements(request)
+    if ent.user is None:
+        raise LoginRequired
+    order_no = str(request.query_params.get("out_trade_no") or "").strip()
+    if not order_no:
+        return _redirect("/account", err="缺少订单号")
+    order = await session.scalar(
+        select(PaymentOrder).where(
+            PaymentOrder.order_no == order_no,
+            PaymentOrder.user_id == ent.user.id,
+        )
+    )
+    if order is None:
+        return _redirect("/account", err="订单不存在")
+    if order.status == "paid":
+        return _redirect("/account", msg=f"充值 ¥{order.amount_cents / 100:.2f} 已到账")
+    return _redirect(
+        "/account",
+        msg="支付结果以支付平台异步通知为准，到账后余额会自动更新，请稍后刷新。",
+    )
+
+
+@router.post("/account/orders/{order_no}/pay")
+async def account_order_pay(
+    order_no: str,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    ent = _current_entitlements(request)
+    if ent.user is None:
+        raise LoginRequired
+    await payment_service.expire_pending_orders(session, ent.user.id)
+    order = await session.scalar(
+        select(PaymentOrder).where(
+            PaymentOrder.order_no == order_no,
+            PaymentOrder.user_id == ent.user.id,
+        )
+    )
+    if order is None:
+        return _redirect("/account", err="订单不存在")
+    if order.status != "pending":
+        return _redirect("/account", err="订单已支付或已过期，不能重复付款")
+    if order.expires_at is None or order.expires_at <= utcnow():
+        order.status = "expired"
+        await session.commit()
+        return _redirect("/account", err="订单已过期，请重新发起支付")
+    try:
+        provider = await payment_service.provider_for_order(session, order)
+        notify_url, return_url = await payment_service.checkout_urls_for_order(session, order)
+        creation, error = await payment_service.start_checkout(
+            provider,
+            order,
+            request.client.host if request.client else "0.0.0.0",
+            notify_url,
+            return_url,
+        )
+    except ValueError as exc:
+        return _redirect("/account", err=str(exc))
+    if creation is None:
+        await session.commit()
+        return _redirect("/account", err=f"发起支付失败：{error}")
+    await session.commit()
+    return RedirectResponse(creation.pay_url, status_code=303)
+
+
+@router.post("/account/subscribe/pay")
+async def account_subscribe_pay(
+    request: Request, session: AsyncSession = Depends(get_session)
+) -> RedirectResponse:
+    ent = _current_entitlements(request)
+    if ent.user is None:
+        raise LoginRequired
+    if ent.is_superadmin:
+        return _redirect("/account", err="超级管理员无需购买订阅")
+    order, error = await payment_service.create_subscription_order(session, ent.user.id)
+    if order is None:
+        return _redirect("/account", err=error)
+    await session.commit()
+    provider = await payment_service.provider_for_order(session, order)
+    notify_url, return_url = await payment_service.checkout_urls_for_order(session, order)
+    creation, error = await payment_service.start_checkout(
+        provider,
+        order,
+        request.client.host if request.client else "0.0.0.0",
+        notify_url,
+        return_url,
+    )
+    if creation is None:
+        await session.commit()
+        return _redirect("/account", err=f"发起支付失败：{error}")
+    await session.commit()
+    return RedirectResponse(creation.pay_url, status_code=303)
+
+
+@public_router.api_route("/payments/epay/notify", methods=["GET", "POST"])
+async def epay_notify(
+    request: Request, session: AsyncSession = Depends(get_session)
+) -> Response:
+    if request.method == "POST":
+        form = await request.form()
+        form_items = list(form.multi_items())
+    else:
+        form_items = list(request.query_params.multi_items())
+    if len({key for key, _value in form_items}) != len(form_items):
+        return PlainTextResponse("fail", status_code=400)
+    params = {str(k): str(v) for k, v in form_items}
+    try:
+        status, _order = await payment_service.handle_notification(
+            session, None, params
+        )
+    except ValueError as exc:
+        log.info("Rejected Epay notification: %s", exc)
+        return PlainTextResponse("fail", status_code=400)
+    except Exception:
+        await session.rollback()
+        log.exception("Epay notification processing failed")
+        return PlainTextResponse("fail", status_code=400)
+    if status in {"paid", "already_paid"}:
+        return PlainTextResponse("success")
+    return PlainTextResponse("fail", status_code=400)
+
+
+def _payment_channel_fields(form: Any, *, existing: PaymentChannel | None = None) -> dict[str, object]:
+    name = _text(form, "name", 64)
+    gateway = _text(form, "gateway", 255).rstrip("/")
+    merchant_id = _text(form, "merchant_id", 64)
+    merchant_key = _text(form, "merchant_key", 255)
+    if not name or not gateway or not merchant_id:
+        raise ValueError("渠道名称、支付网关和商户 ID 必填")
+    parsed_gateway = urlsplit(gateway)
+    if parsed_gateway.scheme not in {"http", "https"} or not parsed_gateway.netloc:
+        raise ValueError("支付网关必须是完整的 http:// 或 https:// 地址")
+    if parsed_gateway.username or parsed_gateway.password:
+        raise ValueError("支付网关地址不能包含用户名或密码")
+    if not merchant_key and existing is None:
+        raise ValueError("商户密钥必填")
+    version = _text(form, "version", 8, "V1").upper()
+    if version not in {"V1", "V2"}:
+        raise ValueError("仅支持 V1 或 V2")
+    channel_type = _text(form, "channel_type", 32, "epay")
+    if channel_type != "epay":
+        raise ValueError("当前仅支持 Epay 易支付渠道")
+    pay_type = _text(form, "pay_type", 32, "alipay")
+    if pay_type not in {"alipay", "wxpay", "qqpay", "bank", "usdt"}:
+        raise ValueError("不支持的支付方式")
+    interact_type = _text(form, "interact_type", 16, "qrcode")
+    if interact_type not in {"qrcode", "redirect"}:
+        raise ValueError("不支持的交互方式")
+    currency = _text(form, "currency", 8, "CNY").upper() or "CNY"
+    rate_base = _text(form, "rate_base", 16)
+    rate = Decimal(rate_base) if rate_base else None
+    if rate is not None and (not rate.is_finite() or rate <= 0):
+        raise ValueError("汇率基数必须是大于 0 的数字")
+    try:
+        fee_percent = Decimal(_text(form, "fee_percent", 16, "0") or "0")
+        fee_fixed = Decimal(_text(form, "fee_fixed", 16, "0") or "0")
+    except InvalidOperation as exc:
+        raise ValueError("手续费必须是有效数字") from exc
+    if not fee_percent.is_finite() or fee_percent < 0 or fee_percent > 100:
+        raise ValueError("百分比手续费须在 0 到 100 之间")
+    if not fee_fixed.is_finite() or fee_fixed < 0:
+        raise ValueError("固定手续费不能小于 0")
+    icon = existing.icon if existing is not None else ""
+    upload = form.get("icon")
+    if isinstance(upload, UploadFile) and upload.filename:
+        payload = upload.file.read(payment_service.ICON_MAX_BYTES + 1)
+        icon = payment_service.save_icon(
+            name, upload.content_type or "", payload
+        )
+    if _text(form, "remove_icon", 8) == "on":
+        icon = ""
+    return {
+        "name": name,
+        "icon": icon,
+        "channel_type": channel_type,
+        "pay_type": pay_type,
+        "interact_type": interact_type,
+        "sort_weight": _int(form, "sort_weight", 10, 0, 100000),
+        "fee_percent": int((fee_percent * 100).quantize(Decimal("1"))),
+        "fee_fixed_cents": int((fee_fixed * 100).quantize(Decimal("1"))),
+        "enabled": _bool(form, "enabled"),
+        "version": version,
+        "gateway": gateway,
+        "merchant_id": merchant_id,
+        "merchant_key": merchant_key or (existing.merchant_key if existing else ""),
+        "notify_url": _text(form, "notify_url", 255),
+        "return_url": _text(form, "return_url", 255),
+        "currency": currency,
+        "rate_base": rate_base,
+    }
+
+
+@router.get("/payments", response_class=HTMLResponse)
+async def payment_channels_page(
+    request: Request,
+    channel_type: str = "",
+    pay_type: str = "",
+    session: AsyncSession = Depends(get_session),
+) -> HTMLResponse:
+    _require_superadmin(request)
+    stmt = select(PaymentChannel)
+    if channel_type:
+        stmt = stmt.where(PaymentChannel.channel_type == channel_type)
+    if pay_type:
+        stmt = stmt.where(PaymentChannel.pay_type == pay_type)
+    channels = (
+        await session.scalars(
+            stmt.order_by(PaymentChannel.sort_weight.asc(), PaymentChannel.id.asc())
+        )
+    ).all()
+    return _render(
+        request,
+        "payment_channels.html",
+        channels=channels,
+        channel_type=channel_type,
+        pay_type=pay_type,
+        channel_type_options=[("epay", "Epay 易支付")],
+        pay_type_options=[
+            ("alipay", "支付宝"),
+            ("wxpay", "微信支付"),
+            ("qqpay", "QQ 钱包"),
+            ("bank", "网银支付"),
+            ("usdt", "USDT"),
+        ],
+    )
+
+
+@router.get("/payments/orders", response_class=HTMLResponse)
+async def payment_orders_page(
+    request: Request,
+    q: str = "",
+    status: str = "",
+    purpose: str = "",
+    session: AsyncSession = Depends(get_session),
+) -> HTMLResponse:
+    _require_superadmin(request)
+    payment_stmt = (
+        select(PaymentOrder, ConsoleUser)
+        .join(ConsoleUser, ConsoleUser.id == PaymentOrder.user_id)
+        .order_by(PaymentOrder.id.desc())
+    )
+    ledger_stmt = (
+        select(AccountLedgerEntry, ConsoleUser)
+        .join(ConsoleUser, ConsoleUser.id == AccountLedgerEntry.user_id)
+        .where(AccountLedgerEntry.kind == "subscription_balance")
+        .order_by(AccountLedgerEntry.id.desc())
+    )
+    q = q.strip()
+    if q:
+        user_match = (
+            ConsoleUser.display_name.ilike(f"%{q}%")
+            | ConsoleUser.username.ilike(f"%{q}%")
+        )
+        payment_stmt = payment_stmt.where(
+            PaymentOrder.order_no.ilike(f"%{q}%") | user_match
+        )
+        ledger_stmt = ledger_stmt.where(user_match)
+    if status in {"pending", "paid", "failed", "expired"}:
+        payment_stmt = payment_stmt.where(PaymentOrder.status == status)
+        if status != "paid":
+            ledger_stmt = ledger_stmt.where(AccountLedgerEntry.id < 0)
+    else:
+        status = ""
+    if purpose in {"recharge", "subscription"}:
+        payment_stmt = payment_stmt.where(PaymentOrder.purpose == purpose)
+        if purpose != "subscription":
+            ledger_stmt = ledger_stmt.where(AccountLedgerEntry.id < 0)
+    else:
+        purpose = ""
+    payment_rows = (await session.execute(payment_stmt.limit(1000))).all()
+    ledger_rows = (await session.execute(ledger_stmt.limit(1000))).all()
+    orders: list[dict[str, Any]] = [
+        {
+            "user": user,
+            "order_no": order.order_no,
+            "purpose": order.purpose,
+            "amount_cents": order.amount_cents,
+            "fee_cents": order.fee_cents,
+            "charge_cents": order.charge_cents or order.amount_cents + order.fee_cents,
+            "charge_currency": order.charge_currency,
+            "provider": order.provider,
+            "pay_type": order.pay_type,
+            "status": order.status,
+            "created_at": order.created_at,
+            "paid_at": order.paid_at,
+        }
+        for order, user in payment_rows
+    ]
+    orders.extend(
+        {
+            "user": user,
+            "order_no": f"余额-{entry.id}",
+            "purpose": "subscription_balance",
+            "amount_cents": -entry.amount_cents,
+            "fee_cents": 0,
+            "charge_cents": -entry.amount_cents,
+            "charge_currency": "CNY",
+            "provider": "余额抵扣",
+            "pay_type": "余额",
+            "status": "paid",
+            "created_at": entry.created_at,
+            "paid_at": entry.created_at,
+        }
+        for entry, user in ledger_rows
+    )
+    orders.sort(key=lambda item: item["created_at"], reverse=True)
+    orders = orders[:1000]
+    return _render(
+        request,
+        "payment_orders.html",
+        orders=orders,
+        q=q,
+        status=status,
+        purpose=purpose,
+    )
+
+
+@router.get("/payments/new", response_class=HTMLResponse)
+@router.get("/payments/{channel_id}/edit", response_class=HTMLResponse)
+async def payment_channel_form(
+    request: Request,
+    channel_id: int | None = None,
+    session: AsyncSession = Depends(get_session),
+) -> HTMLResponse:
+    _require_superadmin(request)
+    channel = await session.get(PaymentChannel, channel_id) if channel_id else None
+    if channel_id and channel is None:
+        raise HTTPException(status_code=404, detail="支付渠道不存在")
+    cfg = get_config()
+    return _render(
+        request,
+        "payment_channel_form.html",
+        channel=channel,
+        channel_type_options=[("epay", "Epay 易支付")],
+        pay_type_options=[
+            ("alipay", "支付宝"),
+            ("wxpay", "微信支付"),
+            ("qqpay", "QQ 钱包"),
+            ("bank", "网银支付"),
+            ("usdt", "USDT"),
+        ],
+        interact_type_options=[("qrcode", "二维码"), ("redirect", "跳转支付")],
+        default_notify=f"{cfg.web.base_url.rstrip('/')}/payments/epay/notify",
+        default_return=f"{cfg.web.base_url.rstrip('/')}/account/recharge/return",
+    )
+
+
+@router.post("/payments/new")
+async def payment_channel_create(
+    request: Request, session: AsyncSession = Depends(get_session)
+) -> RedirectResponse:
+    _require_superadmin(request)
+    form = await request.form()
+    try:
+        fields = _payment_channel_fields(form)
+    except (ValueError, InvalidOperation) as exc:
+        return _redirect("/payments/new", err=str(exc))
+    await payment_service.create_channel(session, fields)
+    return _redirect("/payments", msg="支付渠道已新增")
+
+
+@router.post("/payments/{channel_id}/update")
+async def payment_channel_update(
+    channel_id: int,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    _require_superadmin(request)
+    channel = await session.get(PaymentChannel, channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="支付渠道不存在")
+    form = await request.form()
+    try:
+        fields = _payment_channel_fields(form, existing=channel)
+    except (ValueError, InvalidOperation) as exc:
+        return _redirect(f"/payments/{channel_id}/edit", err=str(exc))
+    await payment_service.update_channel(session, channel_id, fields)
+    return _redirect("/payments", msg="支付渠道已更新")
+
+
+@router.post("/payments/{channel_id}/toggle")
+async def payment_channel_toggle(
+    channel_id: int,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    _require_superadmin(request)
+    channel = await session.get(PaymentChannel, channel_id)
+    if channel is None:
+        raise HTTPException(status_code=404, detail="支付渠道不存在")
+    channel.enabled = not channel.enabled
+    return _redirect("/payments", msg="渠道状态已更新")
+
+
+@router.post("/payments/{channel_id}/delete")
+async def payment_channel_delete(
+    channel_id: int,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> RedirectResponse:
+    _require_superadmin(request)
+    try:
+        deleted = await payment_service.delete_channel(session, channel_id)
+    except ValueError as exc:
+        return _redirect("/payments", err=str(exc))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="支付渠道不存在")
+    return _redirect("/payments", msg="支付渠道已删除")
+
+
+@public_router.get("/payments/icons/{filename}")
+async def payment_channel_icon(filename: str) -> FileResponse:
+    if Path(filename).name != filename:
+        raise HTTPException(status_code=404, detail="图标不存在")
+    path = payment_service.icons_dir() / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="图标不存在")
+    return FileResponse(path, headers={"Cache-Control": "public, max-age=86400"})
 
 
 @router.get("/", response_class=HTMLResponse)
