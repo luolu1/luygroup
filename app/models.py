@@ -94,7 +94,8 @@ class Group(Base):
     )
     rules_text = Column(Text, default="")
     log_channel_id = Column(BigInteger, nullable=True)
-    delete_command_messages = Column(Boolean, default=False)
+    delete_command_messages = Column(Boolean, default=True)
+    auto_delete_messages = Column(Boolean, default=True)
 
     # ---- linkage / report ----
     crossban_enabled = Column(Boolean, default=False)

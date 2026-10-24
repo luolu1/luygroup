@@ -103,6 +103,7 @@ SETTING_SCOPES: dict[str, set[str]] = {
     "general": {
         "is_active",
         "delete_command_messages",
+        "auto_delete_messages",
         "rules_text",
         "welcome_enabled",
         "welcome_text",
@@ -1395,6 +1396,7 @@ async def save_group_settings(
         "invite_redemption",
         "welcome_enabled",
         "delete_command_messages",
+        "auto_delete_messages",
         "crossban_enabled",
         "report_enabled",
         "report_receive",

@@ -80,6 +80,10 @@
           <input class="check" type="checkbox" name="delete_command_messages" {% if group.delete_command_messages %}checked{% endif %}>
           <span><span class="t">删除命令消息</span><span class="d">执行管理命令后自动删除命令本身。</span></span>
         </label>
+        <label class="switch">
+          <input class="check" type="checkbox" name="auto_delete_messages" {% if group.auto_delete_messages %}checked{% endif %}>
+          <span><span class="t">消息自动删除</span><span class="d">自动审核命中的违规消息会被删除。</span></span>
+        </label>
         {% if can('welcome') %}
         <label class="switch">
           <input class="check" type="checkbox" name="welcome_enabled" {% if group.welcome_enabled %}checked{% endif %}>

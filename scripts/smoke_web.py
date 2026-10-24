@@ -124,7 +124,7 @@ try:
         )
 
         r = client.get("/login")
-        check("login page", r.status_code == 200 and "GroupGuard 控制台" in r.text, r.text[:200])
+        check("login page", r.status_code == 200 and "luygroup 控制台" in r.text, r.text[:200])
 
         anonymous = TestClient(app)
         r = anonymous.get("/groups", follow_redirects=False)
@@ -879,6 +879,32 @@ try:
         con.close()
         check("ai scope applied", row[0] == 1 and row[1] == 77 and row[2] == 88, str(row))
         check("ai scope keeps rules", row[3] == "旧群规", str(row))
+
+        r = client.get("/groups/-1001234567890?tab=settings")
+        check(
+            "group settings default cleanup switches are on",
+            r.status_code == 200
+            and 'name="delete_command_messages"' in r.text
+            and 'name="auto_delete_messages"' in r.text
+            and 'name="welcome_enabled"' in r.text,
+            r.text[:800],
+        )
+        r = client.post(
+            "/groups/-1001234567890/settings",
+            data={"_scope": "general", "is_active": "on"},
+            follow_redirects=False,
+        )
+        con = connect()
+        settings = con.execute(
+            "SELECT delete_command_messages, auto_delete_messages, welcome_enabled "
+            "FROM groups WHERE id=-1001234567890"
+        ).fetchone()
+        con.close()
+        check(
+            "group settings can turn cleanup switches off",
+            r.status_code == 303 and settings == (0, 0, 0),
+            f"{r.status_code} {settings}",
+        )
 
         r = client.post(
             "/groups/-1001234567890/whitelist/add",

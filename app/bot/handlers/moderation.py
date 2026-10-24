@@ -289,7 +289,7 @@ async def _apply_detection(
 ) -> None:
     target = helpers.Target(user.id, user.first_name or "", user.username or "")
     deleted = False
-    if detection.action != "reply":
+    if group.auto_delete_messages and detection.action != "reply":
         deleted = await helpers.delete_message_safe(bot, group.id, message.message_id)
     if deleted:
         await repo.bump_stat(session, group.id, "deletes")

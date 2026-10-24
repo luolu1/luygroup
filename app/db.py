@@ -119,6 +119,9 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
             "reviewed_at": "DATETIME",
             "review_note": "VARCHAR(512) DEFAULT ''",
         },
+        "groups": {
+            "auto_delete_messages": "BOOLEAN DEFAULT 1",
+        },
     }
     for table, additions in columns.items():
         existing = {
@@ -136,6 +139,24 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
                     # If the other task won the race, the column already exists.
                     if "duplicate column name" not in str(exc).lower():
                         raise
+
+    conn.exec_driver_sql(
+        "CREATE TABLE IF NOT EXISTS groupguard_migrations "
+        "(name TEXT PRIMARY KEY NOT NULL)"
+    )
+    migrated = conn.exec_driver_sql(
+        "SELECT 1 FROM groupguard_migrations WHERE name = "
+        "'default_message_cleanup_settings_v1'"
+    ).fetchone()
+    if migrated is None:
+        conn.exec_driver_sql(
+            "UPDATE groups SET delete_command_messages = 1 "
+            "WHERE delete_command_messages = 0"
+        )
+        conn.exec_driver_sql(
+            "INSERT INTO groupguard_migrations (name) VALUES "
+            "('default_message_cleanup_settings_v1')"
+        )
 
     conn.exec_driver_sql(
         "CREATE INDEX IF NOT EXISTS ix_ai_providers_owner_user_id "
