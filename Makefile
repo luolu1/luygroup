@@ -3,7 +3,7 @@ VENV := .venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
 
-.PHONY: help venv install init-config run run-bot run-web check smoke smoke-permissions smoke-captcha smoke-scheduler smoke-scheduler-idempotency smoke-bot-recovery smoke-subscription-purchase smoke-commands smoke-games-race smoke-economy-claims docker-build docker-up docker-down docker-logs clean
+.PHONY: help venv install init-config run run-bot run-web check smoke smoke-permissions smoke-captcha smoke-scheduler smoke-scheduler-idempotency smoke-bot-recovery smoke-subscription-purchase smoke-payments smoke-commands smoke-games-race smoke-economy-claims docker-build docker-up docker-down docker-logs clean
 
 help:
 	@echo "luygroup 常用命令："
@@ -20,6 +20,7 @@ help:
 	@echo "  make smoke-scheduler-idempotency 运行抽奖/竞拍/红包重复结算回归测试"
 	@echo "  make smoke-bot-recovery 运行 Bot 断线恢复生命周期回归测试"
 	@echo "  make smoke-subscription-purchase 运行订阅购买/续费与余额扣款回归测试"
+	@echo "  make smoke-payments 运行易支付下单、验签、回调幂等与充值回归测试"
 	@echo "  make smoke-commands 运行命令菜单、学习分目录、功能门槛与自助命令测试"
 	@echo "  make smoke-games-race 运行竞拍/红包并发资金安全回归测试"
 	@echo "  make smoke-economy-claims 运行签到/商城/抽奖并发资金与库存回归测试"
@@ -82,6 +83,9 @@ smoke-bot-recovery: $(PYTHON)
 
 smoke-subscription-purchase: $(PYTHON)
 	$(PYTHON) scripts/smoke_subscription_purchase.py
+
+smoke-payments: $(PYTHON)
+	$(PYTHON) scripts/smoke_payments.py
 
 smoke-commands: $(PYTHON)
 	$(PYTHON) scripts/smoke_commands.py

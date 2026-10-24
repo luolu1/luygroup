@@ -248,11 +248,15 @@ try:
         check("balance user can open account page", r.status_code == 303 and r.headers.get("location") == "/")
         r = client.get("/account")
         check(
-            "account page shows CNY subscription purchase",
+            "unsubscribed account shows one open action and balance choice",
             r.status_code == 200
             and "¥8.00 CNY" in r.text
-            and "购买一个月" in r.text
-            and "余额 ¥8.00" in r.text,
+            and "开通一个月 · ¥8.00" in r.text
+            and "续费一个月 · ¥8.00" not in r.text
+            and "余额抵扣" in r.text
+            and "在线支付续费 · ¥8.00" not in r.text
+            and 'trigger.addEventListener("click"' in r.text
+            and "账单记录" in r.text,
             r.text[:500],
         )
         r = client.post("/account/subscribe", follow_redirects=False)
@@ -269,6 +273,12 @@ try:
             "account purchase charges eight CNY and activates subscription",
             r.status_code == 303 and account_balance == 0 and subscription and subscription[0] == "active",
             f"{r.status_code} {account_balance} {subscription}",
+        )
+        r = client.get("/account")
+        check(
+            "active subscription shows one renewal action",
+            "续费一个月 · ¥8.00" in r.text and "开通一个月 · ¥8.00" not in r.text,
+            r.text[:500],
         )
         client.post("/logout", follow_redirects=False)
         con = connect()

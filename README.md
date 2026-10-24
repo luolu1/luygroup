@@ -97,6 +97,7 @@ Telegram 群组管理机器人 + Web 控制台。集封禁禁言、反广告、�
 - AI 接口管理、连通性测试、用量与事件
 - 全局黑名单管理
 - 举报记录查看与删除
+- 账户余额在线充值与订阅在线支付（易支付）
 - 群组统计、AI 调用与命中分析
 - 协助管理员与细粒度权限
 - 全部页面中文，移动端自适应
@@ -379,6 +380,64 @@ GROUPGUARD_CONFIG=/etc/groupguard/config.json python -m app.main
 | `url` | SQLAlchemy 异步数据库 URL，默认 `sqlite+aiosqlite:///./data/groupguard.db` |
 
 SQLite 已自动启用 WAL、`busy_timeout=5000` 与外键约束。单机场景无需额外数据库服务。
+
+### `payments`
+
+在线支付默认关闭。配置 `payments.enabled=true` 后，用户可以在「账户与订阅」页通过 Epay 为账户充值，也可以直接在线购买/续费 ¥8.00 月订阅。充值订单和支付订阅均由 Epay 异步通知确认；浏览器支付返回页不会直接发放余额或订阅。
+
+推荐在控制台「支付渠道」页面维护渠道：超级管理员访问 `/payments`，点击「添加渠道」即可新增，支持图标、启用状态、排序权重、手续费与 Epay 商户参数。渠道按权重升序取第一个有效渠道下单，停用后不会参与选择。渠道删除不会删除已有订单记录，但存在待支付订单的渠道只能停用、不能删除。渠道保存后立即生效，无需重启。
+
+渠道字段与结算规则：
+
+| 字段 | 说明 |
+| --- | --- |
+| 渠道名称 | 管理标识，可重复展示在渠道列表 |
+| 渠道图标 | PNG/JPG/WEBP/GIF，点击或拖拽上传，最大 512KB；可随时移除 |
+| 渠道类型 | 当前仅支持 `epay` |
+| 支付方式 | 展示给用户的支付方式，如 `alipay`/`wxpay`/`qqpay`/`bank`/`usdt`；需与 Epay 商户已开通类型一致 |
+| 交互方式 | 二维码或跳转，仅作为渠道配置记录 |
+| 排序权重 | 数值越小越靠前，相同权重按渠道 ID 升序 |
+| 手续费 | 百分比（0~100）与固定金额（元）；两者都计入用户实付金额，余额入账金额仍为订单原值 |
+| 启用 | 停用后用户端不可选该渠道 |
+| 版本 | `V1` 走 `submit.php` 跳转收银台；`V2` 走 `mapi.php` 接口下单 |
+| 支付网关 | Epay 站点根地址，例如 `https://pay.example.com`，不要附加接口路径 |
+| 商户 ID / 商户密钥 | Epay 商户 PID 与密钥；密钥仅保存在数据库，编辑时留空表示不修改 |
+| 通知地址 / 同步地址 | 留空时分别使用 `{web.base_url}/payments/epay/notify` 与 `{web.base_url}/account/recharge/return` |
+| 结算货币 | 例如 `CNY` |
+| 汇率基数 | 可选，例如 `7.2` 表示按该汇率折算实付金额；留空不转换 |
+
+订单入账金额只以本地订单为准：回调金额必须与订单记录的实付金额一致，签名、商户 ID、订单号与交易号都要匹配才会结算，重复回调不会重复入账。
+
+`config.json` 中的 `payments.epay` 作为旧版兼容配置：只有当数据库中从未创建过支付渠道时才使用；一旦创建过渠道，即使全部停用也不会再回退到旧配置，避免用户下单到未维护的商户。
+
+```json
+{
+  "payments": {
+    "enabled": true,
+    "provider": "epay",
+    "min_amount_cents": 100,
+    "max_amount_cents": 100000,
+    "epay": {
+      "base_url": "https://pay.example.com",
+      "pid": "商户ID",
+      "key": "商户密钥",
+      "type": "alipay",
+      "method": "",
+      "timeout": 15
+    }
+  }
+}
+```
+
+- `base_url` 填 Epay 网站根地址，不要附加 `/mapi.php`；下单使用标准 `mapi.php` 接口。
+- `pid` 和 `key` 使用 Epay 商户配置。`type` 必须是该 Epay 实例实际启用的支付类型；留空时由 Epay 收银台选择。
+- `method` 通常留空，只有 Epay 商户端明确要求时才设置。
+- 金额上下限以整数分配置；示例为 ¥1.00 至 ¥1000.00。
+- 在 Epay 商户后台登记异步通知地址：`{web.base_url}/payments/epay/notify`。`web.base_url` 必须是公网可访问的 HTTPS 地址。
+- 使用独立且保密的商户密钥；不要把真实配置提交到 Git。当前适配器使用 Epay V2 传统 MD5 商户签名模式，不支持 Epay RSA 商户模式；订单回调重复到达不会重复入账。
+- `return_url` 仅用于用户返回账户页。支付结果以签名通过的异步通知为准。
+
+Epay 配置修改后重启 Web 服务以加载配置：`docker compose up -d --build`；若使用 systemd 则重启 `groupguard-web`。
 
 ### `defaults`
 

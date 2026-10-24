@@ -29,7 +29,7 @@ os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
 sys.path.insert(0, str(ROOT))
 
 from app.db import dispose_db, get_sessionmaker, init_db  # noqa: E402
-from app.models import ConsoleUser, Subscription, SubscriptionPlan, utcnow  # noqa: E402
+from app.models import AccountLedgerEntry, ConsoleUser, Subscription, SubscriptionPlan, utcnow  # noqa: E402
 from app.services.subscriptions import add_calendar_month, purchase_month  # noqa: E402
 
 
@@ -95,7 +95,14 @@ async def main() -> None:
     first = await create_user(8200002, 1600)
     first_result = await buy(first)
     first_balance, first_subs = await snapshot(first)
+    async with get_sessionmaker()() as session:
+        entries = (
+            await session.scalars(
+                select(AccountLedgerEntry).where(AccountLedgerEntry.user_id == first)
+            )
+        ).all()
     check("first purchase charges CNY 8", first_result[0] == "ok" and first_balance == 800)
+    check("balance subscription writes ledger debit", len(entries) == 1 and entries[0].amount_cents == -800 and entries[0].balance_after_cents == 800)
     check("first purchase creates one calendar-month subscription", len(first_subs) == 1 and first_subs[0][0] == "active" and first_subs[0][2] == plan_id)
 
     renewal = await buy(first)
