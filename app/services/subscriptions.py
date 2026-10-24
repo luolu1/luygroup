@@ -6,7 +6,7 @@ from datetime import datetime
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import ConsoleUser, Subscription, SubscriptionPlan, utcnow
+from ..models import AccountLedgerEntry, ConsoleUser, Subscription, SubscriptionPlan, utcnow
 
 MONTHLY_PRICE_CENTS = 800
 
@@ -86,4 +86,13 @@ async def purchase_month(
         current.status = "active"
         current.starts_at = now
         current.expires_at = expires_at
+    session.add(
+        AccountLedgerEntry(
+            user_id=user_id,
+            kind="subscription_balance",
+            amount_cents=-MONTHLY_PRICE_CENTS,
+            balance_after_cents=int(new_balance),
+            description="余额购买/续费订阅一个月",
+        )
+    )
     return "ok", expires_at, int(new_balance)
