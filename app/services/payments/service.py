@@ -3,11 +3,11 @@ from __future__ import annotations
 import re
 import secrets
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO
 from pathlib import Path
-from typing import Mapping
+from collections.abc import Mapping
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -101,7 +101,7 @@ def channel_price(channel: PaymentChannel, amount_cents: int) -> tuple[int, int,
 
 
 def new_order_no() -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    stamp = datetime.now(UTC).strftime("%Y%m%d%H%M%S")
     return f"R{stamp}{secrets.token_hex(4)}"
 
 
@@ -437,20 +437,6 @@ async def settle_payment(
                 description="在线充值到账",
             )
         )
-    if order.purpose == "subscription":
-        user_balance = await session.scalar(
-            select(ConsoleUser.balance_cents).where(ConsoleUser.id == order.user_id)
-        )
-        session.add(
-            AccountLedgerEntry(
-                user_id=order.user_id,
-                order_id=order.id,
-                kind="subscription_online",
-                amount_cents=-order.amount_cents,
-                balance_after_cents=int(user_balance or 0),
-                description="在线购买/续费订阅一个月",
-            )
-        )
     order.status = "paid"
     order.paid_at = now
     if callback.trade_no:
@@ -476,7 +462,11 @@ async def handle_notification(
     else:
         actual_provider = get_provider()
     callback = actual_provider.verify_callback(params)
-    callback = replace(callback, currency=order.charge_currency or "CNY")
+    order_currency = (order.charge_currency or "CNY").upper()
+    declared_currency = str(params.get("currency") or "").strip().upper()
+    if declared_currency and declared_currency != order_currency:
+        return "currency_mismatch", order
+    callback = replace(callback, currency=order_currency)
     return await settle_payment(session, callback, order.provider)
 
 

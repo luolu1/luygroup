@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Mapping, Protocol
+from typing import Protocol
+from collections.abc import Mapping
 
 
 @dataclass(frozen=True)

@@ -3,8 +3,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 from decimal import Decimal, InvalidOperation
-from typing import Mapping
-from urllib.parse import quote, urlencode, urljoin, urlsplit
+from collections.abc import Mapping
+from urllib.parse import urlencode, urljoin, urlsplit
 
 import httpx
 
@@ -106,7 +106,7 @@ class EpayProvider:
             raw_amount = Decimal(params["money"])
             amount = raw_amount.quantize(Decimal("0.01"))
         except (KeyError, InvalidOperation):
-            raise EpayError("Epay 金额无效")
+            raise EpayError("Epay 金额无效") from None
         if amount != raw_amount:
             raise EpayError("Epay 金额小数位无效")
         order_no = str(params.get("out_trade_no") or "").strip()
