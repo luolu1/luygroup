@@ -143,12 +143,9 @@ def normalize_base_url(base_url: str) -> str:
         base = "https:" + base
     if "://" not in base:
         host = (urlparse("//" + base).hostname or "").lower()
-        private = (
-            host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
-            or host.startswith("192.168.")
-            or host.startswith("10.")
-            or any(host.startswith(f"172.{index}.") for index in range(16, 32))
-        )
+        private = host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or host.startswith(
+            ("192.168.", "10.")
+        ) or any(host.startswith(f"172.{index}.") for index in range(16, 32))
         base = ("http://" if private else "https://") + base
     return base.rstrip("/")
 
@@ -468,7 +465,7 @@ async def assistant_reply(
     owner_user_id: int | None = None,
 ) -> AIResult:
     context_key = hashlib.sha1(
-        f"{group_title}\n{rules[:1500]}".encode("utf-8")
+        f"{group_title}\n{rules[:1500]}".encode()
     ).hexdigest()[:16]
     cached = learning_store.get(
         "assistant", group_id, question, extra=context_key

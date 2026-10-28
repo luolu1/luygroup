@@ -246,12 +246,15 @@ def check_local(
                 host = ""
             if host and domain_allowed(host, allowed):
                 continue
-        if any(domain_allowed(domain, allowed) for domain in domains):
-            # Allow messages whose *only* link is on the allow list.
-            if pattern.pattern.startswith("(?:https?://|www\\.") and value and all(
-                domain_allowed(d, allowed) for d in domains
-            ):
-                continue
+        only_allowed_link = (
+            pattern.pattern.startswith("(?:https?://|www\\.")
+            and bool(value)
+            and all(domain_allowed(domain, allowed) for domain in domains)
+        )
+        if only_allowed_link or any(
+            domain_allowed(domain, allowed) for domain in domains
+        ):
+            continue
         return Detection(
             hit=True,
             source="builtin",
@@ -260,7 +263,7 @@ def check_local(
             action="warn",
         )
 
-    same, total = recent.add(group_id, user_id, text)
+    same, _total = recent.add(group_id, user_id, text)
     if same >= MAX_REPEAT:
         return Detection(
             hit=True,
