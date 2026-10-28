@@ -1,7 +1,7 @@
 """General commands: help, rules, info, warnings lookup, stats."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 from html import escape
 
 from aiogram import Bot, F, Router
@@ -43,6 +43,8 @@ PRIVATE_MENU_TEXT = (
     "/unbanme —— 自助解封\n"
     "/unmuteme —— 自助解除禁言\n"
     "/cjtz —— 开启/关闭抽奖推送\n"
+    "/cjhistory —— 查看我创建的抽奖\n"
+    "/cjcancel 编号 —— 取消未开奖抽奖\n"
     "/jptz —— 开启/关闭竞拍推送\n\n"
     "群组管理请把机器人设为管理员，并在群内发送 /ads 查看总菜单。"
 )
@@ -60,7 +62,7 @@ GROUP_MENU_TEXT = (
     "/cf —— 查询封禁历史等原因\n"
     "/jf —— 查看自己的积分\n"
     "/id —— 查询用户/群 ID\n"
-    "/cj 标题 | 奖品 [参与费] [分钟] —— 发起抽奖\n"
+    "/cj —— 群内管理员发起，私聊配置抽奖\n"
     "/jp 物品 | 起拍价 [加价幅度] [分钟] —— 发起竞拍\n\n"
     "进群验证、反广告、警告、关键词、必关频道等设置由管理员在群内或控制台配置。\n"
     "订阅用户可私聊机器人发送 /console 打开订阅控制台，发送 /sub 查看订阅。"

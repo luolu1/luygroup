@@ -73,7 +73,7 @@ def _single_attempt(func):
         key = f"{callback.from_user.id}:{token}" if token else ""
         if key and key in _verification_inflight:
             await _answer(callback, "该验证正在处理，请稍候。", show_alert=True)
-            return
+            return None
         if key:
             _verification_inflight.add(key)
         try:
@@ -140,7 +140,8 @@ def _bio_hit(group: Group, user: User) -> str | None:
 
 async def _announce_rejoin_mute(bot: Bot, group: Group, user: User) -> None:
     try:
-        await bot.send_message(
+        await helpers.send_temp_notice(
+            bot,
             group.id,
             f"🔇 {user.mention_html()} 此前曾被移出，重新入群后已自动禁言，请联系管理员解除。",
         )
@@ -858,7 +859,8 @@ async def on_verify(callback: CallbackQuery, bot: Bot) -> None:
                     exc,
                 )
                 try:
-                    await bot.send_message(
+                    await helpers.send_temp_notice(
+                        bot,
                         group.id,
                         f"⚠️ {callback.from_user.mention_html()} 验证失败次数达到上限，"
                         f"但自动移出失败：{escape(str(exc))[:200]}，请管理员手动处理。",
@@ -867,7 +869,8 @@ async def on_verify(callback: CallbackQuery, bot: Bot) -> None:
                     pass
             else:
                 try:
-                    await bot.send_message(
+                    await helpers.send_temp_notice(
+                        bot,
                         group.id,
                         f"🚫 {callback.from_user.mention_html()} 连续答错验证码 3 次，已被移出群组。",
                     )

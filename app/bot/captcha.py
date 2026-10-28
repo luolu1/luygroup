@@ -30,7 +30,7 @@ _FONT_CANDIDATES = (
 
 def _digest(token: str, label: str) -> bytes:
     secret = (get_config().web.secret_key or "groupguard").encode("utf-8")
-    message = f"{label}:{token}".encode("utf-8")
+    message = f"{label}:{token}".encode()
     return hmac.new(secret, message, hashlib.sha256).digest()
 
 
@@ -114,7 +114,7 @@ def render_captcha(code: str) -> bytes:
             (27 - bbox[0], 27 - bbox[1]),
             char,
             font=font,
-            fill=color + (255,),
+            fill=(*color, 255),
         )
         char_image = char_image.rotate(
             rng.uniform(-26, 26), resample=Image.BICUBIC, expand=1
