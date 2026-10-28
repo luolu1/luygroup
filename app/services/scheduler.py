@@ -17,6 +17,7 @@ from ..models import (
     Group,
     Lottery,
     LotteryEntry,
+    LotteryWinner,
     Member,
     RedPacket,
     RequiredChannel,
@@ -173,8 +174,37 @@ async def expire_verifications(bot: Bot) -> None:
                 select(Verification).where(Verification.status == "pending")
             )
         ).all()
+        group_ids = {int(verification.group_id) for verification in pending}
+        groups = {
+            int(group.id): group
+            for group in (
+                await session.scalars(select(Group).where(Group.id.in_(group_ids)))
+            ).all()
+        }
+        channel_counts = {
+            int(group_id): int(count)
+            for group_id, count in (
+                await session.execute(
+                    select(RequiredChannel.group_id, func.count(RequiredChannel.id))
+                    .where(RequiredChannel.group_id.in_(group_ids))
+                    .group_by(RequiredChannel.group_id)
+                )
+            ).all()
+        }
+        user_ids = {int(verification.user_id) for verification in pending}
+        members = {
+            (int(member.group_id), int(member.user_id)): member
+            for member in (
+                await session.scalars(
+                    select(Member).where(
+                        Member.group_id.in_(group_ids),
+                        Member.user_id.in_(user_ids),
+                    )
+                )
+            ).all()
+        }
         for verification in pending:
-            group = await repo.get_group(session, verification.group_id)
+            group = groups.get(int(verification.group_id))
             if group is None or not group.is_active:
                 verification.status = "expired"
                 expired.append(
@@ -190,17 +220,10 @@ async def expire_verifications(bot: Bot) -> None:
             timeout = max(60, int(group.verify_timeout or 300))
             if verification.created_at + timedelta(seconds=timeout) > now:
                 continue
-            channels = int(
-                await session.scalar(
-                    select(func.count(RequiredChannel.id)).where(
-                        RequiredChannel.group_id == group.id
-                    )
-                )
-                or 0
-            )
+            channels = channel_counts.get(int(group.id), 0)
             verification.status = "timeout"
-            member = await repo.get_member(session, group.id, verification.user_id)
-            if member:
+            member = members.get((int(group.id), int(verification.user_id)))
+            if member is not None:
                 member.is_verified = False
             await repo.add_log(
                 session,
@@ -241,6 +264,24 @@ async def _claim_lottery(session, lottery_id: int) -> bool:
     )
     row = (await session.execute(stmt)).first()
     return row is not None
+
+
+async def _lottery_due(session, lottery: Lottery, now) -> bool:
+    """Return whether a lottery reached its configured draw condition."""
+    if (lottery.draw_type or "time").lower() == "participant":
+        target = int(lottery.draw_participant_count or 0)
+        if target <= 0:
+            return False
+        entries = int(
+            await session.scalar(
+                select(func.count(LotteryEntry.id)).where(
+                    LotteryEntry.lottery_id == lottery.id
+                )
+            )
+            or 0
+        )
+        return entries >= target
+    return lottery.ends_at is not None and lottery.ends_at <= now
 
 
 async def _claim_auction(
@@ -290,14 +331,12 @@ async def draw_lotteries(bot: Bot) -> None:
         now = utcnow()
         lotteries = (
             await session.scalars(
-                select(Lottery).where(
-                    Lottery.status == "open",
-                    Lottery.ends_at.is_not(None),
-                    Lottery.ends_at <= now,
-                )
+                select(Lottery).where(Lottery.status == "open")
             )
         ).all()
         for lottery in lotteries:
+            if not await _lottery_due(session, lottery, now):
+                continue
             if not await _claim_lottery(session, lottery.id):
                 continue
             entries = (
@@ -308,13 +347,25 @@ async def draw_lotteries(bot: Bot) -> None:
             if entries:
                 count = max(1, int(lottery.winners_count or 1))
                 winners = random.sample(entries, min(count, len(entries)))
+                session.add_all(
+                    [
+                        LotteryWinner(lottery_id=lottery.id, user_id=winner.user_id)
+                        for winner in winners
+                    ]
+                )
                 winner_text = "、".join(_mention(w.user_id) for w in winners)
+                contact = (lottery.claim_contact or "").strip()
+                claim_line = (
+                    f"领奖联系：{escape(contact)}"
+                    if contact
+                    else "请中奖者联系管理员领奖。"
+                )
                 text = (
                     f"🎉 <b>抽奖开奖：{lottery.title}</b>\n"
-                    f"奖品：{lottery.prize}\n"
+                    f"奖品：{escape(lottery.prize)} × {count}\n"
                     f"参与人数：{len(entries)}\n"
                     f"中奖者：{winner_text}\n"
-                    "请中奖者联系管理员领奖。"
+                    f"{claim_line}"
                 )
             else:
                 text = f"🎲 抽奖「{lottery.title}」已到期，但无人参与，本轮流奖。"
@@ -418,19 +469,16 @@ async def refund_red_packets(bot: Bot) -> None:
 async def cleanup_members() -> None:
     async with session_scope() as session:
         await repo.expire_warnings(session)
-        now = utcnow()
-        members = (
-            await session.scalars(
-                select(Member).where(
-                    Member.is_muted.is_(True),
-                    Member.muted_until.is_not(None),
-                    Member.muted_until <= now,
-                )
+        await session.execute(
+            update(Member)
+            .where(
+                Member.is_muted.is_(True),
+                Member.muted_until.is_not(None),
+                Member.muted_until <= utcnow(),
             )
-        ).all()
-        for member in members:
-            member.is_muted = False
-            member.muted_until = None
+            .values(is_muted=False, muted_until=None)
+            .execution_options(synchronize_session=False)
+        )
 
 
 async def tick(bot: Bot) -> None:
@@ -448,6 +496,6 @@ async def run_scheduler(bot: Bot, interval: int = 20) -> None:
             await tick(bot)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception:
             log.exception("Scheduler tick failed")
         await asyncio.sleep(interval)
