@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Iterable
+from collections.abc import Iterable
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
@@ -149,17 +149,16 @@ async def get_member(session: AsyncSession, group_id: int, user_id: int) -> Memb
 async def bump_stat(session: AsyncSession, group_id: int, field: str, delta: int = 1) -> None:
     if field not in STAT_FIELDS or not delta:
         return
-    today = day_key()
-    stat = await session.scalar(
-        select(GroupDailyStat).where(
-            GroupDailyStat.group_id == int(group_id), GroupDailyStat.day == today
+    column = getattr(GroupDailyStat, field)
+    statement = (
+        sqlite_insert(GroupDailyStat)
+        .values(group_id=int(group_id), day=day_key(), **{field: int(delta)})
+        .on_conflict_do_update(
+            index_elements=["group_id", "day"],
+            set_={field: func.coalesce(column, 0) + int(delta)},
         )
     )
-    if stat is None:
-        stat = GroupDailyStat(group_id=int(group_id), day=today)
-        session.add(stat)
-        await session.flush()
-    setattr(stat, field, (getattr(stat, field) or 0) + delta)
+    await session.execute(statement)
 
 
 async def bump_member_daily(
@@ -327,15 +326,17 @@ async def adjust_points(
 
 
 async def expire_warnings(session: AsyncSession) -> int:
-    now = utcnow()
-    result = await session.scalars(
-        select(Warning).where(Warning.active.is_(True), Warning.expires_at.is_not(None), Warning.expires_at <= now)
+    result = await session.execute(
+        update(Warning)
+        .where(
+            Warning.active.is_(True),
+            Warning.expires_at.is_not(None),
+            Warning.expires_at <= utcnow(),
+        )
+        .values(active=False)
+        .execution_options(synchronize_session=False)
     )
-    count = 0
-    for warning in result.all():
-        warning.active = False
-        count += 1
-    return count
+    return int(result.rowcount or 0)
 
 
 def parse_csv(value: str | None) -> list[str]:

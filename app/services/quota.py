@@ -3,17 +3,31 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..entitlements import build_for_user, group_owner_user_id
+from ..entitlements import GroupAccess, build_for_user, group_owner_user_id
 from ..models import ConsoleUser, Group
 from . import repo
 
 
 async def _owner_limit(
-    session: AsyncSession, group: Group, attr: str
+    session: AsyncSession,
+    group: Group,
+    attr: str,
+    *,
+    access: GroupAccess | None = None,
 ) -> int:
     """Return the effective daily limit for ``attr`` (0 means unlimited)."""
     group_limit = int(getattr(group, attr) or 0)
-    owner_id = await group_owner_user_id(session, group.id)
+    if access is not None and access.owner_id is not None:
+        plan_limit = getattr(access.entitlements, attr, None)
+        if plan_limit is None:
+            return group_limit
+        plan_limit = int(plan_limit)
+        if group_limit <= 0:
+            return plan_limit
+        if plan_limit <= 0:
+            return group_limit
+        return min(group_limit, plan_limit)
+    owner_id = await group_owner_user_id(session, group.id, access=access)
     if owner_id is None:
         return group_limit
     owner = await session.get(ConsoleUser, owner_id)
@@ -30,16 +44,20 @@ async def _owner_limit(
     return min(group_limit, plan_limit)
 
 
-async def allow_request(session: AsyncSession, group: Group) -> bool:
-    limit = await _owner_limit(session, group, "ai_daily_quota")
+async def allow_request(
+    session: AsyncSession, group: Group, *, access: GroupAccess | None = None
+) -> bool:
+    limit = await _owner_limit(session, group, "ai_daily_quota", access=access)
     if limit > 0:
         usage = await repo.get_usage(session, group.id)
         return usage.requests < limit
     return True
 
 
-async def allow_sample(session: AsyncSession, group: Group) -> bool:
-    limit = await _owner_limit(session, group, "sample_daily_quota")
+async def allow_sample(
+    session: AsyncSession, group: Group, *, access: GroupAccess | None = None
+) -> bool:
+    limit = await _owner_limit(session, group, "sample_daily_quota", access=access)
     if limit > 0:
         usage = await repo.get_usage(session, group.id)
         return usage.samples < limit

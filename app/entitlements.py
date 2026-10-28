@@ -14,7 +14,8 @@ upgrade immediately unlocks the same feature everywhere.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Iterable
+from collections.abc import Iterable
+from typing import Final
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -191,6 +192,34 @@ class Entitlements:
 EMPTY_ENTITLEMENTS = Entitlements(features=frozenset(), group_limit=0)
 
 
+@dataclass(frozen=True, slots=True)
+class GroupAccess:
+    owner_id: int | None
+    entitlements: Entitlements | None
+
+    def can(self, feature: str) -> bool:
+        return self.entitlements.can(feature) if self.entitlements is not None else True
+
+
+UNBOUND_GROUP_ACCESS: Final = GroupAccess(owner_id=None, entitlements=None)
+
+
+class GroupAccessCache:
+    def __init__(self, session: AsyncSession, group_id: int) -> None:
+        self._session = session
+        self._group_id = int(group_id)
+        self._access: GroupAccess | None = None
+
+    async def resolve(self) -> GroupAccess:
+        if self._access is None:
+            self._access = await resolve_group_access(self._session, self._group_id)
+        return self._access
+
+    async def can(self, feature: str) -> bool:
+        access = await self.resolve()
+        return access.can(feature)
+
+
 async def active_subscription(
     session: AsyncSession, user_id: int
 ) -> Subscription | None:
@@ -224,10 +253,21 @@ async def build_for_user(
             sample_daily_quota=None,
         )
 
-    subscription = await active_subscription(session, user.id)
-    plan = None
-    if subscription is not None and subscription.plan_id:
-        plan = await session.get(SubscriptionPlan, int(subscription.plan_id))
+    now = utcnow()
+    subscription, plan = (
+        await session.execute(
+            select(Subscription, SubscriptionPlan)
+            .outerjoin(SubscriptionPlan, SubscriptionPlan.id == Subscription.plan_id)
+            .where(
+                Subscription.user_id == int(user.id),
+                Subscription.status == "active",
+                Subscription.starts_at <= now,
+                or_(Subscription.expires_at.is_(None), Subscription.expires_at > now),
+            )
+            .order_by(Subscription.id.desc())
+            .limit(1)
+        )
+    ).first() or (None, None)
 
     advanced = user.role == "subscriber" or subscription is not None
     if not advanced:
@@ -255,24 +295,50 @@ async def build_for_user(
     )
 
 
-async def group_owner_user_id(session: AsyncSession, group_id: int) -> int | None:
-    """Return the console user that owns/bound a Telegram group, if any."""
-    row = await session.scalar(
-        select(ConsoleGroupAccess.user_id)
-        .where(ConsoleGroupAccess.group_id == int(group_id))
-        .order_by(
-            (ConsoleGroupAccess.role == "owner").desc(),
-            ConsoleGroupAccess.id.asc(),
+async def resolve_group_access(
+    session: AsyncSession, group_id: int
+) -> GroupAccess:
+    row = (
+        await session.execute(
+            select(ConsoleGroupAccess.user_id, ConsoleUser)
+            .outerjoin(ConsoleUser, ConsoleUser.id == ConsoleGroupAccess.user_id)
+            .where(ConsoleGroupAccess.group_id == int(group_id))
+            .order_by(
+                (ConsoleGroupAccess.role == "owner").desc(),
+                ConsoleGroupAccess.id.asc(),
+            )
+            .limit(1)
         )
-        .limit(1)
+    ).first()
+    if row is None:
+        return UNBOUND_GROUP_ACCESS
+    owner_id, owner = row
+    entitlements = (
+        await build_for_user(session, owner)
+        if owner is not None and owner.is_active
+        else EMPTY_ENTITLEMENTS
     )
-    return int(row) if row is not None else None
+    return GroupAccess(owner_id=int(owner_id), entitlements=entitlements)
+
+
+async def group_owner_user_id(
+    session: AsyncSession,
+    group_id: int,
+    *,
+    access: GroupAccess | None = None,
+) -> int | None:
+    """Return the console user that owns/bound a Telegram group, if any."""
+    resolved = access or await resolve_group_access(session, group_id)
+    return resolved.owner_id
 
 
 async def group_owner(
-    session: AsyncSession, group_id: int
+    session: AsyncSession,
+    group_id: int,
+    *,
+    access: GroupAccess | None = None,
 ) -> ConsoleUser | None:
-    owner_id = await group_owner_user_id(session, group_id)
+    owner_id = await group_owner_user_id(session, group_id, access=access)
     if owner_id is None:
         return None
     user = await session.get(ConsoleUser, owner_id)
@@ -282,21 +348,19 @@ async def group_owner(
 
 
 async def group_feature_allowed(
-    session: AsyncSession, group_id: int, feature: str
+    session: AsyncSession,
+    group_id: int,
+    feature: str,
+    *,
+    access: GroupAccess | None = None,
 ) -> bool:
     """Check a feature for the group's owning console user.
 
     Groups that have no console binding are platform-managed and keep working,
     which preserves behaviour for groups added directly by the bot owner.
     """
-    owner_id = await group_owner_user_id(session, group_id)
-    if owner_id is None:
-        return True
-    user = await session.get(ConsoleUser, owner_id)
-    if user is None or not user.is_active:
-        return False
-    entitlements = await build_for_user(session, user)
-    return entitlements.can(feature)
+    resolved = access or await resolve_group_access(session, group_id)
+    return resolved.can(feature)
 
 
 async def user_can_for_group(
