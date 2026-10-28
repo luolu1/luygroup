@@ -35,7 +35,7 @@ sys.path.insert(0, str(ROOT))
 
 from sqlalchemy import select  # noqa: E402
 
-from app.bot import captcha  # noqa: E402
+from app.bot import captcha, helpers  # noqa: E402
 from app.bot.handlers import join  # noqa: E402
 from app.db import init_db, session_scope  # noqa: E402
 from app.models import Group, Verification, utcnow  # noqa: E402
@@ -140,6 +140,7 @@ def wrong_option(token: str) -> int:
 
 async def main() -> None:
     await init_db()
+    helpers.NOTICE_TTL_SECONDS = 0.05
     async with session_scope() as session:
         session.add(
             Group(
@@ -232,6 +233,12 @@ async def main() -> None:
         any("连续答错验证码 3 次，已被移出群组" in text for text in bot.messages),
     )
     check("third wrong answer deletes prompt", refreshed.message_id in bot.deleted)
+    await asyncio.sleep(0.2)
+    check(
+        "third wrong answer notice is deleted automatically",
+        999 in bot.deleted,
+        str(bot.deleted),
+    )
     check("inflight guard is released", not join._verification_inflight)
 
     # Concurrent clicks on the same challenge must not allow multiple guesses.
