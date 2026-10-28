@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import ClassVar
 from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, Request
@@ -58,7 +59,9 @@ UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 class CSRFOriginMiddleware(BaseHTTPMiddleware):
-    EXEMPT_PATHS = {"/healthz", "/payments/epay/notify"}
+    EXEMPT_PATHS: ClassVar[frozenset[str]] = frozenset(
+        {"/healthz", "/payments/epay/notify"}
+    )
 
     async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
         path = request.url.path

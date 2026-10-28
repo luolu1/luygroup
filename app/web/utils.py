@@ -58,12 +58,12 @@ def user_label(user_id: int | None, name: str | None = None, username: str | Non
 
 
 __all__ = [
-    "fmt_dt",
-    "fmt_date",
-    "fmt_money",
-    "short",
-    "yes_no",
-    "n",
-    "user_label",
     "escape",
+    "fmt_date",
+    "fmt_dt",
+    "fmt_money",
+    "n",
+    "short",
+    "user_label",
+    "yes_no",
 ]

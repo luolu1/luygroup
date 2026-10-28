@@ -33,7 +33,6 @@ from ..entitlements import (
     FIELD_FEATURES,
     TAB_FEATURES,
     Entitlements,
-    build_for_user,
     group_owner_user_id,
 )
 from ..models import (
@@ -53,6 +52,8 @@ from ..models import (
     Keyword,
     KeywordHit,
     Lottery,
+    LotteryEntry,
+    LotteryWinner,
     Member,
     PaymentChannel,
     PaymentOrder,
@@ -619,15 +620,55 @@ async def account_page(
         .order_by(AccountLedgerEntry.id.desc())
         .limit(500)
     )
-    pending_orders = await session.scalars(
+    orders = await session.scalars(
         select(PaymentOrder)
-        .where(
-            PaymentOrder.user_id == ent.user.id,
-            PaymentOrder.status == "pending",
-        )
+        .where(PaymentOrder.user_id == ent.user.id)
         .order_by(PaymentOrder.id.desc())
-        .limit(100)
+        .limit(200)
     )
+    lottery_rows = (
+        await session.execute(
+            select(Lottery, Group.title)
+            .outerjoin(Group, Group.id == Lottery.group_id)
+            .where(
+                Lottery.creator_id == int(ent.user.id),
+                Lottery.hidden_at.is_(None),
+            )
+            .order_by(Lottery.id.desc())
+            .limit(200)
+        )
+    ).all()
+    lottery_ids = [int(lottery.id) for lottery, _group_title in lottery_rows]
+    entry_counts: dict[int, int] = {}
+    winner_ids: dict[int, list[int]] = {}
+    if lottery_ids:
+        entry_counts = {
+            int(lottery_id): int(count)
+            for lottery_id, count in (
+                await session.execute(
+                    select(LotteryEntry.lottery_id, func.count(LotteryEntry.id))
+                    .where(LotteryEntry.lottery_id.in_(lottery_ids))
+                    .group_by(LotteryEntry.lottery_id)
+                )
+            ).all()
+        }
+        for lottery_id, user_id in (
+            await session.execute(
+                select(LotteryWinner.lottery_id, LotteryWinner.user_id).where(
+                    LotteryWinner.lottery_id.in_(lottery_ids)
+                )
+            )
+        ).all():
+            winner_ids.setdefault(int(lottery_id), []).append(int(user_id))
+    my_lotteries = [
+        {
+            "lottery": lottery,
+            "group_title": group_title or str(lottery.group_id),
+            "entry_count": entry_counts.get(int(lottery.id), 0),
+            "winner_ids": winner_ids.get(int(lottery.id), []),
+        }
+        for lottery, group_title in lottery_rows
+    ]
     payments_enabled = await payment_service.checkout_enabled(session)
     return _render(
         request,
@@ -637,7 +678,8 @@ async def account_page(
         now_utc=utcnow(),
         monthly_price_cents=MONTHLY_PRICE_CENTS,
         bills=list(bills.all()),
-        pending_orders=list(pending_orders.all()),
+        orders=list(orders.all()),
+        my_lotteries=my_lotteries,
         payments_enabled=payments_enabled,
         min_recharge=pay_cfg.min_amount_cents,
         max_recharge=pay_cfg.max_amount_cents,
@@ -969,20 +1011,21 @@ async def payment_orders_page(
             PaymentOrder.order_no.ilike(f"%{q}%") | user_match
         )
         ledger_stmt = ledger_stmt.where(user_match)
+    include_ledger = True
     if status in {"pending", "paid", "failed", "expired"}:
         payment_stmt = payment_stmt.where(PaymentOrder.status == status)
-        if status != "paid":
-            ledger_stmt = ledger_stmt.where(AccountLedgerEntry.id < 0)
+        include_ledger = status == "paid"
     else:
         status = ""
     if purpose in {"recharge", "subscription"}:
         payment_stmt = payment_stmt.where(PaymentOrder.purpose == purpose)
-        if purpose != "subscription":
-            ledger_stmt = ledger_stmt.where(AccountLedgerEntry.id < 0)
+        include_ledger = include_ledger and purpose == "subscription"
     else:
         purpose = ""
     payment_rows = (await session.execute(payment_stmt.limit(1000))).all()
-    ledger_rows = (await session.execute(ledger_stmt.limit(1000))).all()
+    ledger_rows = (
+        (await session.execute(ledger_stmt.limit(1000))).all() if include_ledger else []
+    )
     orders: list[dict[str, Any]] = [
         {
             "user": user,
