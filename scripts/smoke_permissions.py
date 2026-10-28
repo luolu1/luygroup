@@ -14,7 +14,6 @@ import tempfile
 import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 TMP = Path(tempfile.mkdtemp(prefix="groupguard-perm-"))
@@ -33,6 +32,7 @@ if not admin_ids:
     sys.exit(2)
 
 cfg["database"]["url"] = f"sqlite+aiosqlite:///{DB}"
+cfg.setdefault("web", {})["base_url"] = "http://testserver"
 cfg.setdefault("ai", {})["learning_dir"] = str(TMP / "learning")
 TMP_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
 os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)

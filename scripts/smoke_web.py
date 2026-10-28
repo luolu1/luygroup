@@ -35,6 +35,7 @@ if not admin_ids:
 ADMIN_ID = admin_ids[0]
 
 cfg["database"]["url"] = f"sqlite+aiosqlite:///{DB}"
+cfg.setdefault("web", {})["base_url"] = "http://testserver"
 cfg.setdefault("ai", {})["learning_dir"] = str(TMP / "learning")
 TMP_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
 os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
@@ -246,6 +247,31 @@ try:
         con.close()
         r = client.get("/console?token=balance-user-token", follow_redirects=False)
         check("balance user can open account page", r.status_code == 303 and r.headers.get("location") == "/")
+        con = connect()
+        con.execute(
+            "INSERT INTO groups (id, title, chat_type, is_active) VALUES (?, ?, ?, 1)",
+            (-100990001, "Web Lottery Group", "supergroup"),
+        )
+        balance_user_id = con.execute(
+            "SELECT id FROM console_users WHERE telegram_id=?", (ADMIN_ID + 10000,)
+        ).fetchone()[0]
+        con.execute(
+            "INSERT INTO lotteries (group_id, creator_id, title, prize, winners_count, "
+            "participation_type, draw_type, status, ends_at, hidden_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+1 hour'), NULL)",
+            (-100990001, balance_user_id, "Web 抽奖记录", "测试奖品", 1, "none", "time", "drawn"),
+        )
+        lottery_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+        con.execute(
+            "INSERT INTO lottery_entries (lottery_id, user_id) VALUES (?, ?)",
+            (lottery_id, ADMIN_ID + 10001),
+        )
+        con.execute(
+            "INSERT INTO lottery_winners (lottery_id, user_id) VALUES (?, ?)",
+            (lottery_id, ADMIN_ID + 10001),
+        )
+        con.commit()
+        con.close()
         r = client.get("/account")
         check(
             "unsubscribed account shows one open action and balance choice",
@@ -258,6 +284,17 @@ try:
             and 'trigger.addEventListener("click"' in r.text
             and "账单记录" in r.text,
             r.text[:500],
+        )
+        check(
+            "account shows my lottery records",
+            r.status_code == 200
+            and "我的抽奖" in r.text
+            and "Web 抽奖记录" in r.text
+            and "Web Lottery Group" in r.text
+            and "已开奖" in r.text
+            and "报名人数" in r.text
+            and str(ADMIN_ID + 10001) in r.text,
+            r.text[:800],
         )
         r = client.post("/account/subscribe", follow_redirects=False)
         con = connect()

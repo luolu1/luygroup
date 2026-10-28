@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
 import sys
@@ -27,13 +26,12 @@ TMP_CONFIG.write_text(json.dumps(config), encoding="utf-8")
 os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
 sys.path.insert(0, str(ROOT))
 
-from sqlalchemy import delete, select, update  # noqa: E402
+from sqlalchemy import select, update  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.config import get_config  # noqa: E402
 from app.db import dispose_db, get_sessionmaker, init_db  # noqa: E402
 from app.models import (
-    AccountLedgerEntry,
     ConsoleUser,
     PaymentChannel,
     PaymentOrder,
@@ -49,7 +47,6 @@ from app.services.payments.service import (  # noqa: E402
     create_subscription_order,
     expire_pending_orders,
     handle_notification,
-    get_provider,
     settle_payment,
     start_checkout,
 )
@@ -307,8 +304,8 @@ async def main() -> None:
                 await session.commit()
             expired_page = client.get("/account")
             check(
-                "expired pending bill is hidden from active payment list",
-                expired.order_no not in expired_page.text,
+                "expired pending bill has no continue-payment action",
+                f"/account/orders/{expired.order_no}/pay" not in expired_page.text,
             )
             account = client.get("/account")
             check(
@@ -319,7 +316,10 @@ async def main() -> None:
                 f"{account.status_code} {account.url} {account.text[:180]}",
             )
             bills = client.get("/account")
-            check("account page displays billing ledger", "账单记录" in bills.text)
+            check(
+                "account page displays payment and balance records",
+                "支付订单" in bills.text and "余额流水" in bills.text,
+            )
             external = client.post(
                 "/account/subscribe/pay", follow_redirects=False
             )
@@ -402,13 +402,6 @@ async def main() -> None:
             subscription_order_no = subscription_order.order_no
             assert subscription_order.channel_id == channel_id
             assert subscription_order.charge_cents == 849
-    subscription_callback = PaymentCallback(
-        order_no=subscription_order_no,
-        trade_no="epay-subscription-1",
-        merchant_id="10001",
-        amount=Decimal("8.49"),
-        status="paid",
-    )
     async with get_sessionmaker()() as session:
         async with session.begin():
             status, _ = await handle_notification(session, None, {
@@ -442,15 +435,15 @@ async def main() -> None:
         settled_order = await session.scalar(
             select(PaymentOrder).where(PaymentOrder.order_no == subscription_order_no)
         )
-        ledger = await session.scalar(
-            select(AccountLedgerEntry)
-            .where(
-                AccountLedgerEntry.user_id == user_id,
-                AccountLedgerEntry.order_id == settled_order.id,
-                AccountLedgerEntry.kind == "subscription_online",
-            )
+        balance_after_online = await session.scalar(
+            select(ConsoleUser.balance_cents).where(ConsoleUser.id == user_id)
         )
-        check("online subscription writes ledger entry", ledger is not None)
+        check(
+            "online subscription records paid order without changing balance",
+            settled_order is not None
+            and settled_order.status == "paid"
+            and balance_after_online == 1984,
+        )
     async with get_sessionmaker()() as session:
         async with session.begin():
             await session.execute(

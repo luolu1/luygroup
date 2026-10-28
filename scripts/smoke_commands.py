@@ -49,7 +49,6 @@ from app.models import (  # noqa: E402
     Group,
     Member,
     MemberDailyStat,
-    Report,
     UserNotificationPreference,
     utcnow,
 )
@@ -62,6 +61,8 @@ PRIVATE_EXPECTED = [
     "unbanme",
     "unmuteme",
     "cjtz",
+    "cjhistory",
+    "cjcancel",
     "jptz",
 ]
 GROUP_EXPECTED = [
