@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from typing import Any
 
 from sqlalchemy import (
@@ -24,7 +24,7 @@ Base = declarative_base()
 
 def utcnow() -> datetime:
     """Naive UTC timestamps, which are what SQLite stores reliably."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 def day_key(now: datetime | None = None) -> str:
@@ -633,10 +633,38 @@ class Lottery(Base):
     prize = Column(String(512), default="")
     entry_fee = Column(Integer, default=0)
     winners_count = Column(Integer, default=1)
+    # none / keyword / points / message_count
+    participation_type = Column(String(16), default="none")
+    participation_value = Column(String(255), default="")
+    # time / participant
+    draw_type = Column(String(16), default="time")
+    draw_participant_count = Column(Integer, nullable=True)
+    claim_contact = Column(String(255), default="")
     status = Column(String(16), default="open")  # open / drawn / cancelled
     message_id = Column(BigInteger, nullable=True)
     ends_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=utcnow)
+    hidden_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_lotteries_group_status", "group_id", "status"),
+        Index("ix_lotteries_creator_hidden_id", "creator_id", "hidden_at", "id"),
+    )
+
+
+class LotteryQualification(Base):
+    """Members who already satisfied a keyword participation condition."""
+
+    __tablename__ = "lottery_qualifications"
+
+    id = Column(Integer, primary_key=True)
+    lottery_id = Column(Integer, index=True)
+    user_id = Column(BigInteger, index=True)
+    created_at = Column(DateTime, default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("lottery_id", "user_id", name="uq_lottery_qualification"),
+    )
 
 
 class LotteryEntry(Base):
@@ -648,6 +676,19 @@ class LotteryEntry(Base):
     created_at = Column(DateTime, default=utcnow)
 
     __table_args__ = (UniqueConstraint("lottery_id", "user_id", name="uq_lottery_entry"),)
+
+
+class LotteryWinner(Base):
+    __tablename__ = "lottery_winners"
+
+    id = Column(Integer, primary_key=True)
+    lottery_id = Column(Integer, index=True)
+    user_id = Column(BigInteger, index=True)
+    drawn_at = Column(DateTime, default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("lottery_id", "user_id", name="uq_lottery_winner"),
+    )
 
 
 class Auction(Base):
@@ -696,36 +737,36 @@ class GroupDailyStat(Base):
 
 
 __all__ = [
-    "Base",
-    "utcnow",
-    "day_key",
-    "Group",
-    "Admin",
-    "Warning",
-    "Member",
-    "Whitelist",
-    "GlobalBlacklist",
-    "Keyword",
-    "KeywordHit",
-    "AdminLog",
+    "AIEvent",
     "AIProvider",
     "AIUsage",
-    "AIEvent",
-    "Verification",
-    "RequiredChannel",
-    "InviteCode",
-    "CrossLink",
-    "ReportLink",
-    "Report",
-    "PointsTransaction",
-    "DailyCheckin",
-    "ShopItem",
-    "ShopOrder",
-    "RedPacket",
-    "RedPacketClaim",
-    "Lottery",
-    "LotteryEntry",
+    "Admin",
+    "AdminLog",
     "Auction",
     "AuctionBid",
+    "Base",
+    "CrossLink",
+    "DailyCheckin",
+    "GlobalBlacklist",
+    "Group",
     "GroupDailyStat",
+    "InviteCode",
+    "Keyword",
+    "KeywordHit",
+    "Lottery",
+    "LotteryEntry",
+    "Member",
+    "PointsTransaction",
+    "RedPacket",
+    "RedPacketClaim",
+    "Report",
+    "ReportLink",
+    "RequiredChannel",
+    "ShopItem",
+    "ShopOrder",
+    "Verification",
+    "Warning",
+    "Whitelist",
+    "day_key",
+    "utcnow",
 ]

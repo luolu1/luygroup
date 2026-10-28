@@ -1,0 +1,28 @@
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+extend-exclude = ["data", ".venv"]
+
+[tool.ruff.lint]
+select = ["F", "E4", "E9", "B", "UP", "SIM", "C4", "RET", "PIE", "RUF", "ASYNC"]
+ignore = [
+    # The UI and every user-facing string is Chinese; full-width punctuation
+    # inside string literals and comments is intentional.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    # FastAPI's dependency-injection idiom is a call in a default argument.
+    "B008",
+    # These async helpers expose a ``timeout`` knob and forward it to the HTTP
+    # client instead of wrapping the body in ``asyncio.timeout``.
+    "ASYNC109",
+    # Learning-data directory switching is a rare, operator-triggered action;
+    # the pathlib calls run once per config change rather than per request.
+    "ASYNC240",
+    # Existing narrow exception handlers intentionally ignore expected cleanup
+    # failures; changing them adds context-manager noise without changing flow.
+    "SIM105",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/*.py" = ["E402", "E501", "RET503", "RUF100", "SIM117", "UP037"]

@@ -6,7 +6,7 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import timedelta
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 from sqlalchemy import event, select
 from sqlalchemy.exc import OperationalError
@@ -129,6 +129,14 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
             "charge_currency": "VARCHAR(8) DEFAULT 'CNY'",
             "expires_at": "DATETIME",
         },
+        "lotteries": {
+            "participation_type": "VARCHAR(16) DEFAULT 'none'",
+            "participation_value": "VARCHAR(255) DEFAULT ''",
+            "draw_type": "VARCHAR(16) DEFAULT 'time'",
+            "draw_participant_count": "INTEGER",
+            "claim_contact": "VARCHAR(255) DEFAULT ''",
+            "hidden_at": "DATETIME",
+        },
     }
     for table, additions in columns.items():
         existing = {
@@ -151,19 +159,26 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
         "CREATE TABLE IF NOT EXISTS groupguard_migrations "
         "(name TEXT PRIMARY KEY NOT NULL)"
     )
-    migrated = conn.exec_driver_sql(
-        "SELECT 1 FROM groupguard_migrations WHERE name = "
-        "'default_message_cleanup_settings_v1'"
-    ).fetchone()
-    if migrated is None:
+
+    def has_migration(name: str) -> bool:
+        return (
+            conn.exec_driver_sql(
+                "SELECT 1 FROM groupguard_migrations WHERE name = ?", (name,)
+            ).fetchone()
+            is not None
+        )
+
+    def mark_migration(name: str) -> None:
+        conn.exec_driver_sql(
+            "INSERT OR IGNORE INTO groupguard_migrations (name) VALUES (?)", (name,)
+        )
+
+    if not has_migration("default_message_cleanup_settings_v1"):
         conn.exec_driver_sql(
             "UPDATE groups SET delete_command_messages = 1 "
             "WHERE delete_command_messages = 0"
         )
-        conn.exec_driver_sql(
-            "INSERT INTO groupguard_migrations (name) VALUES "
-            "('default_message_cleanup_settings_v1')"
-        )
+        mark_migration("default_message_cleanup_settings_v1")
 
     conn.exec_driver_sql(
         "CREATE INDEX IF NOT EXISTS ix_ai_providers_owner_user_id "
@@ -173,6 +188,21 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
         "CREATE INDEX IF NOT EXISTS ix_global_blacklist_owner_user_id "
         "ON global_blacklist (owner_user_id)"
     )
+    for index_statement in (
+        "CREATE INDEX IF NOT EXISTS ix_keyword_hits_created_at "
+        "ON keyword_hits (created_at)",
+        "CREATE INDEX IF NOT EXISTS ix_payment_orders_status_expires "
+        "ON payment_orders (status, expires_at)",
+        "CREATE INDEX IF NOT EXISTS ix_verifications_status_created "
+        "ON verifications (status, created_at)",
+        "CREATE INDEX IF NOT EXISTS ix_members_muted_until "
+        "ON members (is_muted, muted_until)",
+        "CREATE INDEX IF NOT EXISTS ix_lotteries_group_status "
+        "ON lotteries (group_id, status)",
+        "CREATE INDEX IF NOT EXISTS ix_lotteries_creator_hidden_id "
+        "ON lotteries (creator_id, hidden_at, id)",
+    ):
+        conn.exec_driver_sql(index_statement)
 
     console_columns = {
         str(row[1])
@@ -243,6 +273,8 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
     conn.exec_driver_sql(
         "CREATE INDEX IF NOT EXISTS ix_warnings_code ON warnings (code)"
     )
+    if has_migration("warnings_metadata_backfill_v1"):
+        return
     conn.exec_driver_sql(
         "UPDATE warnings SET code = strftime('%Y%m%d%H%M', created_at) "
         "WHERE (code IS NULL OR code = '') AND created_at IS NOT NULL"
@@ -290,6 +322,7 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
         "WHERE instr(code, '-') = 0 AND code IN ("
         "SELECT code FROM warnings GROUP BY code HAVING COUNT(*) > 1)"
     )
+    mark_migration("warnings_metadata_backfill_v1")
 
 
 async def init_db() -> None:
@@ -340,9 +373,6 @@ async def init_db() -> None:
                     )
                 )
 
-            # Migrate configured bot administrators to independent console users.
-            # The token is retained only for its 24-hour display window; login
-            # validation still uses the hash.
             for telegram_id in cfg.bot.admin_ids:
                 user = await session.scalar(
                     select(ConsoleUser).where(ConsoleUser.telegram_id == int(telegram_id))

@@ -3,7 +3,7 @@ VENV := .venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
 
-.PHONY: help venv install init-config run run-bot run-web check smoke smoke-permissions smoke-captcha smoke-scheduler smoke-scheduler-idempotency smoke-bot-recovery smoke-subscription-purchase smoke-payments smoke-commands smoke-games-race smoke-economy-claims docker-build docker-up docker-down docker-logs clean
+.PHONY: help venv install init-config run run-bot run-web check lint format smoke smoke-permissions smoke-entitlement-queries smoke-captcha smoke-rejoin smoke-scheduler smoke-scheduler-queries smoke-scheduler-idempotency smoke-bot-recovery smoke-subscription-purchase smoke-payments smoke-commands smoke-games-race smoke-economy-claims docker-build docker-up docker-down docker-logs clean
 
 help:
 	@echo "luygroup 常用命令："
@@ -13,10 +13,14 @@ help:
 	@echo "  make run-bot       仅启动 Telegram Bot"
 	@echo "  make run-web       仅启动 Web 控制台"
 	@echo "  make check         编译检查全部 Python 文件"
+	@echo "  make lint          Ruff 检查生产代码与测试脚本"
+	@echo "  make format        Ruff 格式化 Python 文件"
 	@echo "  make smoke         运行 Web 面板冒烟测试"
 	@echo "  make smoke-permissions 运行角色、群组与接口隔离回归测试"
+	@echo "  make smoke-entitlement-queries 运行权限缓存语义与查询预算测试"
 	@echo "  make smoke-captcha 运行验证码刷新、三次失败移出回归测试"
 	@echo "  make smoke-scheduler 运行验证超时移出回归测试"
+	@echo "  make smoke-scheduler-queries 运行调度器批量查询与清理回归测试"
 	@echo "  make smoke-scheduler-idempotency 运行抽奖/竞拍/红包重复结算回归测试"
 	@echo "  make smoke-bot-recovery 运行 Bot 断线恢复生命周期回归测试"
 	@echo "  make smoke-subscription-purchase 运行订阅购买/续费与余额扣款回归测试"
@@ -60,11 +64,20 @@ check: $(PYTHON)
 	$(PYTHON) -m compileall -q app run_bot.py run_web.py
 	@echo "编译检查通过。"
 
+lint: $(PYTHON)
+	$(PYTHON) -m ruff check app run_bot.py run_web.py scripts
+
+format: $(PYTHON)
+	$(PYTHON) -m ruff format app run_bot.py run_web.py scripts
+
 smoke: $(PYTHON)
 	$(PYTHON) scripts/smoke_web.py
 
 smoke-permissions: $(PYTHON)
 	$(PYTHON) scripts/smoke_permissions.py
+
+smoke-entitlement-queries: $(PYTHON)
+	$(PYTHON) scripts/smoke_entitlement_queries.py
 
 smoke-captcha: $(PYTHON)
 	$(PYTHON) scripts/smoke_captcha.py
@@ -74,6 +87,9 @@ smoke-rejoin: $(PYTHON)
 
 smoke-scheduler: $(PYTHON)
 	$(PYTHON) scripts/smoke_scheduler.py
+
+smoke-scheduler-queries: $(PYTHON)
+	$(PYTHON) scripts/smoke_scheduler_queries.py
 
 smoke-scheduler-idempotency: $(PYTHON)
 	$(PYTHON) scripts/smoke_scheduler_idempotency.py
