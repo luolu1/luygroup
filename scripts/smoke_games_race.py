@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import tempfile
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,12 +38,15 @@ sys.path.insert(0, str(ROOT))
 from sqlalchemy import func, select  # noqa: E402
 from sqlalchemy.exc import OperationalError  # noqa: E402
 
-from app.bot.handlers import games  # noqa: E402
+from app.bot import helpers  # noqa: E402
+from app.bot.handlers import games, moderation  # noqa: E402
 from app.db import dispose_db, init_db, session_scope  # noqa: E402
 from app.models import (  # noqa: E402
     Auction,
     AuctionBid,
     Group,
+    Lottery,
+    LotteryEntry,
     Member,
     PointsTransaction,
     RedPacket,
@@ -52,6 +56,10 @@ from app.models import (  # noqa: E402
 from app.services import repo, scheduler  # noqa: E402
 
 failures: list[str] = []
+
+
+def future_draw_time() -> str:
+    return (utcnow() + timedelta(days=1)).strftime("%Y-%m-%d %H:%M")
 
 
 def check(name: str, cond: bool, extra: str = "") -> None:
@@ -76,9 +84,21 @@ async def with_retry(factory):
 class FakeBot:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str]] = []
+        self.membership: dict[tuple[int, int], str] = {}
+        self.next_message_id = 700
 
-    async def send_message(self, chat_id: int, text: str, **kwargs) -> None:
+    async def send_message(self, chat_id: int, text: str, **kwargs):
         self.sent.append((int(chat_id), text))
+        self.next_message_id += 1
+        return SimpleNamespace(message_id=self.next_message_id)
+
+    async def get_chat_member(self, chat_id: int, user_id: int):
+        return SimpleNamespace(
+            status=self.membership.get((int(chat_id), int(user_id)), "member")
+        )
+
+    async def me(self):
+        return SimpleNamespace(username="smokebot")
 
 
 class FakeUser:
@@ -101,21 +121,42 @@ class FakeMessage:
     def __init__(self, *, user_id: int, chat_id: int, text: str = "") -> None:
         self.from_user = FakeUser(user_id)
         self.chat = FakeChat(chat_id)
+        self.sender_chat = None
+        self.forward_from_chat = None
+        if chat_id > 0:
+            self.chat.type = "private"
         self.text = text
         self.reply_to_message = None
         self.replies: list[str] = []
+        self.markup = None
+        self.sent_answers: list[tuple[str, object | None]] = []
 
     async def reply(self, text: str, **kwargs) -> None:
         self.replies.append(text)
+        self.markup = kwargs.get("reply_markup")
+
+    async def answer(self, text: str, **kwargs) -> None:
+        self.sent_answers.append((text, kwargs.get("reply_markup")))
 
 
 class FakeCallbackMessage:
     def __init__(self, chat_id: int) -> None:
         self.chat = FakeChat(chat_id)
+        if chat_id > 0:
+            self.chat.type = "private"
         self.markup_calls: list[object] = []
+        self.answers: list[tuple[str, object | None]] = []
+        self.edited_text: str | None = None
 
     async def edit_reply_markup(self, reply_markup=None) -> None:
         self.markup_calls.append(reply_markup)
+
+    async def answer(self, text: str, **kwargs) -> None:
+        self.answers.append((text, kwargs.get("reply_markup")))
+
+    async def edit_text(self, text: str, **kwargs) -> None:
+        self.edited_text = text
+        self.answers.append((text, kwargs.get("reply_markup")))
 
 
 class FakeCallback:
@@ -125,8 +166,550 @@ class FakeCallback:
         self.message = FakeCallbackMessage(chat_id)
         self.answers: list[str] = []
 
-    async def answer(self, text: str, show_alert: bool = False) -> None:
+    async def answer(self, text: str = "", show_alert: bool = False) -> None:
         self.answers.append(text)
+
+
+async def test_lottery_private_setup() -> None:
+    group_id = -100820099
+    user_id = 820099
+    await create_group(group_id, "Lottery setup")
+    bot = FakeBot()
+    bot.membership[(group_id, user_id)] = "administrator"
+
+    start = FakeMessage(user_id=user_id, chat_id=group_id, text="/cj")
+    start.chat.title = "Lottery setup"
+    await games.cmd_lottery(start, bot)
+    assert bot.sent[-1][0] == user_id
+    assert "Lottery setup" in bot.sent[0][1]
+    assert "第 1/6 步 · 标题" in bot.sent[0][1]
+    assert "例如：周末抽奖" in bot.sent[0][1]
+    async with session_scope() as session:
+        assert await session.scalar(
+            select(Lottery.id).where(Lottery.group_id == group_id)
+        ) is None
+
+    await games.lottery_private_config(
+        FakeMessage(user_id=user_id, chat_id=user_id, text="周末抽奖"),
+        bot,
+    )
+    await games.lottery_private_config(
+        FakeMessage(user_id=user_id, chat_id=user_id, text="一个月会员"), bot
+    )
+    await games.lottery_setup_callback(
+        FakeCallback(data="lotsetup:condition:none", user_id=user_id, chat_id=user_id),
+        bot,
+    )
+    await games.lottery_private_config(
+        FakeMessage(user_id=user_id, chat_id=user_id, text="2"), bot
+    )
+    await games.lottery_setup_callback(
+        FakeCallback(data="lotsetup:draw:time", user_id=user_id, chat_id=user_id),
+        bot,
+    )
+    await games.lottery_private_config(
+        FakeMessage(user_id=user_id, chat_id=user_id, text=future_draw_time()), bot
+    )
+    configured_draw_at = games._lottery_drafts[user_id].draw_at
+    assert configured_draw_at is not None
+    confirm = FakeMessage(user_id=user_id, chat_id=user_id, text="@admin")
+    await games.lottery_private_config(confirm, bot)
+    assert confirm.markup is not None
+    callback = FakeCallback(data="lotsetup:create", user_id=user_id, chat_id=user_id)
+    await games.lottery_setup_callback(callback, bot)
+    async with session_scope() as session:
+        lottery = await session.scalar(
+            select(Lottery).where(Lottery.group_id == group_id)
+        )
+        assert lottery is not None
+        assert lottery.title == "周末抽奖"
+        assert lottery.winners_count == 2
+        assert lottery.participation_type == "none"
+        assert lottery.draw_type == "time"
+        assert lottery.claim_contact == "@admin"
+        assert lottery.ends_at is not None
+        assert lottery.ends_at == configured_draw_at
+    assert any(chat_id == group_id and "周末抽奖" in text for chat_id, text in bot.sent)
+    print("PASS group admin walks the private wizard and creates a time lottery")
+    games._lottery_drafts.pop(user_id, None)
+
+    revoked_group_id = -100820097
+    revoked_user_id = 820097
+    await create_group(revoked_group_id, "Lottery revoked")
+    bot.membership[(revoked_group_id, revoked_user_id)] = "administrator"
+    await games.cmd_lottery(
+        FakeMessage(user_id=revoked_user_id, chat_id=revoked_group_id, text="/cj"),
+        bot,
+    )
+    await games.lottery_private_config(
+        FakeMessage(user_id=revoked_user_id, chat_id=revoked_user_id, text="不应发布"),
+        bot,
+    )
+    await games.lottery_private_config(
+        FakeMessage(user_id=revoked_user_id, chat_id=revoked_user_id, text="中奖品"), bot
+    )
+    await games.lottery_setup_callback(
+        FakeCallback(
+            data="lotsetup:condition:none", user_id=revoked_user_id, chat_id=revoked_user_id
+        ),
+        bot,
+    )
+    await games.lottery_private_config(
+        FakeMessage(user_id=revoked_user_id, chat_id=revoked_user_id, text="1"), bot
+    )
+    await games.lottery_setup_callback(
+        FakeCallback(
+            data="lotsetup:draw:time", user_id=revoked_user_id, chat_id=revoked_user_id
+        ),
+        bot,
+    )
+    await games.lottery_private_config(
+        FakeMessage(
+            user_id=revoked_user_id,
+            chat_id=revoked_user_id,
+            text=future_draw_time(),
+        ),
+        bot,
+    )
+    await games.lottery_private_config(
+        FakeMessage(user_id=revoked_user_id, chat_id=revoked_user_id, text="@admin"), bot
+    )
+    bot.membership[(revoked_group_id, revoked_user_id)] = "member"
+    await games.lottery_setup_callback(
+        FakeCallback(
+            data="lotsetup:create",
+            user_id=revoked_user_id,
+            chat_id=revoked_user_id,
+        ),
+        bot,
+    )
+    async with session_scope() as session:
+        assert await session.scalar(
+            select(Lottery.id).where(Lottery.group_id == revoked_group_id)
+        ) is None
+    print("PASS revoked admin cannot confirm lottery")
+
+
+async def test_lottery_wizard_back_and_expiry() -> None:
+    group_id = -100820088
+    user_id = 820088
+    await create_group(group_id, "Lottery edit")
+    bot = FakeBot()
+    bot.membership[(group_id, user_id)] = "administrator"
+    await games.cmd_lottery(
+        FakeMessage(user_id=user_id, chat_id=group_id, text="/cj"), bot
+    )
+    started = games._lottery_drafts[user_id].created_at
+    await games.lottery_private_config(
+        FakeMessage(user_id=user_id, chat_id=user_id, text="Original title"), bot
+    )
+    back = FakeCallback(
+        data="lotsetup:back:title", user_id=user_id, chat_id=user_id
+    )
+    await games.lottery_setup_callback(back, bot)
+    assert games._lottery_drafts[user_id].step == "title"
+    assert games._lottery_drafts[user_id].created_at == started
+    await games.lottery_private_config(
+        FakeMessage(user_id=user_id, chat_id=user_id, text="Updated title"), bot
+    )
+    assert games._lottery_drafts[user_id].title == "Updated title"
+    print("PASS lottery wizard returns to title without extending draft lifetime")
+
+    games._lottery_drafts[user_id] = replace(
+        games._lottery_drafts[user_id],
+        created_at=utcnow() - timedelta(minutes=5),
+    )
+    expired = FakeMessage(user_id=user_id, chat_id=user_id, text="Late prize")
+    await games.lottery_private_config(expired, bot)
+    assert user_id not in games._lottery_drafts
+    assert expired.replies
+    print("PASS lottery wizard draft expires after five minutes")
+
+    confirm_group = -100820087
+    confirm_user = 820087
+    await create_group(confirm_group, "Lottery confirmation expiry")
+    bot.membership[(confirm_group, confirm_user)] = "administrator"
+    await games.cmd_lottery(
+        FakeMessage(user_id=confirm_user, chat_id=confirm_group, text="/cj"), bot
+    )
+    games._lottery_drafts[confirm_user] = replace(
+        games._lottery_drafts[confirm_user],
+        step="confirm",
+        title="Expired draft",
+        prize="Prize",
+        created_at=utcnow() - timedelta(minutes=5),
+    )
+    await games.lottery_setup_callback(
+        FakeCallback(data="lotsetup:create", user_id=confirm_user, chat_id=confirm_user),
+        bot,
+    )
+    async with session_scope() as session:
+        assert await session.scalar(
+            select(Lottery.id).where(Lottery.group_id == confirm_group)
+        ) is None
+    print("PASS expired lottery draft cannot be confirmed")
+
+
+async def test_lottery_participation_rules() -> None:
+    group_id = -100820094
+    admin_id = 820094
+    member_id = 820095
+    await create_group(group_id, "Lottery rules")
+    bot = FakeBot()
+    bot.membership[(group_id, admin_id)] = "administrator"
+    await games.cmd_lottery(
+        FakeMessage(user_id=admin_id, chat_id=group_id, text="/cj"), bot
+    )
+    await games.lottery_private_config(
+        FakeMessage(user_id=admin_id, chat_id=admin_id, text="关键词抽奖"), bot
+    )
+    await games.lottery_private_config(
+        FakeMessage(user_id=admin_id, chat_id=admin_id, text="奖品A"), bot
+    )
+    await games.lottery_setup_callback(
+        FakeCallback(data="lotsetup:condition:keyword", user_id=admin_id, chat_id=admin_id),
+        bot,
+    )
+    await games.lottery_private_config(
+        FakeMessage(user_id=admin_id, chat_id=admin_id, text="抽奖"), bot
+    )
+    await games.lottery_private_config(
+        FakeMessage(user_id=admin_id, chat_id=admin_id, text="1"), bot
+    )
+    await games.lottery_setup_callback(
+        FakeCallback(data="lotsetup:draw:time", user_id=admin_id, chat_id=admin_id), bot
+    )
+    await games.lottery_private_config(
+        FakeMessage(user_id=admin_id, chat_id=admin_id, text=future_draw_time()), bot
+    )
+    await games.lottery_private_config(
+        FakeMessage(user_id=admin_id, chat_id=admin_id, text="@admin"), bot
+    )
+    await games.lottery_setup_callback(
+        FakeCallback(data="lotsetup:create", user_id=admin_id, chat_id=admin_id), bot
+    )
+    async with session_scope() as session:
+        keyword_lottery = await session.scalar(
+            select(Lottery).where(Lottery.group_id == group_id)
+        )
+        assert keyword_lottery is not None
+        assert keyword_lottery.participation_type == "keyword"
+        keyword_lottery_id = int(keyword_lottery.id)
+
+    denied = FakeCallback(
+        data=f"lot:{keyword_lottery_id}", user_id=member_id, chat_id=group_id
+    )
+    await games.on_lottery_join(denied)
+    assert any("需要先在群内发送" in answer for answer in denied.answers), denied.answers
+    print("PASS keyword lottery rejects member without qualifying message")
+
+    auto_message = FakeMessage(user_id=member_id, chat_id=group_id, text="我要参加抽奖")
+    auto_message.chat.title = "Lottery rules"
+    await moderation.on_group_message(auto_message, bot)
+    async with session_scope() as session:
+        entry_count = int(await session.scalar(
+            select(func.count(LotteryEntry.id)).where(
+                LotteryEntry.lottery_id == keyword_lottery_id,
+                LotteryEntry.user_id == member_id,
+            )
+        ) or 0)
+        assert entry_count == 0
+    exact_message = FakeMessage(user_id=member_id, chat_id=group_id, text="抽奖")
+    exact_message.chat.title = "Lottery rules"
+    await moderation.on_group_message(exact_message, bot)
+    async with session_scope() as session:
+        entry_count = int(await session.scalar(
+            select(func.count(LotteryEntry.id)).where(
+                LotteryEntry.lottery_id == keyword_lottery_id,
+                LotteryEntry.user_id == member_id,
+            )
+        ) or 0)
+        assert entry_count == 1
+    history = FakeMessage(user_id=admin_id, chat_id=admin_id, text="/cjhistory")
+    await games.lottery_history(history)
+    assert any("我创建的抽奖" in text for text, _markup in history.sent_answers)
+    list_markup = next(
+        markup for _text, markup in history.sent_answers if markup is not None
+    )
+    assert any("关键词抽奖" in button.text for row in list_markup.inline_keyboard for button in row)
+    print("PASS keyword message automatically enters member and appears in history")
+    allowed = FakeCallback(
+        data=f"lot:{keyword_lottery_id}", user_id=member_id, chat_id=group_id
+    )
+    await games.on_lottery_join(allowed)
+    assert any("你已经参与过了" in answer for answer in allowed.answers), allowed.answers
+    print("PASS keyword lottery button recognizes automatic entry")
+
+    admin_bot = FakeBot()
+    admin_bot.membership[(group_id, admin_id)] = "administrator"
+    admin_message = FakeMessage(user_id=admin_id, chat_id=group_id, text="抽奖")
+    admin_message.chat.title = "Lottery rules"
+    await moderation.on_group_message(admin_message, admin_bot)
+    async with session_scope() as session:
+        admin_entry_count = int(
+            await session.scalar(
+                select(func.count(LotteryEntry.id)).where(
+                    LotteryEntry.lottery_id == keyword_lottery_id,
+                    LotteryEntry.user_id == admin_id,
+                )
+            )
+            or 0
+        )
+    assert admin_entry_count == 1
+    print("PASS group admin keyword message automatically enters lottery")
+
+    points_group = -100820093
+    points_admin = 820092
+    points_member = 820091
+    await create_group(points_group, "Lottery points")
+    bot.membership[(points_group, points_admin)] = "administrator"
+    await set_points(points_group, points_member, 5)
+    async with session_scope() as session:
+        points_lottery = Lottery(
+            group_id=points_group,
+            creator_id=points_admin,
+            title="积分抽奖",
+            prize="奖品B",
+            winners_count=1,
+            participation_type="points",
+            participation_value="100",
+            draw_type="time",
+            status="open",
+            ends_at=utcnow() + timedelta(minutes=30),
+        )
+        session.add(points_lottery)
+        await session.flush()
+        points_lottery_id = int(points_lottery.id)
+
+    poor = FakeCallback(
+        data=f"lot:{points_lottery_id}", user_id=points_member, chat_id=points_group
+    )
+    await games.on_lottery_join(poor)
+    assert any("需要至少 100 积分" in answer for answer in poor.answers), poor.answers
+    print("PASS points lottery rejects member below threshold")
+
+    async with session_scope() as session:
+        member = await session.scalar(
+            select(Member).where(
+                Member.group_id == points_group, Member.user_id == points_member
+            )
+        )
+        assert member is not None
+        member.points = 200
+    rich = FakeCallback(
+        data=f"lot:{points_lottery_id}", user_id=points_member, chat_id=points_group
+    )
+    await games.on_lottery_join(rich)
+    assert any("参与成功" in answer for answer in rich.answers), rich.answers
+    print("PASS points lottery accepts member at threshold")
+
+    message_group = -100820092
+    message_member = 820090
+    await create_group(message_group, "Lottery message count")
+    async with session_scope() as session:
+        session.add(
+            Member(
+                group_id=message_group,
+                user_id=message_member,
+                message_count=20,
+            )
+        )
+        message_lottery = Lottery(
+            group_id=message_group,
+            creator_id=820089,
+            title="发言数抽奖",
+            prize="奖品D",
+            winners_count=1,
+            participation_type="message_count",
+            participation_value="20",
+            draw_type="time",
+            status="open",
+            ends_at=utcnow() + timedelta(minutes=30),
+        )
+        session.add(message_lottery)
+        await session.flush()
+        message_lottery_id = int(message_lottery.id)
+    active_member = FakeCallback(
+        data=f"lot:{message_lottery_id}",
+        user_id=message_member,
+        chat_id=message_group,
+    )
+    await games.on_lottery_join(active_member)
+    assert any("参与成功" in answer for answer in active_member.answers)
+    print("PASS message-count lottery accepts member at threshold")
+
+
+async def test_lottery_creator_management() -> None:
+    group_id = -100820086
+    creator_id = 820086
+    other_id = 820085
+    await create_group(group_id, "Lottery management")
+    async with session_scope() as session:
+        session.add_all(
+            [
+                Lottery(
+                    group_id=group_id,
+                    creator_id=creator_id,
+                    title="可取消",
+                    prize="奖品",
+                    status="open",
+                    ends_at=utcnow() + timedelta(hours=1),
+                ),
+                Lottery(
+                    group_id=group_id,
+                    creator_id=other_id,
+                    title="他人的抽奖",
+                    prize="奖品",
+                    status="open",
+                    ends_at=utcnow() + timedelta(hours=1),
+                ),
+            ]
+        )
+        await session.flush()
+        creator_lottery = await session.scalar(
+            select(Lottery).where(Lottery.creator_id == creator_id)
+        )
+        other_lottery = await session.scalar(
+            select(Lottery).where(Lottery.creator_id == other_id)
+        )
+        assert creator_lottery is not None and other_lottery is not None
+        creator_lottery_id = int(creator_lottery.id)
+    history = FakeMessage(user_id=creator_id, chat_id=creator_id, text="/cjhistory")
+    await games.lottery_history(history)
+    listed = [text for text, _markup in history.sent_answers]
+    assert any("我创建的抽奖" in text for text in listed)
+    assert any(markup is not None for _text, markup in history.sent_answers)
+    view = FakeCallback(
+        data=f"lotmanage:view:{creator_lottery_id}",
+        user_id=creator_id,
+        chat_id=creator_id,
+    )
+    await games.lottery_management_callback(view, FakeBot())
+    assert view.message.answers
+    selection = FakeCallback(
+        data=f"lotmanage:select:{creator_lottery_id}",
+        user_id=creator_id,
+        chat_id=creator_id,
+    )
+    await games.lottery_management_callback(selection, FakeBot())
+    assert selection.message.answers
+    assert selection.message.answers[-1][1] is not None
+    edit = FakeCallback(
+        data=f"lotmanage:field:{creator_lottery_id}:title",
+        user_id=creator_id,
+        chat_id=creator_id,
+    )
+    await games.lottery_management_callback(edit, FakeBot())
+    edit_bot = FakeBot()
+    edit_bot.membership[(group_id, creator_id)] = "administrator"
+    await games.lottery_private_config(
+        FakeMessage(user_id=creator_id, chat_id=creator_id, text="Edited title"), edit_bot
+    )
+    await games.lottery_setup_callback(
+        FakeCallback(data="lotsetup:create", user_id=creator_id, chat_id=creator_id),
+        edit_bot,
+    )
+    async with session_scope() as session:
+        edited = await session.get(Lottery, creator_lottery_id)
+        total_created = int(
+            await session.scalar(
+                select(func.count(Lottery.id)).where(Lottery.creator_id == creator_id)
+            )
+            or 0
+        )
+        assert edited is not None and edited.title == "Edited title", (
+            edited.title if edited is not None else "missing"
+        )
+        assert total_created == 1
+    print("PASS edit flow updates existing lottery without duplicating it")
+
+    cancel = FakeCallback(
+        data=f"lotmanage:cancel:{creator_lottery_id}",
+        user_id=creator_id,
+        chat_id=creator_id,
+    )
+    await games.lottery_management_callback(cancel, FakeBot())
+    assert any("已取消" in answer for answer in cancel.answers)
+    async with session_scope() as session:
+        cancelled = await session.get(Lottery, creator_lottery_id)
+        assert cancelled is not None and cancelled.status == "cancelled"
+    cancelled_history = FakeMessage(
+        user_id=creator_id, chat_id=creator_id, text="/cjhistory"
+    )
+    await games.lottery_history(cancelled_history)
+    assert len(cancelled_history.sent_answers) == 1
+    assert "已取消" in cancelled_history.sent_answers[0][1].inline_keyboard[0][0].text
+    print("PASS creator can list, view, edit and cancel with management buttons")
+
+    denied = FakeMessage(
+        user_id=other_id, chat_id=other_id, text=f"/cjcancel {creator_lottery_id}"
+    )
+    await games.lottery_cancel_created(denied)
+    assert "找不到" in denied.replies[-1]
+    print("PASS other creator cannot cancel lottery")
+
+
+async def test_lottery_requires_admin() -> None:
+    group_id = -100820098
+    user_id = 820098
+    await create_group(group_id, "Lottery non-admin")
+    bot = FakeBot()
+    start = FakeMessage(user_id=user_id, chat_id=group_id, text="/cj")
+    await games.cmd_lottery(start, bot)
+    assert not bot.sent
+    assert start.replies
+    assert user_id not in games._lottery_drafts
+    print("PASS non-admin cannot start lottery setup")
+
+    anonymous = SimpleNamespace(
+        chat=FakeChat(group_id),
+        sender_chat=FakeChat(group_id),
+        from_user=None,
+        text="/cj",
+        message_id=702,
+        replies=[],
+    )
+
+    async def reply(text: str, **_kwargs) -> None:
+        anonymous.replies.append(text)
+
+    anonymous.reply = reply
+    await games.cmd_lottery(anonymous, bot)
+    assert any("匿名管理员身份无法接收私聊" in text for text in anonymous.replies)
+    print("PASS anonymous admin gets private-DM limitation instead of permission denial")
+
+
+async def test_anonymous_admin_context() -> None:
+    group_id = -100820096
+    await create_group(group_id, "Anonymous admin")
+    async with session_scope() as session:
+        group = await session.get(Group, group_id)
+        assert group is not None
+        group.delete_command_messages = False
+        await session.flush()
+        chat = FakeChat(group_id, "Anonymous admin")
+
+        anonymous_message = SimpleNamespace(
+            chat=chat,
+            from_user=None,
+            sender_chat=chat,
+            text="/ban",
+            message_id=701,
+        )
+        async def fake_reply(_text: str) -> None:
+            return None
+
+        anonymous_message.reply = fake_reply
+        result = await helpers.admin_context(
+            FakeBot(), session, anonymous_message, "ban"
+        )
+        assert result is not None and result[1] == group_id
+        anonymous_message.sender_chat = FakeChat(-100820095)
+        denied = await helpers.admin_context(
+            FakeBot(), session, anonymous_message, "ban"
+        )
+        assert denied is None
+    print("PASS same-group anonymous admin is recognized by admin context")
 
 
 async def create_group(group_id: int, title: str) -> None:
@@ -217,6 +800,12 @@ async def create_packet(
 
 
 async def run_tests() -> None:
+    await test_lottery_private_setup()
+    await test_lottery_wizard_back_and_expiry()
+    await test_lottery_participation_rules()
+    await test_lottery_creator_management()
+    await test_lottery_requires_admin()
+    await test_anonymous_admin_context()
     # ------------------------------------------------------------------
     # 1. 竞拍正常路径
     # ------------------------------------------------------------------

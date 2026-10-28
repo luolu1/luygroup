@@ -42,6 +42,7 @@ from app.models import (  # noqa: E402
     Group,
     Lottery,
     LotteryEntry,
+    LotteryWinner,
     Member,
     PointsTransaction,
     RedPacket,
@@ -150,10 +151,74 @@ async def run_tests() -> None:
             settled is not None and settled.status == "drawn",
             settled.status if settled else "missing",
         )
+        winners = (
+            await session.scalars(
+                select(LotteryWinner.user_id).where(LotteryWinner.lottery_id == lottery_id)
+            )
+        ).all()
+        check(
+            "lottery winners are persisted",
+            len(winners) == 1 and int(winners[0]) in {810101, 810102},
+            str(winners),
+        )
         check(
             "empty lottery status drawn after first claim",
             empty_settled is not None and empty_settled.status == "drawn",
             empty_settled.status if empty_settled else "missing",
+        )
+
+    participant_group = -100810009
+    await create_group(participant_group, "Participant-count lottery")
+    async with session_scope() as session:
+        participant_lottery = Lottery(
+            group_id=participant_group,
+            creator_id=810009,
+            title="人数开奖",
+            prize="奖品C",
+            winners_count=1,
+            participation_type="none",
+            draw_type="participant",
+            draw_participant_count=2,
+            claim_contact="@lottery_admin",
+            status="open",
+            ends_at=None,
+        )
+        session.add(participant_lottery)
+        await session.flush()
+        participant_lottery_id = int(participant_lottery.id)
+        session.add(LotteryEntry(lottery_id=participant_lottery_id, user_id=810901))
+
+    participant_bot = FakeBot()
+    await scheduler.draw_lotteries(participant_bot)
+    async with session_scope() as session:
+        waiting = await session.get(Lottery, participant_lottery_id)
+        check(
+            "participant lottery waits below threshold",
+            waiting is not None and waiting.status == "open",
+            waiting.status if waiting else "missing",
+        )
+
+    async with session_scope() as session:
+        session.add(LotteryEntry(lottery_id=participant_lottery_id, user_id=810902))
+    await scheduler.draw_lotteries(participant_bot)
+    await scheduler.draw_lotteries(participant_bot)
+    async with session_scope() as session:
+        participant_drawn = await session.get(Lottery, participant_lottery_id)
+        participant_messages = messages_for(
+            participant_bot, participant_group, "抽奖开奖"
+        )
+        check(
+            "participant lottery settles after threshold exactly once",
+            participant_drawn is not None
+            and participant_drawn.status == "drawn"
+            and len(participant_messages) == 1,
+            f"{participant_drawn.status if participant_drawn else 'missing'} {participant_messages}",
+        )
+        check(
+            "lottery announcement includes claim contact",
+            len(participant_messages) == 1
+            and "@lottery_admin" in participant_messages[0],
+            str(participant_messages),
         )
 
     # ------------------------------------------------------------------
