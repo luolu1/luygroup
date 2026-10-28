@@ -64,26 +64,74 @@
 
 <div class="card">
   <div class="spread">
-    <h2>待支付订单</h2>
-    <span class="faint small">创建后 5 分钟内有效</span>
+    <h2>我的抽奖</h2>
+    <span class="faint small">当前控制台账户创建的抽奖记录</span>
   </div>
-  {% if pending_orders %}
+  {% if my_lotteries %}
   <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>订单号</th><th>类型</th><th>应付金额</th><th>有效至</th><th>操作</th></tr>
+        <tr><th>编号</th><th>标题</th><th>群组</th><th>状态</th><th>报名人数</th><th>中奖者</th><th>开奖时间</th></tr>
       </thead>
       <tbody>
-        {% for order in pending_orders %}
+        {% for item in my_lotteries %}
+        <tr>
+          <td class="mono small">#{{ item.lottery.id }}</td>
+          <td>{{ item.lottery.title }}</td>
+          <td>{{ item.group_title }}</td>
+          <td>
+            {% if item.lottery.status == 'open' %}<span class="badge info">进行中</span>
+            {% elif item.lottery.status == 'drawn' %}<span class="badge ok">已开奖</span>
+            {% elif item.lottery.status == 'cancelled' %}<span class="badge">已取消</span>
+            {% else %}<span class="badge">{{ item.lottery.status }}</span>{% endif %}
+          </td>
+          <td>{{ item.entry_count }}</td>
+          <td>
+            {% if item.winner_ids %}{{ item.winner_ids|join(', ') }}{% else %}<span class="faint">—</span>{% endif %}
+          </td>
+          <td class="muted small">{{ item.lottery.ends_at|dt if item.lottery.ends_at else ('人数开奖' if item.lottery.draw_type == 'participant' else '—') }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="hint">暂无抽奖记录。</div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <div class="spread">
+    <h2>支付订单</h2>
+    <span class="faint small">未付款订单创建后 5 分钟内有效</span>
+  </div>
+  {% if orders %}
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>订单号</th><th>类型</th><th>应付金额</th><th>状态</th><th>创建时间</th><th>操作</th></tr>
+      </thead>
+      <tbody>
+        {% for order in orders %}
         <tr>
           <td class="mono small">{{ order.order_no }}</td>
           <td>{{ '订阅购买/续费' if order.purpose == 'subscription' else '余额充值' }}</td>
           <td>{{ (order.charge_cents or order.amount_cents + order.fee_cents)|money }} {{ order.charge_currency }}</td>
-          <td class="muted small">{{ order.expires_at|dt if order.expires_at else '—' }}</td>
           <td>
+            {% if order.status == 'paid' %}<span class="badge ok">已完成</span>
+            {% elif order.status == 'pending' %}<span class="badge info">待支付</span>
+            {% elif order.status == 'expired' %}<span class="badge">已过期</span>
+            {% else %}<span class="badge bad">{{ order.status }}</span>{% endif %}
+          </td>
+          <td class="muted small">{{ order.created_at|dt }}</td>
+          <td>
+            {% if order.status == 'pending' %}
             <form method="post" action="/account/orders/{{ order.order_no }}/pay">
               <button type="submit" class="ghost sm">继续付款</button>
             </form>
+            {% else %}
+            <span class="faint small">—</span>
+            {% endif %}
           </td>
         </tr>
         {% endfor %}
@@ -91,14 +139,14 @@
     </table>
   </div>
   {% else %}
-  <div class="hint">没有待支付订单。</div>
+  <div class="hint">暂无支付订单。</div>
   {% endif %}
 </div>
 
 <div class="card">
   <div class="spread">
-    <h2>账单记录</h2>
-    <span class="faint small">充值与订阅订单</span>
+    <h2>余额流水</h2>
+    <span class="faint small">账户余额变动明细</span>
   </div>
   {% if bills %}
   <table>
