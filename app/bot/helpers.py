@@ -7,7 +7,7 @@ import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Iterable
+from collections.abc import Iterable
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
@@ -26,6 +26,8 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _admin_cache: dict[tuple[int, int], tuple[bool, float]] = {}
 _ADMIN_TTL = 60.0
+_background_tasks: set[asyncio.Task[None]] = set()
+NOTICE_TTL_SECONDS = 12.0
 
 
 async def is_telegram_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
@@ -88,7 +90,12 @@ async def admin_context(
     if chat.type not in {"group", "supergroup"}:
         await message.reply("该命令只能在群组中使用。")
         return None
-    if message.from_user is None:
+    anonymous_group = (
+        message.from_user is None
+        and message.sender_chat is not None
+        and message.sender_chat.id == chat.id
+    )
+    if message.from_user is None and not anonymous_group:
         return None
     group = await repo.ensure_group(
         session,
@@ -97,14 +104,20 @@ async def admin_context(
         username=chat.username or "",
         chat_type=chat.type,
     )
-    if not await has_permission(bot, session, chat.id, message.from_user.id, permission):
+    actor_id = message.from_user.id if message.from_user is not None else chat.id
+    allowed = anonymous_group or await has_permission(
+        bot, session, chat.id, actor_id, permission
+    )
+    if not allowed:
         await message.reply("⛔ 你没有权限执行此操作。")
         return None
     if group.delete_command_messages and (message.text or "").startswith("/"):
-        asyncio.create_task(
+        task = asyncio.create_task(
             delete_message_safe(bot, chat.id, message.message_id, delay=2)
         )
-    return group, message.from_user.id
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    return group, actor_id
 
 
 async def can_moderate_target(bot: Bot, session: AsyncSession, group_id: int, target_id: int) -> tuple[bool, str]:
@@ -227,6 +240,28 @@ async def delete_message_safe(
         return False
     except TelegramAPIError:
         return False
+
+
+async def send_temp_notice(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    *,
+    delay: float | None = None,
+) -> int | None:
+    try:
+        sent = await bot.send_message(chat_id, text)
+    except TelegramAPIError:
+        return None
+    ttl = NOTICE_TTL_SECONDS if delay is None else delay
+    if ttl <= 0:
+        return sent.message_id
+    task = asyncio.create_task(
+        delete_message_safe(bot, chat_id, sent.message_id, delay=ttl)
+    )
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return sent.message_id
 
 
 async def mute_user(
