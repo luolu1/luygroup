@@ -32,6 +32,8 @@ PRIVATE_COMMANDS = [
     BotCommand(command="unbanme", description="自助解封"),
     BotCommand(command="unmuteme", description="自助解除禁言"),
     BotCommand(command="cjtz", description="开启/关闭抽奖推送"),
+    BotCommand(command="cjhistory", description="查看我创建的抽奖"),
+    BotCommand(command="cjcancel", description="取消未开奖抽奖"),
     BotCommand(command="jptz", description="开启/关闭竞拍推送"),
 ]
 
@@ -47,7 +49,7 @@ GROUP_COMMANDS = [
     BotCommand(command="cf", description="查询封禁历史等原因"),
     BotCommand(command="jf", description="查看自己的积分"),
     BotCommand(command="id", description="查询用户/群 ID"),
-    BotCommand(command="cj", description="发起抽奖"),
+    BotCommand(command="cj", description="私聊配置抽奖"),
     BotCommand(command="jp", description="发起竞拍"),
 ]
 
