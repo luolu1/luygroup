@@ -83,7 +83,7 @@ def _admin_help() -> str:
 @router.message(Command("ban"))
 async def cmd_ban(message: Message, bot: Bot) -> None:
     async with session_scope() as session:
-        ctx = await helpers.admin_context(bot, session, message, "ban")
+        ctx = await helpers.telegram_admin_context(bot, session, message)
         if not ctx:
             return
         group, actor = ctx

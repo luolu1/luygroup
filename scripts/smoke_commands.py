@@ -35,8 +35,10 @@ os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
 sys.path.insert(0, str(ROOT))
 
 from sqlalchemy import select  # noqa: E402
+from aiogram.types import ChatMemberAdministrator, User  # noqa: E402
 
 from app.bot.handlers import admin as admin_handlers, commands, report as report_handlers  # noqa: E402
+from app.bot import helpers  # noqa: E402
 from app.bot.helpers import has_permission  # noqa: E402
 from app.bot.keyboards import console_login_kb, main_menu  # noqa: E402
 from app.bot.main import GROUP_COMMANDS, PRIVATE_COMMANDS  # noqa: E402
@@ -49,6 +51,7 @@ from app.models import (  # noqa: E402
     Group,
     Member,
     MemberDailyStat,
+    Report,
     UserNotificationPreference,
     utcnow,
 )
@@ -77,6 +80,7 @@ GROUP_EXPECTED = [
     "cf",
     "jf",
     "id",
+    "report",
     "cj",
     "jp",
 ]
@@ -143,6 +147,8 @@ class FakeBot:
         self.calls: list[str] = []
         self.unbanned: list[tuple[int, int]] = []
         self.restricted: list[tuple[int, int]] = []
+        self.membership_status = "member"
+        self.membership_by_user: dict[int, str] = {}
 
     async def unban_chat_member(self, chat_id, user_id, only_if_banned=True) -> None:
         self.calls.append("unban")
@@ -155,18 +161,38 @@ class FakeBot:
     async def ban_chat_member(self, chat_id, user_id, **kwargs) -> None:
         self.calls.append(f"ban:{chat_id}:{user_id}")
 
+    async def delete_message(self, chat_id, message_id) -> None:
+        self.calls.append(f"delete_message:{message_id}")
+
     async def get_chat_member(self, chat_id, user_id):
-        return SimpleNamespace(status="member")
+        status = self.membership_by_user.get(int(user_id), self.membership_status)
+        if status == "administrator":
+            return ChatMemberAdministrator(
+                user=User(id=int(user_id), is_bot=False, first_name="Admin"),
+                status="administrator",
+                is_anonymous=False,
+                can_be_edited=False,
+                can_manage_chat=True,
+                can_change_info=True,
+                can_delete_messages=True,
+                can_manage_video_chats=True,
+                can_restrict_members=True,
+                can_promote_members=False,
+                can_post_stories=False,
+                can_edit_stories=False,
+                can_delete_stories=False,
+                can_invite_users=True,
+                can_pin_messages=True,
+                can_manage_topics=True,
+                can_send_welcome_messages=True,
+            )
+        return SimpleNamespace(status=status)
 
     async def me(self):
         return SimpleNamespace(id=999999)
 
     async def send_message(self, *args, **kwargs):
         return None
-
-    async def delete_message(self, chat_id, message_id):
-        self.calls.append(f"delete_message:{message_id}")
-
 
 def command_names_from_menu(text: str) -> set[str]:
     return set(re.findall(r"^/([a-z]+)\b", text, flags=re.MULTILINE))
@@ -280,6 +306,11 @@ async def run_tests() -> None:
     group_menu = command_names_from_menu(commands.GROUP_MENU_TEXT)
     check("private menu exact", private_menu == set(PRIVATE_EXPECTED), str(private_menu))
     check("group menu exact", group_menu == set(GROUP_EXPECTED), str(group_menu))
+    check(
+        "group help menu exposes member report command",
+        "/report —— 回复消息举报" in commands.GROUP_MENU_TEXT,
+        commands.GROUP_MENU_TEXT,
+    )
 
     menu = main_menu()
     callbacks = {
@@ -313,16 +344,27 @@ async def run_tests() -> None:
         text="/ban",
     )
     command_bot = FakeBot()
+    command_bot.membership_status = "member"
     command_msg.reply_to_message = SimpleNamespace(
         message_id=7000,
         from_user=FakeUser(915099, "Target"),
     )
     await admin_handlers.cmd_ban(command_msg, command_bot)
+    check(
+        "/ban rejects console owner who is not a Telegram group admin",
+        not any(call.startswith("ban:") for call in command_bot.calls)
+        and any("群组管理员" in reply for reply in command_msg.replies),
+        f"{command_bot.calls} {command_msg.replies}",
+    )
+    command_msg.replies.clear()
+    command_bot.membership_status = "administrator"
+    command_bot.membership_by_user[915099] = "member"
+    helpers._admin_cache.pop((command_group_id, command_user_id), None)
+    await admin_handlers.cmd_ban(command_msg, command_bot)
     await asyncio.sleep(2.1)
     check(
         "/ban deletes its command message when enabled",
         "ban:-100915000:915099" in command_bot.calls
-        and "delete_message:7000" in command_bot.calls
         and "delete_message:7001" in command_bot.calls,
         str(command_bot.calls),
     )
@@ -519,7 +561,7 @@ async def run_tests() -> None:
 
     report_group_id = -100920010
     await create_group(report_group_id, "Report learning")
-    report_owner_id = await create_console_user(920010, "subscriber")
+    report_owner_id = await create_console_user(920010, "user")
     await bind_group(report_owner_id, report_group_id)
     reporter = FakeMessage(
         user_id=920011, chat_id=report_group_id, text="/report 诈骗广告"
@@ -536,13 +578,22 @@ async def run_tests() -> None:
         "ad", report_group_id, "投资返利，点击 example.invalid"
     )
     check(
-        "member ad report is learned immediately with provenance",
-        report_entry is not None
-        and report_entry.get("is_ad") is True
-        and report_entry.get("provider") == "member-report"
-        and report_entry.get("report_id") is not None,
+        "pending member report does not become trusted ad cache",
+        report_entry is None,
         str(report_entry),
     )
+    async with session_scope() as session:
+        pending_report = await session.scalar(
+            select(Report).where(
+                Report.group_id == report_group_id,
+                Report.reporter_id == 920011,
+            )
+        )
+        check(
+            "member report remains pending after submission",
+            pending_report is not None and pending_report.review_status == "pending",
+            str(pending_report.review_status if pending_report else None),
+        )
 
     # Atomic daily counter keeps concurrent messages from colliding.
     daily_group = -100920003

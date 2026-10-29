@@ -120,6 +120,36 @@ async def admin_context(
     return group, actor_id
 
 
+async def telegram_admin_context(
+    bot: Bot,
+    session: AsyncSession,
+    message: Message,
+) -> tuple[Group, int] | None:
+    chat = message.chat
+    if chat.type not in {"group", "supergroup"} or message.from_user is None:
+        if chat.type not in {"group", "supergroup"}:
+            await message.reply("该命令只能在群组中使用。")
+        return None
+    group = await repo.ensure_group(
+        session,
+        chat.id,
+        title=chat.title or "",
+        username=chat.username or "",
+        chat_type=chat.type,
+    )
+    actor_id = int(message.from_user.id)
+    if not is_global_admin(actor_id) and not await is_telegram_admin(bot, group.id, actor_id):
+        await message.reply("⛔ 只有群组管理员可以执行此操作。")
+        return None
+    if group.delete_command_messages and (message.text or "").startswith("/"):
+        task = asyncio.create_task(
+            delete_message_safe(bot, chat.id, message.message_id, delay=2)
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    return group, actor_id
+
+
 async def can_moderate_target(bot: Bot, session: AsyncSession, group_id: int, target_id: int) -> tuple[bool, str]:
     if is_global_admin(target_id) or await repo.get_admin(session, group_id, target_id):
         return False, "对方是机器人管理员，不能对其操作。"
@@ -229,17 +259,30 @@ async def restrict_permanently(bot: Bot, chat_id: int, user_id: int) -> None:
 async def delete_message_safe(
     bot: Bot, chat_id: int, message_id: int | None, *, delay: float = 0
 ) -> bool:
+    deleted, _error = await delete_message_diagnostic(
+        bot, chat_id, message_id, delay=delay
+    )
+    return deleted
+
+
+async def delete_message_diagnostic(
+    bot: Bot, chat_id: int, message_id: int | None, *, delay: float = 0
+) -> tuple[bool, str | None]:
     if not message_id:
-        return False
+        return False, "缺少消息 ID"
     if delay > 0:
         await asyncio.sleep(delay)
     try:
         await bot.delete_message(chat_id, message_id)
-        return True
-    except (TelegramBadRequest, TelegramForbiddenError):
-        return False
-    except TelegramAPIError:
-        return False
+        return True, None
+    except (TelegramBadRequest, TelegramForbiddenError, TelegramAPIError) as exc:
+        log.warning(
+            "Failed to delete Telegram message chat=%s message=%s: %s",
+            chat_id,
+            message_id,
+            exc,
+        )
+        return False, str(exc)[:500] or exc.__class__.__name__
 
 
 async def send_temp_notice(
