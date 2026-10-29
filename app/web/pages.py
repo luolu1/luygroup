@@ -1458,6 +1458,14 @@ async def _fetch_bot_membership(chat_id: int) -> dict[str, Any]:
     )
 
 
+async def _fetch_user_membership(chat_id: int, user_id: int) -> dict[str, Any]:
+    return await _telegram_call(
+        "getChatMember",
+        {"chat_id": int(chat_id), "user_id": int(user_id)},
+        timeout=8,
+    )
+
+
 def _member_in_chat(member: dict[str, Any]) -> bool:
     status = str(member.get("status") or "")
     if status in {"creator", "administrator", "member"}:
@@ -1501,6 +1509,19 @@ async def add_group(
             ),
         )
     ent = _current_entitlements(request)
+    if not ent.is_superadmin:
+        telegram_id = ent.user.telegram_id if ent.user else None
+        if not telegram_id:
+            return _redirect("/groups", err="当前控制台账号未绑定 Telegram 身份")
+        try:
+            user_membership = await _fetch_user_membership(group_id, int(telegram_id))
+        except ValueError as exc:
+            return _redirect("/groups", err=f"无法验证你的群组权限：{exc}")
+        if not _member_is_admin(user_membership):
+            return _redirect(
+                "/groups",
+                err="只有该 Telegram 群组的管理员才能绑定群组",
+            )
     existing_access = await session.scalar(
         select(ConsoleGroupAccess).where(
             ConsoleGroupAccess.user_id == admin_id,

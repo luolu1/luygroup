@@ -67,6 +67,14 @@ async def fake_group_ref(ref: str) -> dict:
 
 web_pages._fetch_bot_membership = fake_bot_membership
 web_pages._fetch_telegram_group = fake_group_ref
+group_admin_status: dict[int, str] = {9001: "member"}
+
+
+async def fake_user_membership(chat_id: int, user_id: int) -> dict:
+    return {"status": group_admin_status.get(user_id, "left")}
+
+
+web_pages._fetch_user_membership = fake_user_membership
 
 failures: list[str] = []
 
@@ -92,6 +100,13 @@ async def group_limit_for(user_id: int) -> int | None:
     async with session_scope() as session:
         user = await session.get(ConsoleUser, user_id)
         return (await build_for_user(session, user)).group_limit
+
+
+async def plan_entitlement_for(user_id: int) -> tuple[int | None, frozenset[str]]:
+    async with session_scope() as session:
+        user = await session.get(ConsoleUser, user_id)
+        entitlements = await build_for_user(session, user)
+        return entitlements.group_limit, entitlements.features
 
 
 try:
@@ -135,6 +150,31 @@ try:
             (
                 sub_id,
                 plan_id,
+                now.strftime("%Y-%m-%d %H:%M:%S.%f"),
+                future,
+            ),
+        )
+        con.execute(
+            "INSERT INTO console_users (telegram_id, display_name, token_hash, role, is_active, balance_cents) "
+            "VALUES (9004, 'Custom Plan User', ?, 'subscriber', 1, 0)",
+            (hash_console_token("custom-plan-token"),),
+        )
+        custom_user_id = int(
+            con.execute("SELECT id FROM console_users WHERE telegram_id=9004").fetchone()[0]
+        )
+        custom_plan_id = int(
+            con.execute(
+                "INSERT INTO subscription_plans (name, label, features, group_limit, "
+                "ai_daily_quota, sample_daily_quota, enabled) VALUES (?, ?, ?, ?, ?, ?, 1)",
+                ("smoke-limited", "Limited", '["games"]', 3, 17, 23),
+            ).lastrowid
+        )
+        con.execute(
+            "INSERT INTO subscriptions (user_id, plan_id, status, starts_at, expires_at) "
+            "VALUES (?, ?, 'active', ?, ?)",
+            (
+                custom_user_id,
+                custom_plan_id,
                 now.strftime("%Y-%m-%d %H:%M:%S.%f"),
                 future,
             ),
@@ -263,14 +303,27 @@ try:
             "/groups/add", data={"chat": "@shouldnotadd"}, follow_redirects=False
         )
         check(
-            "basic second group is allowed",
+            "non-admin cannot claim an unbound group",
+            r.status_code == 303 and "err=" in r.headers.get("location", ""),
+            str(r.headers),
+        )
+        con = connect()
+        stray = con.execute("SELECT COUNT(*) FROM groups WHERE id=-1009999999999").fetchone()[0]
+        con.close()
+        check("non-admin group claim creates no group record", stray == 0, str(stray))
+        group_admin_status[9001] = "administrator"
+        r = client.post(
+            "/groups/add", data={"chat": "@shouldnotadd"}, follow_redirects=False
+        )
+        check(
+            "group admin can bind an unbound group",
             r.status_code == 303 and "msg=" in r.headers.get("location", ""),
             str(r.headers),
         )
         con = connect()
         stray = con.execute("SELECT COUNT(*) FROM groups WHERE id=-1009999999999").fetchone()[0]
         con.close()
-        check("basic second group was created", stray == 1, str(stray))
+        check("admin binding creates group record", stray == 1, str(stray))
         async def third_group(_ref: str) -> dict:
             return {
                 "id": -1009999999998,
@@ -297,6 +350,15 @@ try:
         # ------------------------------------------------------- subscriber user
         check("subscriber login", login(client, tokens["sub"]))
         check("subscriber group limit is five", asyncio.run(group_limit_for(sub_id)) == 5)
+        custom_limit, custom_features = asyncio.run(plan_entitlement_for(custom_user_id))
+        check(
+            "custom plan applies feature list and group limit",
+            custom_limit == 3
+            and "games" in custom_features
+            and "ai" not in custom_features
+            and "settings" in custom_features,
+            f"limit={custom_limit} features={sorted(custom_features)}",
+        )
         r = client.get("/account")
         check("subscriber can access account and renewal page", r.status_code == 200 and "续费一个月" in r.text and "¥8.00" in r.text)
         for path in ("/ai", "/blacklist", "/reports", "/stats"):

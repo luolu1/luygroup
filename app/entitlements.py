@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .models import (
     ConsoleGroupAccess,
     ConsoleUser,
+    JsonMixin,
     Subscription,
     SubscriptionPlan,
     utcnow,
@@ -280,12 +281,23 @@ async def build_for_user(
             sample_daily_quota=0,
         )
 
-    group_limit = 5
+    if plan is None:
+        features = ALL_FEATURES
+        group_limit = 5
+    else:
+        configured_features = JsonMixin.loads(plan.features, [])
+        plan_features = {
+            str(feature).strip()
+            for feature in configured_features
+            if str(feature).strip()
+        } if isinstance(configured_features, list) else set()
+        features = BASIC_FEATURES | frozenset(plan_features)
+        group_limit = int(plan.group_limit or 5)
     ai_quota = int(plan.ai_daily_quota) if plan and plan.ai_daily_quota else 200
     sample_quota = int(plan.sample_daily_quota) if plan and plan.sample_daily_quota else 500
     return Entitlements(
         user=user,
-        features=ALL_FEATURES,
+        features=frozenset(features),
         advanced=True,
         plan=plan,
         subscription=subscription,
