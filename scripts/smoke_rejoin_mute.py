@@ -37,7 +37,7 @@ from sqlalchemy import select  # noqa: E402
 from app.bot import captcha, helpers  # noqa: E402
 from app.bot.handlers import join  # noqa: E402
 from app.db import init_db, session_scope  # noqa: E402
-from app.models import AdminLog, Group, Member, Verification, utcnow  # noqa: E402
+from app.models import AdminLog, Group, InviteCode, Member, Verification, utcnow  # noqa: E402
 
 CHAT_ID = -1009876543210
 USER_ID = 7788
@@ -158,6 +158,35 @@ async def reset_member(*, mute_on_rejoin: bool, verified: bool = False) -> None:
         member.mute_on_rejoin = mute_on_rejoin
 
 
+async def test_disabled_invite_redemption_keeps_code_usage() -> None:
+    async with session_scope() as session:
+        group = await session.get(Group, CHAT_ID)
+        assert group is not None
+        group.invite_redemption = False
+        session.add(
+            InviteCode(
+                group_id=CHAT_ID,
+                code="disabled-redemption",
+                link="https://t.me/+disabled-redemption",
+                uses=0,
+                max_uses=1,
+                active=True,
+            )
+        )
+    redeemed = await join.redeem_invite(
+        FakeBot(), CHAT_ID, USER_ID, "https://t.me/+disabled-redemption", FakeUser()
+    )
+    async with session_scope() as session:
+        code = await session.scalar(
+            select(InviteCode).where(InviteCode.code == "disabled-redemption")
+        )
+        check(
+            "disabled invite redemption does not consume code",
+            not redeemed and code is not None and code.uses == 0 and code.active,
+            str((redeemed, code.uses if code else None, code.active if code else None)),
+        )
+
+
 async def main() -> None:
     await init_db()
     async with session_scope() as session:
@@ -173,6 +202,7 @@ async def main() -> None:
             )
         )
     await reset_member(mute_on_rejoin=False)
+    await test_disabled_invite_redemption_keeps_code_usage()
 
     # 1. A flagged member rejoining a group without verification is muted
     # immediately and permanently.

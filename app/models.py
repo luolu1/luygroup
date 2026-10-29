@@ -465,6 +465,7 @@ class Verification(Base):
     token = Column(String(64), unique=True, index=True)
     status = Column(String(16), default="pending")  # pending / passed / timeout / kicked
     message_id = Column(BigInteger, nullable=True)
+    message_chat_id = Column(BigInteger, nullable=True)
     created_at = Column(DateTime, default=utcnow)
     passed_at = Column(DateTime, nullable=True)
     failed_attempts = Column(Integer, default=0)

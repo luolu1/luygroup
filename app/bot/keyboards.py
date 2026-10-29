@@ -55,6 +55,12 @@ def verification_kb(
     return builder.as_markup()
 
 
+def verification_private_kb(url: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text="🔐 开始私聊验证", url=url))
+    return builder.as_markup()
+
+
 def redpacket_kb(packet_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="🧧 领取红包", callback_data=f"rp:{packet_id}"))

@@ -176,7 +176,7 @@ async def _send_verify_prompt(
     channels: list[RequiredChannel],
     missing: list[RequiredChannel],
     require_username: bool | None = None,
-) -> int | None:
+) -> tuple[int, int] | None:
     code = captcha.captcha_code(token)
     options = captcha.captcha_options(token)
     image = captcha.render_captcha(code)
@@ -217,14 +217,53 @@ async def _send_verify_prompt(
     ]
     try:
         sent = await bot.send_photo(
-            group.id,
+            user.id,
             BufferedInputFile(image, filename="groupguard-captcha.png"),
             caption=caption,
             reply_markup=keyboards.verification_kb(token, links, options),
         )
-        return sent.message_id
+        return sent.message_id, user.id
     except TelegramAPIError:
-        return None
+        username = await helpers.get_bot_username(bot)
+        if not username:
+            return None
+        try:
+            sent = await bot.send_message(
+                group.id,
+                f"🔐 {user.mention_html()}，请点击按钮打开机器人私聊完成入群验证。",
+                reply_markup=keyboards.verification_private_kb(
+                    f"https://t.me/{username}?start=verify_{token}"
+                ),
+            )
+            return sent.message_id, group.id
+        except TelegramAPIError:
+            return None
+
+
+async def send_private_verification(bot: Bot, token: str) -> bool:
+    async with session_scope() as session:
+        verification = await session.scalar(
+            select(Verification).where(Verification.token == token)
+        )
+        if verification is None or verification.status != "pending":
+            return False
+        group = await repo.get_group(session, verification.group_id)
+        if group is None:
+            return False
+        user = User(id=verification.user_id, is_bot=False, first_name="用户")
+        missing = await missing_channels(bot, group.id, user.id)
+        sent = await _send_verify_prompt(
+            bot,
+            group,
+            user,
+            verification.token,
+            await _group_channels(session, group.id),
+            missing,
+        )
+        if not sent:
+            return False
+        verification.message_id, verification.message_chat_id = sent
+        return True
 
 
 def _channel_label(channel: RequiredChannel) -> str:
@@ -294,7 +333,7 @@ async def _start_verification(
     await session.flush()
     channels = await _group_channels(session, group.id)
     advanced_join = await group_feature_allowed(session, group.id, "verify_advanced")
-    message_id = await _send_verify_prompt(
+    sent = await _send_verify_prompt(
         bot,
         group,
         user,
@@ -303,13 +342,21 @@ async def _start_verification(
         missing,
         require_username=bool(advanced_join and group.require_username),
     )
-    if message_id:
-        verification.message_id = message_id
+    if sent:
+        verification.message_id, verification.message_chat_id = sent
         for old_message_id in old_message_ids:
-            if old_message_id == message_id:
+            if old_message_id == verification.message_id:
                 continue
+            old_chat_id = next(
+                (
+                    item.message_chat_id
+                    for item in old
+                    if item.message_id == old_message_id
+                ),
+                group.id,
+            )
             if not await helpers.delete_message_safe(
-                bot, group.id, old_message_id
+                bot, old_chat_id, old_message_id
             ):
                 log.debug(
                     "could not delete old verification prompt group=%s message=%s",
@@ -341,13 +388,13 @@ async def redeem_invite(
             return False
         if code.max_uses and code.uses >= code.max_uses:
             return False
+        if not group.invite_redemption:
+            return False
         code.uses = (code.uses or 0) + 1
         if code.max_uses and code.uses >= code.max_uses:
             code.active = False
         await repo.add_log(session, group.id, None, "invite_used", user_id, f"code {code.code}")
 
-        if not group.invite_redemption:
-            return False
         member = await repo.ensure_member(
             session,
             group.id,
@@ -711,7 +758,7 @@ async def on_chat_member(update: ChatMemberUpdated, bot: Bot) -> None:
                 invite_redeemed=invite_redeemed,
             )
     elif left:
-        pending_messages: list[int] = []
+        pending_messages: list[tuple[int, int]] = []
         async with session_scope() as session:
             member = await repo.get_member(session, group.id, update.new_chat_member.user.id)
             if member:
@@ -732,10 +779,15 @@ async def on_chat_member(update: ChatMemberUpdated, bot: Bot) -> None:
             for verification in pending:
                 verification.status = "expired"
                 if verification.message_id:
-                    pending_messages.append(verification.message_id)
+                    pending_messages.append(
+                        (
+                            int(verification.message_chat_id or group.id),
+                            int(verification.message_id),
+                        )
+                    )
             await repo.bump_stat(session, group.id, "leaves")
-        for message_id in pending_messages:
-            if not await helpers.delete_message_safe(bot, group.id, message_id):
+        for message_chat_id, message_id in pending_messages:
+            if not await helpers.delete_message_safe(bot, message_chat_id, message_id):
                 log.debug(
                     "could not delete verification prompt after leave "
                     "group=%s message=%s",
@@ -879,8 +931,9 @@ async def on_verify(callback: CallbackQuery, bot: Bot) -> None:
             prompt_message_id = verification.message_id or getattr(
                 callback.message, "message_id", None
             )
+            prompt_chat_id = verification.message_chat_id or group.id
             if prompt_message_id and not await helpers.delete_message_safe(
-                bot, group.id, prompt_message_id
+                bot, prompt_chat_id, prompt_message_id
             ):
                 log.debug(
                     "could not delete kicked user's verification prompt "
@@ -931,8 +984,9 @@ async def on_verify(callback: CallbackQuery, bot: Bot) -> None:
         prompt_message_id = verification.message_id or getattr(
             callback.message, "message_id", None
         )
+        prompt_chat_id = verification.message_chat_id or group.id
         if prompt_message_id and not await helpers.delete_message_safe(
-            bot, group.id, prompt_message_id
+            bot, prompt_chat_id, prompt_message_id
         ):
             log.debug(
                 "could not delete passed verification prompt group=%s message=%s",

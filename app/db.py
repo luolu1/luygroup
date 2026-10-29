@@ -101,6 +101,7 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
         },
         "verifications": {
             "failed_attempts": "INTEGER DEFAULT 0",
+            "message_chat_id": "BIGINT",
         },
         "console_users": {
             "token_value": "VARCHAR(128)",

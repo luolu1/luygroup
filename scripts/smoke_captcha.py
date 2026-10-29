@@ -88,6 +88,7 @@ class FakeBot:
         self.calls: list[str] = []
         self.captions: list[str] = []
         self.messages: list[str] = []
+        self.photo_chats: list[int] = []
         self.deleted: list[int] = []
         self.next_id = 100
 
@@ -96,6 +97,7 @@ class FakeBot:
 
     async def send_photo(self, chat_id, photo, caption=None, reply_markup=None):
         self.calls.append("send_photo")
+        self.photo_chats.append(int(chat_id))
         self.captions.append(caption or "")
         self.next_id += 1
         return SimpleNamespace(message_id=self.next_id)
@@ -184,6 +186,11 @@ async def main() -> None:
     check("first wrong answer tells remaining attempts", "还可尝试 2 次" in cb1.answers[-1][0])
     check("first wrong answer deletes old prompt", 50 in bot.deleted)
     check("first wrong answer sends new image", bot.calls.count("send_photo") == 1)
+    check(
+        "captcha image is sent to private chat",
+        bot.photo_chats == [USER_ID],
+        str(bot.photo_chats),
+    )
     check(
         "captcha text says one attempt",
         "每个验证码仅可尝试一次" in bot.captions[-1],

@@ -166,7 +166,7 @@ async def _delete_verification_message(
 
 
 async def expire_verifications(bot: Bot) -> None:
-    expired: list[tuple[int, int, str, int | None, bool]] = []
+    expired: list[tuple[int, int, str, int | None, int, bool]] = []
     async with session_scope() as session:
         now = utcnow()
         pending = (
@@ -213,6 +213,7 @@ async def expire_verifications(bot: Bot) -> None:
                         verification.user_id,
                         str(verification.group_id),
                         verification.message_id,
+                        verification.message_chat_id or verification.group_id,
                         False,
                     )
                 )
@@ -239,14 +240,15 @@ async def expire_verifications(bot: Bot) -> None:
                     verification.user_id,
                     group.title or str(group.id),
                     verification.message_id,
+                    verification.message_chat_id or group.id,
                     bool(group.verify_enabled or channels),
                 )
             )
 
-    for chat_id, user_id, title, message_id, should_kick in expired:
+    for chat_id, user_id, title, message_id, message_chat_id, should_kick in expired:
         if should_kick:
             await _kick_timed_out(bot, chat_id, user_id, title)
-        await _delete_verification_message(bot, chat_id, message_id)
+        await _delete_verification_message(bot, message_chat_id, message_id)
 
 
 async def _claim_lottery(session, lottery_id: int) -> bool:
