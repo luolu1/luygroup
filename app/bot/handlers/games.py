@@ -64,6 +64,7 @@ class LotteryDraft:
 
 
 _lottery_drafts: dict[int, LotteryDraft] = {}
+_lottery_creating: set[int] = set()
 _lottery_history_page_size = 5
 
 # Keep strong references to fire-and-forget promotion pushes.  The event loop
@@ -1302,6 +1303,22 @@ async def _cancel_lottery(
 
 @router.callback_query(F.data.startswith("lotsetup:"))
 async def lottery_setup_callback(callback: CallbackQuery, bot: Bot) -> None:
+    action = (callback.data or "").split(":")[1:2]
+    if action == ["create"]:
+        user_id = callback.from_user.id
+        if user_id in _lottery_creating:
+            await callback.answer("抽奖正在发布，请稍候。")
+            return
+        _lottery_creating.add(user_id)
+        try:
+            await _lottery_setup_callback_impl(callback, bot)
+        finally:
+            _lottery_creating.discard(user_id)
+        return
+    await _lottery_setup_callback_impl(callback, bot)
+
+
+async def _lottery_setup_callback_impl(callback: CallbackQuery, bot: Bot) -> None:
     user_id = callback.from_user.id
     draft = _lottery_drafts.get(user_id)
     if callback.message is None or callback.message.chat.id != user_id or draft is None:

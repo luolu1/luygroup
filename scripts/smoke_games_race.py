@@ -86,8 +86,15 @@ class FakeBot:
         self.sent: list[tuple[int, str]] = []
         self.membership: dict[tuple[int, int], str] = {}
         self.next_message_id = 700
+        self.hold_send = False
+        self.send_started = asyncio.Event()
+        self.send_release = asyncio.Event()
+        self.send_release.set()
 
     async def send_message(self, chat_id: int, text: str, **kwargs):
+        if self.hold_send:
+            self.send_started.set()
+            await self.send_release.wait()
         self.sent.append((int(chat_id), text))
         self.next_message_id += 1
         return SimpleNamespace(message_id=self.next_message_id)
@@ -231,6 +238,50 @@ async def test_lottery_private_setup() -> None:
         assert lottery.ends_at == configured_draw_at
     assert any(chat_id == group_id and "周末抽奖" in text for chat_id, text in bot.sent)
     print("PASS group admin walks the private wizard and creates a time lottery")
+    games._lottery_drafts.pop(user_id, None)
+
+    games._lottery_drafts[user_id] = replace(
+        games._lottery_drafts.get(user_id)
+        or games.LotteryDraft(
+            user_id=user_id,
+            group_id=group_id,
+            created_at=utcnow(),
+            step="confirm",
+            title="Concurrent lottery",
+            prize="Prize",
+        ),
+        step="confirm",
+        title="Concurrent lottery",
+        prize="Prize",
+    )
+    bot.hold_send = True
+    bot.send_release.clear()
+    sent_before = len(bot.sent)
+    first_confirm = FakeCallback(
+        data="lotsetup:create", user_id=user_id, chat_id=user_id
+    )
+    second_confirm = FakeCallback(
+        data="lotsetup:create", user_id=user_id, chat_id=user_id
+    )
+    first_task = asyncio.create_task(games.lottery_setup_callback(first_confirm, bot))
+    await bot.send_started.wait()
+    second_task = asyncio.create_task(games.lottery_setup_callback(second_confirm, bot))
+    await second_task
+    bot.send_release.set()
+    await first_task
+    async with session_scope() as session:
+        concurrent_count = int(
+            await session.scalar(
+                select(func.count(Lottery.id)).where(
+                    Lottery.group_id == group_id,
+                    Lottery.title == "Concurrent lottery",
+                )
+            )
+            or 0
+        )
+    assert concurrent_count == 1
+    assert len(bot.sent) == sent_before + 1
+    print("PASS duplicate lottery confirmation creates and publishes once")
     games._lottery_drafts.pop(user_id, None)
 
     revoked_group_id = -100820097
