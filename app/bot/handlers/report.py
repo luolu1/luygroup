@@ -11,10 +11,8 @@ from sqlalchemy import select
 
 from ...config import is_global_admin
 from ...db import session_scope
-from ...entitlements import group_feature_allowed
 from ...models import Report, ReportLink
 from ...services import repo
-from ...services.ai import learning_store
 from .. import helpers
 
 router = Router(name="report")
@@ -62,9 +60,6 @@ async def cmd_report(message: Message, bot: Bot) -> None:
         if not group.report_enabled:
             await message.reply("本群暂未开启举报通报功能。")
             return
-        if not await group_feature_allowed(session, group.id, "reports"):
-            await message.reply("举报通报属于订阅版功能，请联系群主升级。")
-            return
         if target.id == (await bot.me()).id:
             await message.reply("不能举报机器人。")
             return
@@ -86,21 +81,6 @@ async def cmd_report(message: Message, bot: Bot) -> None:
         session.add(report)
         await session.flush()
         report_id = report.id
-        if excerpt:
-            await learning_store.put(
-                "ad",
-                group.id,
-                excerpt,
-                "广告举报（待管理员审核）",
-                meta={
-                    "provider": "member-report",
-                    "is_ad": True,
-                    "reason": reason,
-                    "report_id": report_id,
-                    "reporter_id": message.from_user.id,
-                },
-            )
-
         destinations: set[int] = set()
         if group.report_chat_id:
             destinations.add(int(group.report_chat_id))

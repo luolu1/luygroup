@@ -49,6 +49,7 @@ GROUP_COMMANDS = [
     BotCommand(command="cf", description="查询封禁历史等原因"),
     BotCommand(command="jf", description="查看自己的积分"),
     BotCommand(command="id", description="查询用户/群 ID"),
+    BotCommand(command="report", description="回复消息举报"),
     BotCommand(command="cj", description="私聊配置抽奖"),
     BotCommand(command="jp", description="发起竞拍"),
 ]

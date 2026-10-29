@@ -62,6 +62,7 @@ GROUP_MENU_TEXT = (
     "/cf —— 查询封禁历史等原因\n"
     "/jf —— 查看自己的积分\n"
     "/id —— 查询用户/群 ID\n"
+    "/report —— 回复消息举报\n"
     "/cj —— 群内管理员发起，私聊配置抽奖\n"
     "/jp 物品 | 起拍价 [加价幅度] [分钟] —— 发起竞拍\n\n"
     "进群验证、反广告、警告、关键词、必关频道等设置由管理员在群内或控制台配置。\n"
@@ -72,6 +73,20 @@ GROUP_MENU_TEXT = (
 @router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot) -> None:
     if message.chat.type == "private":
+        payload = (message.text or "").split(maxsplit=1)
+        if len(payload) == 2 and payload[1].startswith("verify_"):
+            from ...models import Verification
+            from ..handlers.join import send_private_verification
+
+            token = payload[1][7:]
+            async with session_scope() as session:
+                verification = await session.scalar(
+                    select(Verification).where(Verification.token == token)
+                )
+                if verification is not None and verification.status == "pending":
+                    await send_private_verification(bot, token)
+                    await message.answer("请完成上方图片验证码。")
+                    return
         await _ensure_console_user(message)
         greeting = (
             f"👋 你好，我是 <b>@{escape(await helpers.get_bot_username(bot) or 'luygroup')}</b>，luygroup 群组管理机器人。\n"
