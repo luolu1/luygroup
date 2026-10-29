@@ -292,10 +292,23 @@ async def _apply_detection(
 ) -> None:
     target = helpers.Target(user.id, user.first_name or "", user.username or "")
     deleted = False
+    delete_error: str | None = None
     if group.auto_delete_messages and detection.action != "reply":
-        deleted = await helpers.delete_message_safe(bot, group.id, message.message_id)
+        deleted, delete_error = await helpers.delete_message_diagnostic(
+            bot, group.id, message.message_id
+        )
     if deleted:
         await repo.bump_stat(session, group.id, "deletes")
+    elif group.auto_delete_messages and detection.action != "reply":
+        await repo.add_log(
+            session,
+            group.id,
+            None,
+            "auto_delete_failed",
+            user.id,
+            f"[{detection.source}] message={message.message_id} "
+            f"error={delete_error or 'unknown'}",
+        )
     await repo.record_hit(
         session,
         group.id,
