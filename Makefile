@@ -3,7 +3,7 @@ VENV := .venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
 
-.PHONY: help venv install init-config run run-bot run-web check lint format smoke smoke-permissions smoke-entitlement-queries smoke-captcha smoke-rejoin smoke-scheduler smoke-scheduler-queries smoke-scheduler-idempotency smoke-bot-recovery smoke-subscription-purchase smoke-payments smoke-commands smoke-games-race smoke-economy-claims docker-build docker-up docker-down docker-logs clean
+.PHONY: help venv install init-config run run-bot run-web check lint format smoke smoke-ai-client smoke-permissions smoke-entitlement-queries smoke-captcha smoke-rejoin smoke-scheduler smoke-scheduler-queries smoke-scheduler-idempotency smoke-bot-recovery smoke-subscription-purchase smoke-payments smoke-commands smoke-games-race smoke-economy-claims docker-build docker-up docker-down docker-logs clean
 
 help:
 	@echo "luygroup 常用命令："
@@ -72,6 +72,9 @@ format: $(PYTHON)
 
 smoke: $(PYTHON)
 	$(PYTHON) scripts/smoke_web.py
+
+smoke-ai-client: $(PYTHON)
+	$(PYTHON) scripts/smoke_ai_client.py
 
 smoke-permissions: $(PYTHON)
 	$(PYTHON) scripts/smoke_permissions.py

@@ -319,50 +319,50 @@ async def chat(
     last_error = ""
     attempts = 0
 
-    for provider in providers:
-        attempts += 1
-        endpoint = _endpoint(provider.base_url)
-        headers = {"Content-Type": "application/json"}
-        if provider.api_key:
-            headers["Authorization"] = f"Bearer {provider.api_key}"
-        payload: dict[str, Any] = {
-            "model": provider.model,
-            "messages": messages,
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
-        if json_mode:
-            payload["response_format"] = {"type": "json_object"}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for provider in providers:
+            attempts += 1
+            endpoint = _endpoint(provider.base_url)
+            headers = {"Content-Type": "application/json"}
+            if provider.api_key:
+                headers["Authorization"] = f"Bearer {provider.api_key}"
+            payload: dict[str, Any] = {
+                "model": provider.model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            if json_mode:
+                payload["response_format"] = {"type": "json_object"}
 
-        started = time.monotonic()
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            started = time.monotonic()
+            try:
                 response = await client.post(endpoint, headers=headers, json=payload)
-            latency = int((time.monotonic() - started) * 1000)
-            if response.status_code >= 400:
-                last_error = f"{provider.name}: HTTP {response.status_code} {response.text[:200]}"
+                latency = int((time.monotonic() - started) * 1000)
+                if response.status_code >= 400:
+                    last_error = f"{provider.name}: HTTP {response.status_code} {response.text[:200]}"
+                    continue
+                data = response.json()
+                text = (
+                    data.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
+                if isinstance(text, list):
+                    text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
+                if not text:
+                    last_error = f"{provider.name}: 空响应"
+                    continue
+                return AIResult(
+                    ok=True,
+                    text=text.strip(),
+                    provider=provider.name,
+                    latency_ms=latency,
+                    attempts=attempts,
+                )
+            except Exception as exc:
+                last_error = f"{provider.name}: {type(exc).__name__}: {exc}"
                 continue
-            data = response.json()
-            text = (
-                data.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
-            if isinstance(text, list):  # some providers return content parts
-                text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
-            if not text:
-                last_error = f"{provider.name}: 空响应"
-                continue
-            return AIResult(
-                ok=True,
-                text=text.strip(),
-                provider=provider.name,
-                latency_ms=latency,
-                attempts=attempts,
-            )
-        except Exception as exc:  # network/JSON errors fall through to backup
-            last_error = f"{provider.name}: {type(exc).__name__}: {exc}"
-            continue
 
     return AIResult(ok=False, error=last_error or "AI 调用失败", attempts=attempts)
 
