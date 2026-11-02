@@ -1,6 +1,7 @@
 """Real-time message moderation, flood control and AI mention replies."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 
 from aiogram import Bot, F, Router
@@ -17,6 +18,7 @@ from ...services import ai, detect, lottery_rules, quota, repo
 from .. import helpers
 
 router = Router(name="moderation")
+log = logging.getLogger(__name__)
 
 _flood: dict[tuple[int, int], list[datetime]] = {}
 
@@ -237,8 +239,8 @@ async def on_group_message(message: Message, bot: Bot) -> None:
             and await quota.allow_sample(session, group, access=await access.resolve())
             and await quota.allow_request(session, group, access=await access.resolve())
         ):
+            owner_user_id = (await access.resolve()).owner_id
             try:
-                owner_user_id = (await access.resolve()).owner_id
                 is_ad, reason, result = await ai.check_ad(
                     session,
                     text,
@@ -246,6 +248,31 @@ async def on_group_message(message: Message, bot: Bot) -> None:
                     group.id,
                     owner_user_id=owner_user_id,
                 )
+            except Exception:
+                log.exception(
+                    "AI moderation failed group=%s user=%s",
+                    group.id,
+                    user.id,
+                )
+                await quota.note(session, group, requests=1, samples=1)
+                session.add(
+                    AIEvent(
+                        group_id=group.id,
+                        user_id=user.id,
+                        kind="moderation",
+                        provider="",
+                        prompt=text[:2000],
+                        result="调用失败：AI 检测发生未预期错误",
+                        hit=False,
+                    )
+                )
+                await _notice(
+                    bot,
+                    group.id,
+                    "🤖 AI 广告检测本次调用失败，未自动处理该消息。",
+                    10,
+                )
+            else:
                 await quota.note(
                     session,
                     group,
@@ -273,12 +300,19 @@ async def on_group_message(message: Message, bot: Bot) -> None:
                         reason=f"AI 判定为广告：{reason}" if reason else "AI 判定为广告",
                         action="warn",
                     )
-            except Exception:
-                pass
 
         if not detection.hit:
             return
 
+        if detection.action == "kick":
+            detection = detect.Detection(
+                hit=detection.hit,
+                source=detection.source,
+                reason=detection.reason,
+                match=detection.match,
+                action="ban_kick",
+                reply_text=detection.reply_text,
+            )
         await _apply_detection(bot, session, group, message, user, detection)
 
 
@@ -357,7 +391,7 @@ async def _apply_detection(
             text = await helpers.kick_user(
                 bot, session, group, target, reason=detection.reason, admin_id=None
             )
-        elif detection.action == "ban":
+        elif detection.action in {"ban", "ban_kick"}:
             text = await helpers.ban_user(
                 bot, session, group, target, reason=detection.reason, admin_id=None
             )

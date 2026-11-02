@@ -37,7 +37,12 @@ sys.path.insert(0, str(ROOT))
 from sqlalchemy import select  # noqa: E402
 from aiogram.types import ChatMemberAdministrator, User  # noqa: E402
 
-from app.bot.handlers import admin as admin_handlers, commands, report as report_handlers  # noqa: E402
+from app.bot.handlers import (
+    admin as admin_handlers,
+    commands,
+    moderation,
+    report as report_handlers,
+)  # noqa: E402
 from app.bot import helpers  # noqa: E402
 from app.bot.helpers import has_permission  # noqa: E402
 from app.bot.keyboards import console_login_kb, main_menu  # noqa: E402
@@ -46,12 +51,14 @@ from app.db import init_db, session_scope  # noqa: E402
 from app.entitlements import group_feature_allowed  # noqa: E402
 from app.models import (  # noqa: E402
     AdminLog,
+    AIEvent,
     ConsoleGroupAccess,
     ConsoleUser,
     Group,
     Member,
     MemberDailyStat,
     Report,
+    Warning,
     UserNotificationPreference,
     utcnow,
 )
@@ -129,6 +136,8 @@ class FakeMessage:
         self.chat = FakeChat(chat_id, chat_type)
         self.text = text
         self.reply_to_message = None
+        self.sender_chat = None
+        self.forward_from_chat = None
         self.answers: list[str] = []
         self.replies: list[str] = []
         self.reply_kwargs: dict[str, object] = {}
@@ -192,7 +201,8 @@ class FakeBot:
         return SimpleNamespace(id=999999)
 
     async def send_message(self, *args, **kwargs):
-        return None
+        self.calls.append("send_message")
+        return SimpleNamespace(message_id=8001)
 
 def command_names_from_menu(text: str) -> set[str]:
     return set(re.findall(r"^/([a-z]+)\b", text, flags=re.MULTILINE))
@@ -365,7 +375,9 @@ async def run_tests() -> None:
     check(
         "/ban deletes its command message when enabled",
         "ban:-100915000:915099" in command_bot.calls
-        and "delete_message:7001" in command_bot.calls,
+        and "delete_message:7001" in command_bot.calls
+        and "send_message" in command_bot.calls
+        and not command_msg.replies,
         str(command_bot.calls),
     )
 
@@ -593,6 +605,61 @@ async def run_tests() -> None:
             "member report remains pending after submission",
             pending_report is not None and pending_report.review_status == "pending",
             str(pending_report.review_status if pending_report else None),
+        )
+
+    ai_failure_group = -100920012
+    ai_failure_user = 920012
+    await create_group(ai_failure_group, "AI failure observability")
+    await create_member(ai_failure_group, ai_failure_user)
+    async with session_scope() as session:
+        group = await session.get(Group, ai_failure_group)
+        assert group is not None
+        group.ai_ad_enabled = True
+        group.anti_ad_enabled = False
+    original_check_ad = moderation.ai.check_ad
+
+    async def failing_check_ad(*args, **kwargs):
+        raise RuntimeError("synthetic provider failure")
+
+    moderation.ai.check_ad = failing_check_ad
+    ai_failure_message = FakeMessage(
+        user_id=ai_failure_user,
+        chat_id=ai_failure_group,
+        text="a normal message for AI failure",
+    )
+    await moderation.on_group_message(ai_failure_message, FakeBot())
+    moderation.ai.check_ad = original_check_ad
+    async with session_scope() as session:
+        ai_event = await session.scalar(
+            select(AIEvent)
+            .where(
+                AIEvent.group_id == ai_failure_group,
+                AIEvent.user_id == ai_failure_user,
+                AIEvent.kind == "moderation",
+            )
+            .order_by(AIEvent.id.desc())
+        )
+        warning = await session.scalar(
+            select(Warning).where(
+                Warning.group_id == ai_failure_group,
+                Warning.user_id == ai_failure_user,
+            )
+        )
+        failure_log = await session.scalar(
+            select(AdminLog).where(
+                AdminLog.group_id == ai_failure_group,
+                AdminLog.action == "auto_warn",
+            )
+        )
+        check(
+            "AI failure is recorded for diagnostics",
+            ai_event is not None and not ai_event.hit and "调用失败" in ai_event.result,
+            str(ai_event.result if ai_event else None),
+        )
+        check(
+            "AI failure does not trigger moderation action",
+            warning is None and failure_log is None,
+            str((warning, failure_log)),
         )
 
     # Atomic daily counter keeps concurrent messages from colliding.

@@ -255,8 +255,7 @@
         <label for="warn_action">达到上限后的处罚</label>
         <select id="warn_action" name="warn_action">
           <option value="mute" {% if group.warn_action == 'mute' %}selected{% endif %}>禁言</option>
-          <option value="kick" {% if group.warn_action == 'kick' %}selected{% endif %}>踢出</option>
-          <option value="ban" {% if group.warn_action == 'ban' %}selected{% endif %}>封禁</option>
+          <option value="ban_kick" {% if group.warn_action == 'ban_kick' %}selected{% endif %}>封禁并踢出</option>
         </select>
       </div>
       <div class="field">
@@ -275,8 +274,7 @@
         <label for="flood_action">刷屏处罚</label>
         <select id="flood_action" name="flood_action">
           <option value="mute" {% if group.flood_action == 'mute' %}selected{% endif %}>禁言</option>
-          <option value="kick" {% if group.flood_action == 'kick' %}selected{% endif %}>踢出</option>
-          <option value="ban" {% if group.flood_action == 'ban' %}selected{% endif %}>封禁</option>
+          <option value="ban_kick" {% if group.flood_action == 'ban_kick' %}selected{% endif %}>封禁并踢出</option>
         </select>
       </div>
     </div>
@@ -759,8 +757,7 @@
             <option value="delete">删除消息</option>
             <option value="warn">警告</option>
             <option value="mute">禁言</option>
-            <option value="kick">踢出</option>
-            <option value="ban">封禁</option>
+            <option value="ban_kick">封禁并踢出</option>
             <option value="reply">关键词回复</option>
           </select>
         </div>

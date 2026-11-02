@@ -31,7 +31,7 @@ from .. import helpers
 router = Router(name="admin")
 
 ACTIONS = {"delete", "warn", "mute", "kick", "ban"}
-WARN_ACTIONS = {"mute", "kick", "ban"}
+WARN_ACTIONS = {"mute", "ban_kick"}
 
 
 async def _reply_error(message: Message, text: str) -> None:
@@ -117,7 +117,7 @@ async def cmd_ban(message: Message, bot: Bot) -> None:
         await helpers.send_group_log(
             bot, group, f"🔨 {target.label} 被 {actor} 封禁\n原因：{reason or '-'}"
         )
-        await message.reply(result)
+        await helpers.send_temp_notice(bot, group.id, result)
 
 
 @router.message(Command("unban"))
@@ -661,11 +661,11 @@ async def cmd_setwarn(message: Message, bot: Bot) -> None:
             return
         group, actor = ctx
         args = helpers.parse_args(message.text)
-        if len(args) < 2 or not args[0].isdigit() or args[1] not in WARN_ACTIONS:
-            await _reply_error(message, "用法：/setwarn 次数 mute|kick|ban")
+        if len(args) < 2 or not args[0].isdigit() or args[1] not in WARN_ACTIONS | {"kick", "ban"}:
+            await _reply_error(message, "用法：/setwarn 次数 mute|ban_kick")
             return
         group.warn_limit = max(0, int(args[0]))
-        group.warn_action = args[1]
+        group.warn_action = "ban_kick" if args[1] in {"kick", "ban"} else args[1]
         await repo.add_log(session, group.id, actor, "setwarn", None, " ".join(args))
     await message.reply(f"✅ 警告阈值已设为 {group.warn_limit} 次，触发动作：{group.warn_action}")
 
@@ -679,11 +679,11 @@ async def cmd_setflood(message: Message, bot: Bot) -> None:
         group, actor = ctx
         args = helpers.parse_args(message.text)
         if len(args) < 3 or not args[0].isdigit() or not args[1].isdigit() or args[2] not in WARN_ACTIONS:
-            await _reply_error(message, "用法：/setflood 条数 秒数 mute|kick|ban")
+            await _reply_error(message, "用法：/setflood 条数 秒数 mute|ban_kick")
             return
         group.flood_limit = max(1, int(args[0]))
         group.flood_window = max(1, int(args[1]))
-        group.flood_action = args[2]
+        group.flood_action = "ban_kick" if args[2] in {"kick", "ban"} else args[2]
         await repo.add_log(session, group.id, actor, "setflood", None, " ".join(args))
     await message.reply(
         f"✅ 刷屏限制：{group.flood_window} 秒内超过 {group.flood_limit} 条 → {group.flood_action}"

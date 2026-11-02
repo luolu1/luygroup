@@ -416,6 +416,14 @@ try:
         for tab in tabs:
             r = client.get(f"/groups/-1001234567890?tab={tab}")
             check(f"group tab {tab}", r.status_code == 200, f"{r.status_code} {r.text[:400]}")
+            if tab == "moderation":
+                check(
+                    "moderation policy uses combined ban-kick action",
+                    "封禁并踢出" in r.text
+                    and 'name="warn_action"' in r.text
+                    and 'name="flood_action"' in r.text,
+                    r.text[:600],
+                )
 
         r = client.get("/ai")
         check(

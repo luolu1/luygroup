@@ -508,18 +508,15 @@ async def warn_user(
     extra = ""
     if group.warn_limit > 0 and count >= group.warn_limit:
         action = group.warn_action or "mute"
+        if action in {"kick", "ban"}:
+            action = "ban_kick"
         try:
             if action == "mute":
                 extra = "\n" + await mute_user(
                     bot, session, group, target, group.mute_minutes, reason="警告达到上限", admin_id=admin_id
                 )
                 warning.action = action
-            elif action == "kick":
-                extra = "\n" + await kick_user(
-                    bot, session, group, target, reason="警告达到上限", admin_id=admin_id
-                )
-                warning.action = action
-            elif action == "ban":
+            elif action in {"ban", "ban_kick"}:
                 extra = "\n" + await ban_user(
                     bot, session, group, target, reason="警告达到上限", admin_id=admin_id
                 )

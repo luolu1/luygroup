@@ -1993,11 +1993,15 @@ async def save_group_settings(
             group.crossban_mode = "shared"
     if want("warn_action"):
         group.warn_action = _text(form, "warn_action", 16, "mute")
-        if group.warn_action not in {"mute", "kick", "ban"}:
+        if group.warn_action in {"kick", "ban"}:
+            group.warn_action = "ban_kick"
+        if group.warn_action not in {"mute", "ban_kick"}:
             group.warn_action = "mute"
     if want("flood_action"):
         group.flood_action = _text(form, "flood_action", 16, "mute")
-        if group.flood_action not in {"mute", "kick", "ban"}:
+        if group.flood_action in {"kick", "ban"}:
+            group.flood_action = "ban_kick"
+        if group.flood_action not in {"mute", "ban_kick"}:
             group.flood_action = "mute"
 
     if want("max_message_length"):

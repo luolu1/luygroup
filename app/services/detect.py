@@ -126,7 +126,7 @@ class Detection:
     source: str = ""       # builtin / keyword / length / forward / repeat / flood / ai
     reason: str = ""
     match: str = ""
-    action: str = "delete"  # delete / warn / mute / kick / ban / reply
+    action: str = "delete"
     reply_text: str = ""    # action=reply 时发送的自动回复
 
 
