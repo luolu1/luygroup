@@ -302,25 +302,23 @@ td.num, th.num { text-align: right; font-family: var(--mono); font-variant-numer
 .subnav {
   display: flex;
   gap: 2px;
-  flex-wrap: nowrap;
-  overflow-x: auto;
+  flex-wrap: wrap;
   margin: 0 0 24px;
   border-bottom: 1px solid var(--border-soft);
   padding-bottom: 0;
-  scrollbar-width: none;
 }
-.subnav::-webkit-scrollbar { display: none; }
 .subnav a {
   padding: 10px 14px;
   border-bottom: 2px solid transparent;
   color: var(--muted);
-  font-size: 13.5px;
+  font-size: 13px;
   font-weight: 550;
   margin-bottom: -1px;
   white-space: nowrap;
 }
 .subnav a:hover { color: var(--text); text-decoration: none; }
 .subnav a.active { color: var(--text); border-bottom-color: var(--accent); background: rgba(112, 167, 255, .06); }
+
 
 
 /* ---------------------------------------------------------------- chart */
