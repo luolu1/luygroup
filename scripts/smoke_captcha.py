@@ -226,26 +226,20 @@ async def main() -> None:
     assert third is not None
     check("manual refresh deletes old prompt", third.message_id in bot.deleted)
 
-    # Third wrong answer: kick and do not issue another challenge.
     assert refreshed is not None
     before_third = bot.calls.count("send_photo")
     cb3 = FakeCallback(f"verify:{refreshed.token}:{wrong_option(refreshed.token)}")
     await join.on_verify(cb3, bot)
     check("third wrong answer leaves no pending challenge", await pending_row() is None)
     check("third wrong answer does not rotate again", bot.calls.count("send_photo") == before_third)
-    check("third wrong answer kicks", "ban" in bot.calls and "unban" in bot.calls)
-    check("third wrong answer tells user about removal", "正在将你移出" in cb3.answers[-1][0])
+    check("third wrong answer permanently restricts", "restrict" in bot.calls and "ban" not in bot.calls)
+    check("third wrong answer tells user to rejoin", "永久禁言" in cb3.answers[-1][0] and "重新加入" in cb3.answers[-1][0])
     check(
-        "third wrong answer posts removal notice",
-        any("连续答错验证码 3 次，已被移出群组" in text for text in bot.messages),
+        "third wrong answer posts no group notice",
+        not any("连续答错验证码" in text for text in bot.messages),
     )
     check("third wrong answer deletes prompt", refreshed.message_id in bot.deleted)
-    await asyncio.sleep(0.2)
-    check(
-        "third wrong answer notice is deleted automatically",
-        999 in bot.deleted,
-        str(bot.deleted),
-    )
+    check("third wrong answer does not post a notice to delete", 999 not in bot.deleted, str(bot.deleted))
     check("inflight guard is released", not join._verification_inflight)
 
     # Concurrent clicks on the same challenge must not allow multiple guesses.

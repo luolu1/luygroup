@@ -43,8 +43,11 @@ class FakeBot:
     async def get_chat_member(self, *_args, **_kwargs):
         return type("ChatMember", (), {"status": "member"})()
 
-    async def send_message(self, *_args, **_kwargs) -> None:
+    async def restrict_chat_member(self, *_args, **_kwargs) -> None:
         return None
+
+    async def send_message(self, *_args, **_kwargs):
+        return type("SentMessage", (), {"message_id": 9001})()
 
     async def delete_message(self, *_args, **_kwargs) -> None:
         return None

@@ -299,6 +299,7 @@ class Member(Base):
     # Set when a moderator bans/kicks the member. The next join is muted and
     # stays muted until an administrator explicitly unmutes them.
     mute_on_rejoin = Column(Boolean, default=False)
+    verification_restricted = Column(Boolean, default=False)
     message_count = Column(Integer, default=0)
     points = Column(Integer, default=0)
     last_points_at = Column(DateTime, nullable=True)

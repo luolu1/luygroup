@@ -12,6 +12,7 @@ from aiogram.exceptions import TelegramAPIError
 from sqlalchemy import func, select, update
 
 from ..db import session_scope
+from ..bot import helpers
 from ..models import (
     Auction,
     Group,
@@ -47,10 +48,7 @@ async def _record_kick(chat_id: int, user_id: int, action: str, detail: str) -> 
 
 
 async def _notice(bot: Bot, chat_id: int, text: str) -> None:
-    try:
-        await bot.send_message(chat_id, text[:4000])
-    except TelegramAPIError:
-        pass
+    await helpers.send_temp_notice(bot, chat_id, text[:4000])
 
 
 async def _mark_left(chat_id: int, user_id: int) -> None:
@@ -59,8 +57,7 @@ async def _mark_left(chat_id: int, user_id: int) -> None:
         if member:
             member.is_member = False
             member.is_verified = False
-            member.is_muted = False
-            member.muted_until = None
+            member.verification_restricted = False
 
 
 async def _kick_timed_out(
@@ -69,84 +66,22 @@ async def _kick_timed_out(
     user_id: int,
     title: str,
 ) -> bool:
-    """Remove a member whose verification expired and verify the outcome.
-
-    ``ban_chat_member`` used to be called without checking the result, so a
-    failed ban still produced "已被移出" and the user stayed in the group.
-    Returns True when the member is no longer present.
-    """
-    error = ""
-    removed = False
+    async with session_scope() as session:
+        member = await repo.get_member(session, chat_id, user_id)
+        if member is not None:
+            member.verification_restricted = True
+            member.is_muted = True
+            member.muted_until = None
     try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        status = _member_status(member)
-        if status not in _PRESENT_STATUSES:
-            # Already left, or an earlier ban already removed them.
-            await _mark_left(chat_id, user_id)
-            return True
-        if status in {"administrator", "creator"}:
-            error = "该用户是群管理员，无法自动移出"
-        else:
-            try:
-                await bot.ban_chat_member(chat_id, user_id, revoke_messages=False)
-                removed = True
-            except TelegramAPIError as exc:
-                error = str(exc)
-                # The request may have reached Telegram even though the
-                # response failed; check before claiming the removal failed.
-                try:
-                    current = await bot.get_chat_member(chat_id, user_id)
-                    removed = _member_status(current) not in _PRESENT_STATUSES
-                except TelegramAPIError:
-                    removed = False
-            if removed:
-                try:
-                    await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
-                    error = ""
-                except TelegramAPIError as exc:
-                    error = f"解除封禁失败：{exc}"
-                    # One immediate retry: leaving the user banned is worse
-                    # than a plain kick.
-                    try:
-                        await bot.unban_chat_member(chat_id, user_id, only_if_banned=True)
-                        error = ""
-                    except TelegramAPIError as exc2:
-                        error = f"解除封禁失败：{exc2}"
+        await helpers.restrict_permanently(bot, chat_id, user_id)
     except TelegramAPIError as exc:
-        error = str(exc)
-
-    if removed:
-        await _notice(
-            bot,
-            chat_id,
-            f"⏱ {_mention(user_id)} 未在规定时间内完成验证，已被移出 <b>{escape(title)}</b>。",
-        )
-        if error:
-            log.warning("verify timeout: %s removed from %s but %s", user_id, chat_id, error)
-            await _notice(
-                bot,
-                chat_id,
-                "⚠️ 解除封禁失败，请管理员在面板成员页手动解封。",
-            )
-            await _record_kick(
-                chat_id, user_id, "verify_timeout_kick_unban_failed", error
-            )
-        else:
-            await _record_kick(chat_id, user_id, "verify_timeout_kick", "验证超时自动移出")
-        await _mark_left(chat_id, user_id)
-    else:
-        log.warning("verify timeout: cannot remove %s from %s: %s", user_id, chat_id, error)
-        hint = ""
-        lowered = error.lower()
-        if "not enough rights" in lowered or "chat_admin_required" in lowered:
-            hint = "（机器人缺少“封禁用户”权限）"
-        await _notice(
-            bot,
-            chat_id,
-            f"⚠️ {_mention(user_id)} 验证超时，但自动移出失败{hint}，请管理员手动处理。",
-        )
-        await _record_kick(chat_id, user_id, "verify_timeout_kick_failed", error)
-    return removed
+        log.warning("verification timeout restriction failed group=%s user=%s: %s", chat_id, user_id, exc)
+        await _notice(bot, chat_id, f"⚠️ {_mention(user_id)} 验证超时，永久禁言失败，请管理员手动处理。")
+        await _record_kick(chat_id, user_id, "verify_timeout_restrict_failed", str(exc))
+        return False
+    await _notice(bot, chat_id, f"⏱ {_mention(user_id)} 验证超时，已永久禁言，请退出后重新入群验证。")
+    await _record_kick(chat_id, user_id, "verify_timeout_restrict", "验证超时永久禁言")
+    return True
 
 
 async def _delete_verification_message(

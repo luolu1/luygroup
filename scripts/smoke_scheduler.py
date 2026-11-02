@@ -5,14 +5,30 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+ROOT = Path(__file__).resolve().parents[1]
+TMP = Path(tempfile.mkdtemp(prefix="groupguard-scheduler-"))
+config_path = ROOT / "config.json"
+cfg = json.loads(config_path.read_text(encoding="utf-8"))
+cfg["database"]["url"] = f"sqlite+aiosqlite:///{TMP / 'scheduler.db'}"
+cfg.setdefault("ai", {})["learning_dir"] = str(TMP / "learning")
+config_file = TMP / "config.json"
+config_file.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+os.environ["GROUPGUARD_CONFIG"] = str(config_file)
+
 from aiogram.exceptions import TelegramAPIError  # noqa: E402
+from sqlalchemy import select  # noqa: E402
 
 from app.services import scheduler  # noqa: E402
+from app.db import init_db, session_scope  # noqa: E402
+from app.models import Group, Member  # noqa: E402
 
 CHAT_ID = -100123
 USER_ID = 456
@@ -53,9 +69,22 @@ class FakeBot:
 
     async def restrict_chat_member(self, chat_id: int, user_id: int, permissions=None, until_date=None):
         self.calls.append("restrict")
+        if self.ban_error:
+            raise TelegramAPIError("restrictChatMember", "Bad Request: not enough rights")
+
+    async def send_message(self, chat_id, text, **kwargs):
+        self.calls.append("send_message")
+        return type("Message", (), {"message_id": 9001})()
+
+    async def delete_message(self, chat_id, message_id):
+        self.calls.append(f"delete:{message_id}")
 
 
 async def main() -> None:
+    await init_db()
+    async with session_scope() as session:
+        session.add(Group(id=CHAT_ID, title="测试群", chat_type="supergroup"))
+        session.add(Member(group_id=CHAT_ID, user_id=USER_ID, is_member=True))
     notices: list[str] = []
     logs: list[tuple[str, str]] = []
     marks: list[tuple[int, int]] = []
@@ -78,69 +107,68 @@ async def main() -> None:
         logs.clear()
         marks.clear()
 
-    # 1. 正常移出
     reset()
     bot = FakeBot()
     assert await scheduler._kick_timed_out(bot, CHAT_ID, USER_ID, "测试群")
-    assert bot.calls == ["ban", "unban"], bot.calls
-    assert "已被移出" in notices[-1]
-    assert logs[-1][0] == "verify_timeout_kick"
-    assert marks == [(CHAT_ID, USER_ID)]
-    print("PASS 正常移出并提示")
+    assert bot.calls == ["restrict"], bot.calls
+    assert "永久禁言" in notices[-1]
+    assert logs[-1][0] == "verify_timeout_restrict"
+    assert not marks
+    async with session_scope() as session:
+        member = await session.scalar(
+            select(Member).where(Member.group_id == CHAT_ID, Member.user_id == USER_ID)
+        )
+        assert member is not None and member.verification_restricted and member.muted_until is None
+    print("PASS 验证超时永久禁言")
 
-    # 2. 封禁失败：只提示失败，不再禁言或进入重试
     reset()
     bot = FakeBot(ban_error=True)
     assert not await scheduler._kick_timed_out(bot, CHAT_ID, USER_ID, "测试群")
-    assert "自动移出失败" in notices[-1]
-    assert "restrict" not in bot.calls
+    assert "永久禁言失败" in notices[-1]
+    assert "restrict" in bot.calls
     assert not marks
-    assert logs[-1][0] == "verify_timeout_kick_failed"
-    print("PASS 封禁失败只提示，不再禁言或重试")
+    assert logs[-1][0] == "verify_timeout_restrict_failed"
+    print("PASS 永久禁言失败只提示")
 
-    # 3. 封禁请求报错但用户实际已被移出
     reset()
-    bot = FakeBot(ban_error=True, ban_applied_on_error=True)
+    bot = FakeBot(ban_error=False, ban_applied_on_error=True)
     assert await scheduler._kick_timed_out(bot, CHAT_ID, USER_ID, "测试群")
-    assert "已被移出" in notices[-1] and bot.status == "left"
-    assert marks == [(CHAT_ID, USER_ID)]
-    print("PASS 请求超时但实际已移出时按成功处理")
+    assert "永久禁言" in notices[-1] and "ban" not in bot.calls
+    assert not marks
+    print("PASS 验证超时不再执行封禁踢出")
 
-    # 4. 已移出但解除封禁失败
     reset()
     bot = FakeBot(unban_errors=2)
     assert await scheduler._kick_timed_out(bot, CHAT_ID, USER_ID, "测试群")
-    assert "解除封禁失败" in notices[-1]
-    assert logs[-1][0] == "verify_timeout_kick_unban_failed"
-    print("PASS 解除封禁失败会提醒管理员")
+    assert "永久禁言" in notices[-1]
+    assert logs[-1][0] == "verify_timeout_restrict"
+    print("PASS 超时限制保持永久")
 
-    # 5. 用户已自行离开：不发送消息，但顺带把面板状态纠正为已离开
     reset()
     bot = FakeBot(status="left")
     assert await scheduler._kick_timed_out(bot, CHAT_ID, USER_ID, "测试群")
-    assert not bot.calls and not notices
-    assert marks == [(CHAT_ID, USER_ID)]
-    print("PASS 用户已离开时不发送消息并纠正成员状态")
+    assert "restrict" in bot.calls
+    assert "永久禁言" in notices[-1]
+    print("PASS 超时处理不依赖先踢出")
 
-    # 6. 管理员无法移出
     reset()
     bot = FakeBot(status="administrator")
-    assert not await scheduler._kick_timed_out(bot, CHAT_ID, USER_ID, "测试群")
-    assert "自动移出失败" in notices[-1]
-    print("PASS 管理员无法移出时提示")
+    assert await scheduler._kick_timed_out(bot, CHAT_ID, USER_ID, "测试群")
+    assert "永久禁言" in notices[-1]
+    print("PASS 超时不执行管理员移出")
 
     # 7. 权限不足时提示检查权限
     reset()
     bot = FakeBot()
 
-    async def no_rights(chat_id, user_id, revoke_messages=False):
-        bot.calls.append("ban")
+    async def no_rights(chat_id, user_id, **kwargs):
+        bot.calls.append("restrict")
         raise TelegramAPIError("banChatMember", "Bad Request: not enough rights")
 
-    bot.ban_chat_member = no_rights  # type: ignore[assignment]
+    bot.restrict_chat_member = no_rights  # type: ignore[assignment]
     assert not await scheduler._kick_timed_out(bot, CHAT_ID, USER_ID, "测试群")
-    assert "封禁用户" in notices[-1]
-    print("PASS 权限不足时提示检查权限")
+    assert "永久禁言失败" in notices[-1]
+    print("PASS 永久禁言权限不足时提示")
 
 
 if __name__ == "__main__":

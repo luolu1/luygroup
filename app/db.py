@@ -88,6 +88,7 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
         "members": {
             "is_member": "BOOLEAN DEFAULT 1",
             "mute_on_rejoin": "BOOLEAN DEFAULT 0",
+            "verification_restricted": "BOOLEAN DEFAULT 0",
         },
         "warnings": {
             "action": "TEXT DEFAULT 'warn'",

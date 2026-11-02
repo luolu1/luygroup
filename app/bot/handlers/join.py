@@ -162,10 +162,7 @@ async def send_welcome(bot: Bot, group: Group, user: User, session=None) -> None
         .replace("{group}", escape(group.title or "本群"))
         .replace("{id}", str(user.id))
     )
-    try:
-        await bot.send_message(group.id, text)
-    except TelegramAPIError:
-        pass
+    await helpers.send_temp_notice(bot, group.id, text)
 
 
 async def _send_verify_prompt(
@@ -405,7 +402,7 @@ async def redeem_invite(
         was_verified = bool(member.is_verified)
         member.is_verified = True
         member.is_member = True
-        member.is_banned = False
+        member.verification_restricted = False
         for verification in (
             await session.scalars(
                 select(Verification).where(
@@ -478,7 +475,6 @@ async def process_join(
         stayed_muted = bool(member.mute_on_rejoin)
         member.joined_at = utcnow()
         member.is_member = True
-        member.is_banned = False
         await repo.bump_stat(session, group.id, "joins")
         try:
             count = await bot.get_chat_member_count(group.id)
@@ -488,6 +484,9 @@ async def process_join(
 
         if invite_redeemed:
             member.is_verified = True
+            if stayed_muted:
+                target = helpers.Target(user.id, user.first_name or "", user.username or "")
+                await helpers.apply_rejoin_mute(bot, session, group, target)
             return
 
         # Global blacklist: entered via a public link or leftover account.
@@ -765,8 +764,7 @@ async def on_chat_member(update: ChatMemberUpdated, bot: Bot) -> None:
                 member.is_member = False
                 member.is_verified = False
                 member.is_banned = new == "kicked"
-                member.is_muted = False
-                member.muted_until = None
+                member.verification_restricted = False
             pending = (
                 await session.scalars(
                     select(Verification).where(
@@ -875,59 +873,30 @@ async def on_verify(callback: CallbackQuery, bot: Bot) -> None:
                 return
 
             verification.status = "kicked"
+            member = await repo.ensure_member(
+                session,
+                group.id,
+                callback.from_user.id,
+                username=callback.from_user.username or "",
+                first_name=callback.from_user.first_name or "",
+            )
+            member.verification_restricted = True
+            member.is_muted = True
+            member.muted_until = None
+            await helpers.restrict_permanently(bot, group.id, callback.from_user.id)
             await repo.add_log(
                 session,
                 group.id,
                 None,
-                "verify_failed_kick",
+                "verify_failed_restrict",
                 callback.from_user.id,
                 f"连续答错 {attempts} 次",
             )
             await _answer(
                 callback,
-                "❌ 已连续答错 3 次，正在将你移出群组。",
+                "❌ 已连续答错 3 次，已永久禁言。请退出群组后重新加入并完成验证。",
                 show_alert=True,
             )
-            target = helpers.Target(
-                callback.from_user.id,
-                callback.from_user.first_name or "",
-                callback.from_user.username or "",
-            )
-            try:
-                await helpers.kick_user(
-                    bot,
-                    session,
-                    group,
-                    target,
-                    reason="进群验证连续答错 3 次",
-                    admin_id=None,
-                    flag_rejoin=False,
-                )
-            except TelegramAPIError as exc:
-                log.warning(
-                    "captcha kick failed for group=%s user=%s: %s",
-                    group.id,
-                    callback.from_user.id,
-                    exc,
-                )
-                try:
-                    await helpers.send_temp_notice(
-                        bot,
-                        group.id,
-                        f"⚠️ {callback.from_user.mention_html()} 验证失败次数达到上限，"
-                        f"但自动移出失败：{escape(str(exc))[:200]}，请管理员手动处理。",
-                    )
-                except TelegramAPIError:
-                    pass
-            else:
-                try:
-                    await helpers.send_temp_notice(
-                        bot,
-                        group.id,
-                        f"🚫 {callback.from_user.mention_html()} 连续答错验证码 3 次，已被移出群组。",
-                    )
-                except TelegramAPIError:
-                    pass
             prompt_message_id = verification.message_id or getattr(
                 callback.message, "message_id", None
             )
@@ -953,6 +922,7 @@ async def on_verify(callback: CallbackQuery, bot: Bot) -> None:
             first_name=callback.from_user.first_name or "",
         )
         member.is_verified = True
+        member.verification_restricted = False
         target = helpers.Target(
             callback.from_user.id,
             callback.from_user.first_name or "",
@@ -971,10 +941,11 @@ async def on_verify(callback: CallbackQuery, bot: Bot) -> None:
                 else "✅ 验证通过，但自动禁言失败，请联系管理员处理。"
             )
         else:
-            try:
-                await helpers.unmute_user(bot, session, group, target, admin_id=None)
-            except TelegramAPIError:
-                pass
+            if not member.mute_on_rejoin:
+                try:
+                    await helpers.unmute_user(bot, session, group, target, admin_id=None)
+                except TelegramAPIError:
+                    pass
             answer_text = "✅ 验证通过，欢迎加入！"
         await repo.add_log(
             session, group.id, None, "verify_passed", callback.from_user.id, ""
