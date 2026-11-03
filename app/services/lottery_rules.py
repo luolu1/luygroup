@@ -8,43 +8,39 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..models import Lottery, LotteryEntry, LotteryQualification, Member, utcnow
 from . import repo
 
-async def open_keyword_lotteries(
-    session: AsyncSession, group_id: int
-) -> list[tuple[int, str]]:
-    key = int(group_id)
+
+async def _matching_keyword_lotteries(
+    session: AsyncSession, group_id: int, text: str
+) -> list[Lottery]:
+    normalized_text = text.strip().casefold()
+    if not normalized_text:
+        return []
     rows = (
-        await session.execute(
-            select(Lottery.id, Lottery.participation_value).where(
-                Lottery.group_id == key,
+        await session.scalars(
+            select(Lottery).where(
+                Lottery.group_id == int(group_id),
                 Lottery.status == "open",
                 Lottery.participation_type == "keyword",
             )
         )
     ).all()
     return [
-        (int(row[0]), str(row[1] or "").strip().casefold())
-        for row in rows
-        if str(row[1] or "").strip()
+        lottery
+        for lottery in rows
+        if (lottery.participation_value or "").strip().casefold() == normalized_text
     ]
 
 
 async def record_keyword_matches(
     session: AsyncSession, group_id: int, user_id: int, text: str
 ) -> list[str]:
-    lotteries = await open_keyword_lotteries(session, group_id)
+    lotteries = await _matching_keyword_lotteries(session, group_id, text)
     if not lotteries:
         return []
-    normalized_text = text.strip().casefold()
     auto_entered: list[str] = []
-    for lottery_id, keyword in lotteries:
-        if keyword != normalized_text:
-            continue
-        lottery = await session.get(Lottery, lottery_id)
-        if (
-            lottery is None
-            or lottery.status != "open"
-            or (lottery.ends_at is not None and lottery.ends_at <= utcnow())
-        ):
+    for lottery in lotteries:
+        lottery_id = int(lottery.id)
+        if lottery.ends_at is not None and lottery.ends_at <= utcnow():
             continue
         inserted = (
             await session.execute(
