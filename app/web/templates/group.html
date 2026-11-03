@@ -1111,7 +1111,7 @@
         <tbody>
         {% for a in auctions %}
           <tr>
-            <td>{{ a.item }}<div class="faint small">起拍 {{ a.start_price }} · 加价 {{ a.step }}</div></td>
+            <td>{{ a.item }}<div class="faint small">编号 {{ a.code or a.id }} · 起拍 {{ a.start_price }} · 加价 {{ a.step }}</div></td>
             <td class="num">{{ a.current_price or 0 }}</td>
             <td class="mono small">{{ a.current_bidder or '—' }}</td>
             <td>

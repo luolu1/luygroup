@@ -698,6 +698,7 @@ class Auction(Base):
     __tablename__ = "auctions"
 
     id = Column(Integer, primary_key=True)
+    code = Column(String(12), unique=True, index=True, nullable=True)
     group_id = Column(BigInteger, index=True)
     creator_id = Column(BigInteger)
     item = Column(String(255))

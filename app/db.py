@@ -132,6 +132,9 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
             "charge_currency": "VARCHAR(8) DEFAULT 'CNY'",
             "expires_at": "DATETIME",
         },
+        "auctions": {
+            "code": "VARCHAR(12)",
+        },
         "lotteries": {
             "participation_type": "VARCHAR(16) DEFAULT 'none'",
             "participation_value": "VARCHAR(255) DEFAULT ''",
@@ -182,6 +185,16 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
             "WHERE delete_command_messages = 0"
         )
         mark_migration("default_message_cleanup_settings_v1")
+
+    if not has_migration("auction_public_codes_v1"):
+        conn.exec_driver_sql(
+            "UPDATE auctions SET code = printf('A%08d', id) WHERE code IS NULL OR code = ''"
+        )
+        mark_migration("auction_public_codes_v1")
+    conn.exec_driver_sql(
+        "CREATE UNIQUE INDEX IF NOT EXISTS ix_auctions_code_unique "
+        "ON auctions (code) WHERE code IS NOT NULL AND code != ''"
+    )
 
     conn.exec_driver_sql(
         "CREATE INDEX IF NOT EXISTS ix_ai_providers_owner_user_id "
