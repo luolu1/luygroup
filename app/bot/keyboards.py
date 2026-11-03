@@ -190,9 +190,52 @@ def lottery_history_pagination_kb(page: int, has_previous: bool, has_next: bool)
     return builder.as_markup()
 
 
-def auction_kb(auction_id: int) -> InlineKeyboardMarkup:
+def auction_setup_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text="💰 出价", callback_data=f"bid:{auction_id}"))
+    builder.row(
+        InlineKeyboardButton(text="✅ 确认创建", callback_data="aucsetup:create"),
+        InlineKeyboardButton(text="✖️ 取消", callback_data="aucsetup:cancel"),
+    )
+    return builder.as_markup()
+
+
+def auction_management_kb(auction_id: int, can_change: bool) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if can_change:
+        builder.row(
+            InlineKeyboardButton(text="取消竞拍", callback_data=f"aucmanage:cancel:{auction_id}")
+        )
+    else:
+        builder.row(
+            InlineKeyboardButton(text="删除记录", callback_data=f"aucmanage:delete:{auction_id}")
+        )
+    return builder.as_markup()
+
+
+def auction_history_list_kb(rows: list[tuple[int, str, str, str]]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for auction_id, code, item, status in rows:
+        label = {"open": "进行中", "finished": "已成交", "cancelled": "已取消"}.get(status, status)
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{code or f'#{auction_id}'} · {item} · {label}",
+                callback_data=f"aucmanage:select:{auction_id}",
+            )
+        )
+    return builder.as_markup()
+
+
+def auction_back_kb(target_step: str) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="⬅️ 返回上一步", callback_data=f"aucsetup:back:{target_step}")
+    )
+    return builder.as_markup()
+
+
+def auction_kb(auction_id: int, code: str = "") -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(InlineKeyboardButton(text=f"💰 出价 {code or auction_id}", callback_data=f"bid:{auction_id}"))
     return builder.as_markup()
 
 

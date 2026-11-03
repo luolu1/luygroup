@@ -74,6 +74,8 @@ PRIVATE_EXPECTED = [
     "cjhistory",
     "cjcancel",
     "jptz",
+    "jphistory",
+    "jpcancel",
 ]
 GROUP_EXPECTED = [
     "ads",

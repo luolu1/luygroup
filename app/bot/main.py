@@ -35,6 +35,8 @@ PRIVATE_COMMANDS = [
     BotCommand(command="cjhistory", description="查看我创建的抽奖"),
     BotCommand(command="cjcancel", description="取消未开奖抽奖"),
     BotCommand(command="jptz", description="开启/关闭竞拍推送"),
+    BotCommand(command="jphistory", description="查看我创建的竞拍"),
+    BotCommand(command="jpcancel", description="取消未结束竞拍"),
 ]
 
 GROUP_COMMANDS = [

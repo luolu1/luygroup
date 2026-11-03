@@ -763,6 +763,118 @@ async def test_anonymous_admin_context() -> None:
     print("PASS same-group anonymous admin is recognized by admin context")
 
 
+async def test_auction_private_setup() -> None:
+    group_id = -100820500
+    user_id = 820500
+    await create_group(group_id, "Auction setup")
+    async with session_scope() as session:
+        group = await session.get(Group, group_id)
+        group.points_enabled = True
+    bot = FakeBot()
+    bot.membership[(group_id, user_id)] = "administrator"
+
+    start = FakeMessage(user_id=user_id, chat_id=group_id, text="/jp")
+    await games.cmd_auction(start, bot)
+    assert bot.sent[-1][0] == user_id
+    assert "竞拍将在群组" in bot.sent[-1][1]
+    assert "第 1/4 步 · 拍品" in bot.sent[-1][1]
+    check("auction group start only sends confirmation", "私聊" in start.replies[-1])
+    async with session_scope() as session:
+        assert await session.scalar(select(Auction.id).where(Auction.group_id == group_id)) is None
+
+    await games.game_private_config(
+        FakeMessage(user_id=user_id, chat_id=user_id, text="稀有头像框"), bot
+    )
+    await games.game_private_config(
+        FakeMessage(user_id=user_id, chat_id=user_id, text="100"), bot
+    )
+    await games.game_private_config(
+        FakeMessage(user_id=user_id, chat_id=user_id, text="10"), bot
+    )
+    confirm_message = FakeMessage(user_id=user_id, chat_id=user_id, text="30")
+    await games.game_private_config(confirm_message, bot)
+    assert "确认竞拍配置" in confirm_message.replies[-1]
+    assert bot.sent[-1][0] == user_id
+
+    callback = FakeCallback(data="aucsetup:create", user_id=user_id, chat_id=user_id)
+    await games.auction_setup_callback(callback, bot)
+    async with session_scope() as session:
+        auction = await session.scalar(
+            select(Auction).where(Auction.group_id == group_id)
+        )
+        assert auction is not None
+        assert auction.item == "稀有头像框"
+        assert auction.start_price == 100
+        assert auction.step == 10
+        assert auction.current_price == 100
+        assert auction.current_bidder is None
+        assert auction.status == "open"
+        assert auction.message_id is not None
+        assert auction.code and len(auction.code) == 8
+    assert bot.sent[-1][0] == group_id
+    assert f"竞拍编号：<code>{auction.code}</code>" in bot.sent[-1][1]
+    assert "每次出价会重新延长" in bot.sent[-1][1]
+    assert user_id not in games._auction_drafts
+    check("auction private setup creates auction", True)
+    print("PASS auction private setup creates auction")
+
+
+async def test_auction_private_cancel_and_idempotent() -> None:
+    group_id = -100820501
+    user_id = 820501
+    await create_group(group_id, "Auction cancel")
+    async with session_scope() as session:
+        group = await session.get(Group, group_id)
+        group.points_enabled = True
+    bot = FakeBot()
+    bot.membership[(group_id, user_id)] = "administrator"
+
+    start = FakeMessage(user_id=user_id, chat_id=group_id, text="/jp")
+    await games.cmd_auction(start, bot)
+    await games.game_private_config(
+        FakeMessage(user_id=user_id, chat_id=user_id, text="测试拍品"), bot
+    )
+    cancel = FakeMessage(user_id=user_id, chat_id=user_id, text="/cancel")
+    await games.lottery_cancel(cancel)
+    assert user_id not in games._auction_drafts
+    check("auction private cancel clears draft", "已取消当前创建流程" in cancel.replies[-1])
+
+    await games.cmd_auction(start, bot)
+    for text in ("测试拍品", "50", "5", "15"):
+        await games.game_private_config(
+            FakeMessage(user_id=user_id, chat_id=user_id, text=text), bot
+        )
+    callback1 = FakeCallback(data="aucsetup:create", user_id=user_id, chat_id=user_id)
+    callback2 = FakeCallback(data="aucsetup:create", user_id=user_id, chat_id=user_id)
+    await asyncio.gather(
+        games.auction_setup_callback(callback1, bot),
+        games.auction_setup_callback(callback2, bot),
+    )
+    async with session_scope() as session:
+        count = int(
+            await session.scalar(
+                select(func.count(Auction.id)).where(Auction.group_id == group_id)
+            ) or 0
+        )
+        assert count == 1
+    assert "竞拍已发布" in callback1.answers[-1] or "竞拍已发布" in callback2.answers[-1]
+    assert any("正在发布" in a or "不存在" in a for a in callback1.answers + callback2.answers)
+    print("PASS auction duplicate confirm creates once")
+
+
+async def test_auction_requires_admin() -> None:
+    group_id = -100820502
+    user_id = 820502
+    await create_group(group_id, "Auction no admin")
+    bot = FakeBot()
+    bot.membership[(group_id, user_id)] = "member"
+    start = FakeMessage(user_id=user_id, chat_id=group_id, text="/jp")
+    await games.cmd_auction(start, bot)
+    assert user_id not in games._auction_drafts
+    check("auction requires group admin", "管理员" in start.replies[-1])
+    print("PASS auction requires group admin")
+
+
 async def create_group(group_id: int, title: str) -> None:
     async with session_scope() as session:
         session.add(
@@ -810,6 +922,7 @@ async def create_auction(
 ) -> int:
     async with session_scope() as session:
         auction = Auction(
+            code=f"T{int(group_id) * -1 % 10000:04d}{item[:2]}",
             group_id=int(group_id),
             creator_id=900000,
             item=item,
@@ -852,6 +965,10 @@ async def create_packet(
 
 async def run_tests() -> None:
     await test_lottery_private_setup()
+    await test_auction_private_setup()
+    await test_auction_private_cancel_and_idempotent()
+    await test_auction_requires_admin()
+    await test_auction_bid_updates_deadline_and_history()
     await test_lottery_wizard_back_and_expiry()
     await test_lottery_participation_rules()
     await test_lottery_creator_management()
@@ -1003,6 +1120,60 @@ async def run_tests() -> None:
     )
 
     # ------------------------------------------------------------------
+
+
+async def test_auction_bid_updates_deadline_and_history() -> None:
+    group_id = -100820600
+    creator_id = 820600
+    bidder_id = 820601
+    await create_group(group_id, "Auction deadline and history")
+    async with session_scope() as session:
+        group = await session.get(Group, group_id)
+        group.points_enabled = True
+    await set_points(group_id, bidder_id, 500)
+    auction_id = await create_auction(
+        group_id, item="延拍测试", start_price=100, step=10,
+        current_price=100, current_bidder=None,
+    )
+    async with session_scope() as session:
+        auction = await session.get(Auction, auction_id)
+        auction.code = "T600001"
+        auction.creator_id = creator_id
+        auction.ends_at = utcnow() + timedelta(minutes=1)
+        initial_end = auction.ends_at
+    bid = FakeMessage(user_id=bidder_id, chat_id=group_id, text="/bid T600001 120")
+    await games.cmd_bid(bid, FakeBot())
+    assert "出价成功" in bid.replies[-1]
+    async with session_scope() as session:
+        auction = await session.get(Auction, auction_id)
+        assert auction.ends_at > initial_end
+        assert int(auction.current_price) == 120 and auction.current_bidder == bidder_id
+    check("bid updates auction deadline", "新的截止时间" in bid.replies[-1])
+
+    history = FakeMessage(user_id=creator_id, chat_id=creator_id, text="/jphistory")
+    await games.auction_history(history)
+    check(
+        "auction private history lists created auction",
+        any(
+            "aucmanage:select" in str(markup)
+            for _text, markup in history.sent_answers
+            if markup is not None
+        ),
+    )
+
+    cancel = FakeMessage(user_id=creator_id, chat_id=creator_id, text="/jpcancel T600001")
+    await games.auction_cancel_created(cancel)
+    assert "已取消" in cancel.replies[-1]
+    async with session_scope() as session:
+        auction = await session.get(Auction, auction_id)
+        assert auction.status == "cancelled"
+        bidder = await session.scalar(
+            select(Member).where(Member.group_id == group_id, Member.user_id == bidder_id)
+        )
+        assert bidder is not None and bidder.points == 500
+    print("PASS auction deadline, code bid, history and cancel")
+
+
     # 3. _claim_auction_slot 互斥
     # ------------------------------------------------------------------
     group3 = -100820003

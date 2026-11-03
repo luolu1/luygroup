@@ -63,9 +63,71 @@ class LotteryDraft:
     edit_field: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class AuctionDraft:
+    user_id: int
+    group_id: int
+    created_at: datetime
+    step: str
+    item: str = ""
+    start_price: int = 0
+    step_amount: int = 0
+    minutes: int = 60
+
+
 _lottery_drafts: dict[int, LotteryDraft] = {}
+_auction_drafts: dict[int, AuctionDraft] = {}
 _lottery_creating: set[int] = set()
+_auction_creating: set[int] = set()
 _lottery_history_page_size = 5
+_auction_code_alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+async def _auction_code(session) -> str:
+    for _ in range(12):
+        code = "".join(random.choices(_auction_code_alphabet, k=8))
+        if not await session.scalar(select(Auction.id).where(Auction.code == code)):
+            return code
+    return "".join(random.choices(_auction_code_alphabet, k=8))
+
+
+def _auction_label(auction: Auction) -> str:
+    return auction.code or f"#{auction.id}"
+
+
+def _auction_bid_hint(auction: Auction) -> str:
+    return f"发送 /bid {_auction_label(auction)} 金额 出价"
+
+
+async def _open_auction_for_bid(
+    session, group_id: int, code: str | None = None
+) -> Auction | None:
+    stmt = select(Auction).where(Auction.group_id == int(group_id), Auction.status == "open")
+    stmt = (
+        stmt.where(Auction.code == code)
+        if code
+        else stmt.order_by(Auction.id.desc()).limit(2)
+    )
+    auctions = (await session.scalars(stmt)).all()
+    if code:
+        return auctions[0] if auctions else None
+    return auctions[0] if len(auctions) == 1 else None
+
+
+async def _refresh_auction_deadline(auction: Auction, now) -> None:
+    extension = timedelta(minutes=max(1, int(auction.step or 1)))
+    target = now + extension
+    if auction.ends_at is None or target > auction.ends_at:
+        auction.ends_at = target
+
+
+async def _active_auction_for_group(session, group_id: int) -> Auction | None:
+    return await session.scalar(
+        select(Auction)
+        .where(Auction.group_id == int(group_id), Auction.status == "open")
+        .order_by(Auction.id.desc())
+        .limit(1)
+    )
 
 # Keep strong references to fire-and-forget promotion pushes.  The event loop
 # only holds weak references to tasks, so an unreferenced task can be collected
@@ -73,47 +135,8 @@ _lottery_history_page_size = 5
 _promotion_tasks: set[asyncio.Task] = set()
 
 
-def _tail(message: Message) -> str:
-    text = message.text or ""
-    parts = text.split(maxsplit=1)
-    return parts[1].strip() if len(parts) > 1 else ""
-
-
 def _lottery_user_mention(user_id: int) -> str:
     return f'<a href="tg://user?id={user_id}">用户 {user_id}</a>'
-
-
-def _parse_auction_args(raw: str) -> tuple[str, int, int, int]:
-    """Parse ``title | start_price [step] [minutes]``."""
-    if "|" not in raw:
-        return "", 0, 0, 60
-    title, rest = raw.split("|", 1)
-    title = title.strip()
-    chunks = rest.strip().split()
-    if not title or not chunks or not chunks[0].isdigit():
-        return "", 0, 0, 60
-    start_price = int(chunks[0])
-    step = int(chunks[1]) if len(chunks) > 1 and chunks[1].isdigit() else 0
-    minutes = 60
-    if len(chunks) > 2 and chunks[2].isdigit():
-        minutes = max(1, min(int(chunks[2]), 60 * 24 * 30))
-    return title, start_price, max(0, step), minutes
-
-
-def _parse_game_args(raw: str) -> tuple[str, str, int, int]:
-    """Parse ``title | prize [fee] [minutes]``."""
-    if "|" not in raw:
-        return "", "", 0, 60
-    title, rest = raw.split("|", 1)
-    title = title.strip()
-    chunks = rest.strip().split()
-    minutes = 60
-    fee = 0
-    if chunks and chunks[-1].lstrip("-").isdigit():
-        minutes = max(1, min(int(chunks.pop()), 60 * 24 * 30))
-    if chunks and chunks[-1].lstrip("-").isdigit():
-        fee = max(0, int(chunks.pop()))
-    return title, " ".join(chunks).strip(), fee, minutes
 
 
 def _bounded_int(raw: str, low: int, high: int) -> int | None:
@@ -151,11 +174,6 @@ def _lottery_condition_text(kind: str, value: str) -> str:
     template = _LOTTERY_CONDITION_LABELS.get(kind, _LOTTERY_CONDITION_LABELS["none"])
     return template.format(value=escape(str(value)))
 
-
-def _lottery_draw_text(draw_type: str, value: int) -> str:
-    if draw_type == "participant":
-        return f"参与人数达到 {value} 人"
-    return f"{value} 分钟后开奖"
 
 
 def _lottery_draw_summary(draft: LotteryDraft) -> str:
@@ -895,8 +913,11 @@ async def cmd_lottery(message: Message, bot: Bot) -> None:
 
 
 @router.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
-async def lottery_private_config(message: Message, bot: Bot) -> None:
+async def game_private_config(message: Message, bot: Bot) -> None:
     if not message.from_user:
+        return
+    if message.from_user.id in _auction_drafts:
+        await auction_private_config(message, bot)
         return
     draft = _lottery_drafts.get(message.from_user.id)
     if draft is None:
@@ -988,11 +1009,7 @@ async def lottery_private_config(message: Message, bot: Bot) -> None:
     await _send_lottery_step(bot, draft)
 
 
-@router.message(Command("cancel"))
-async def lottery_cancel(message: Message) -> None:
-    if message.chat.type == "private" and message.from_user:
-        _lottery_drafts.pop(message.from_user.id, None)
-        await message.reply("已取消抽奖创建。")
+lottery_private_config = game_private_config
 
 
 @router.message(Command("cjhistory"))
@@ -1580,20 +1597,43 @@ async def on_lottery_join(callback: CallbackQuery) -> None:
 # ---------------------------------------------------------------------------
 # Auction
 # ---------------------------------------------------------------------------
+def _auction_draft_expired(draft: AuctionDraft) -> bool:
+    return utcnow() - draft.created_at >= _LOTTERY_DRAFT_TTL
+
+
+def _auction_step_prompt(draft: AuctionDraft) -> tuple[str, InlineKeyboardMarkup | None]:
+    prompts = {
+        "item": "第 1/4 步 · 拍品\n请发送拍品名称，例如：稀有头像框",
+        "start_price": "第 2/4 步 · 起拍价\n请发送起拍积分，例如：100",
+        "step": "第 3/4 步 · 加价幅度\n请发送每次最低加价积分，例如：10",
+        "minutes": "第 4/4 步 · 持续时间\n请发送竞拍持续分钟数，例如：30",
+    }
+    target = {"item": "item", "start_price": "item", "step": "start_price", "minutes": "step"}
+    return prompts[draft.step], keyboards.auction_back_kb(target[draft.step])
+
+
+def _auction_summary(draft: AuctionDraft) -> str:
+    return (
+        "请确认竞拍配置：\n"
+        f"拍品：{escape(draft.item)}\n"
+        f"起拍价：{draft.start_price} 积分\n"
+        f"加价幅度：{draft.step_amount} 积分\n"
+        f"持续时间：{draft.minutes} 分钟"
+    )
+
+
+async def _send_auction_step(bot: Bot, draft: AuctionDraft) -> None:
+    text, markup = _auction_step_prompt(draft)
+    await bot.send_message(draft.user_id, text, reply_markup=markup)
+
+
 @router.message(Command("auction", "bidstart", "jp"))
 async def cmd_auction(message: Message, bot: Bot) -> None:
     if not _need_group(message) or not message.from_user:
         await message.reply("请在群组中使用。")
         return
-    title, start_price, step, minutes = _parse_auction_args(_tail(message))
-    if not title:
-        await message.reply(
-            "用法：/jp 物品 | 起拍价 [加价幅度] [分钟]\n"
-            "例如：/jp 稀有头像框 | 100 10 30"
-        )
-        return
-    if start_price < 0 or step < 0:
-        await message.reply("起拍价和加价幅度不能为负数。")
+    if not await _is_group_admin(bot, message.chat.id, message.from_user.id):
+        await message.reply("只有本群管理员可以发起竞拍。")
         return
     async with session_scope() as session:
         group = await _group_for_message(session, message)
@@ -1603,48 +1643,362 @@ async def cmd_auction(message: Message, bot: Bot) -> None:
         if not group.points_enabled:
             await message.reply("本群未开启积分系统，无法竞拍。")
             return
+        group_title = group.title or str(group.id)
+    draft = AuctionDraft(
+        user_id=message.from_user.id,
+        group_id=message.chat.id,
+        created_at=utcnow(),
+        step="item",
+    )
+    _auction_drafts[message.from_user.id] = draft
+    try:
+        await bot.send_message(
+            message.from_user.id,
+            f"本次竞拍将在群组「{escape(group_title)}」创建。\n"
+            "开始配置，发送 /cancel 可随时取消。\n"
+            "第 1/4 步 · 拍品\n请发送拍品名称，例如：稀有头像框",
+        )
+    except TelegramAPIError:
+        _auction_drafts.pop(message.from_user.id, None)
+        await message.reply("无法私聊你，请先打开与机器人的私聊并发送 /start。")
+        return
+    await message.reply("竞拍配置已发送到你的私聊，请在那里完成创建。")
+
+
+async def auction_private_config(message: Message, bot: Bot) -> None:
+    if not message.from_user:
+        return
+    draft = _auction_drafts[message.from_user.id]
+    if _auction_draft_expired(draft):
+        _auction_drafts.pop(message.from_user.id, None)
+        await message.reply("竞拍配置已超过 5 分钟并自动撤销，请回群重新发送 /jp。")
+        return
+    raw = (message.text or "").strip()
+    if draft.step == "item":
+        if not raw:
+            await message.reply("请发送拍品名称。")
+            return
+        draft = replace(draft, item=raw[:255], step="start_price")
+    elif draft.step == "start_price":
+        value = _bounded_int(raw, 0, 2_000_000_000)
+        if value is None:
+            await message.reply("请发送 0 或更大的整数作为起拍价。")
+            return
+        draft = replace(draft, start_price=value, step="step")
+    elif draft.step == "step":
+        value = _bounded_int(raw, 0, 2_000_000_000)
+        if value is None:
+            await message.reply("请发送 0 或更大的整数作为加价幅度。")
+            return
+        draft = replace(draft, step_amount=value, step="minutes")
+    elif draft.step == "minutes":
+        value = _bounded_int(raw, 1, 60 * 24 * 30)
+        if value is None:
+            await message.reply("请发送 1-43200 之间的持续分钟数。")
+            return
+        draft = replace(draft, minutes=value, step="confirm")
+    else:
+        return
+    _auction_drafts[message.from_user.id] = draft
+    if draft.step == "confirm":
+        await message.reply(_auction_summary(draft), reply_markup=keyboards.auction_setup_kb())
+    else:
+        await _send_auction_step(bot, draft)
+
+
+@router.message(Command("cancel"))
+async def lottery_cancel(message: Message) -> None:
+    if message.chat.type == "private" and message.from_user:
+        _lottery_drafts.pop(message.from_user.id, None)
+        _auction_drafts.pop(message.from_user.id, None)
+        await message.reply("已取消当前创建流程。")
+
+
+@router.callback_query(F.data.startswith("aucsetup:"))
+async def auction_setup_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.message is None or callback.message.chat.id != callback.from_user.id:
+        await callback.answer("请在私聊中操作。", show_alert=True)
+        return
+    draft = _auction_drafts.get(callback.from_user.id)
+    if draft is None or _auction_draft_expired(draft):
+        _auction_drafts.pop(callback.from_user.id, None)
+        await callback.answer("竞拍配置不存在或已失效。", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    if action == "cancel":
+        _auction_drafts.pop(callback.from_user.id, None)
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("已取消竞拍创建。")
+        return
+    if action == "back":
+        target = parts[2] if len(parts) > 2 else "item"
+        if target not in {"item", "start_price", "step"}:
+            await callback.answer("无法返回到该步骤。", show_alert=True)
+            return
+        draft = replace(draft, step=target)
+        _auction_drafts[callback.from_user.id] = draft
+        await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("已返回修改。")
+        await _send_auction_step(bot, draft)
+        return
+    if action != "create" or draft.step != "confirm":
+        await callback.answer("请先完成竞拍配置。", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    if user_id in _auction_creating:
+        await callback.answer("竞拍正在发布，请稍候。")
+        return
+    _auction_creating.add(user_id)
+    try:
+        await _auction_confirm_create(callback, bot, draft)
+    finally:
+        _auction_creating.discard(user_id)
+
+
+async def _auction_confirm_create(
+    callback: CallbackQuery, bot: Bot, draft: AuctionDraft
+) -> None:
+    assert callback.message is not None
+    user_id = callback.from_user.id
+    if not await _is_group_admin(bot, draft.group_id, user_id):
+        _auction_drafts.pop(user_id, None)
+        await callback.answer("你已不是该群管理员，无法创建竞拍。", show_alert=True)
+        return
+    async with session_scope() as session:
+        group = await session.get(Group, draft.group_id)
+        if group is None or not group.is_active or not group.points_enabled:
+            _auction_drafts.pop(user_id, None)
+            await callback.answer(
+                "目标群组不存在、已停用或未开启积分系统。", show_alert=True
+            )
+            return
+        if await _feature_denied(session, group, "games"):
+            _auction_drafts.pop(user_id, None)
+            await callback.answer(
+                "本群所属订阅未开通抽奖与竞拍功能。", show_alert=True
+            )
+            return
         auction = Auction(
+            code=await _auction_code(session),
             group_id=group.id,
-            creator_id=message.from_user.id,
-            item=title[:255],
-            start_price=start_price,
-            step=max(0, step),
-            current_price=start_price,
-            current_bidder=None,
+            creator_id=user_id,
+            item=draft.item[:255],
+            start_price=draft.start_price,
+            step=draft.step_amount,
+            current_price=draft.start_price,
             status="open",
-            ends_at=utcnow() + timedelta(minutes=minutes),
+            ends_at=utcnow() + timedelta(minutes=draft.minutes),
         )
         session.add(auction)
         await session.flush()
         ends_text = auction.ends_at.strftime("%Y-%m-%d %H:%M")
         text = (
-            f"🔨 <b>竞拍：{escape(title)}</b>\n"
-            f"起拍价：{start_price} {escape(group.points_name or '积分')}\n"
-            f"加价幅度：{max(0, step)}\n"
+            f"🔨 <b>竞拍：{escape(draft.item)}</b>\n"
+            f"竞拍编号：<code>{escape(_auction_label(auction))}</code>\n"
+            f"起拍价：{draft.start_price} 积分\n"
+            f"加价幅度：{draft.step_amount}\n"
             f"截止时间：{ends_text}（UTC）\n"
-            "发送 /bid 金额 出价，或点击下方按钮查看提示。"
+            f"{escape(_auction_bid_hint(auction))}，每次出价会重新延长 {max(1, draft.step_amount)} 分钟。"
         )
         try:
-            sent = await bot.send_message(group.id, text, reply_markup=keyboards.auction_kb(auction.id))
-            auction.message_id = sent.message_id
-        except TelegramAPIError as exc:
-            await message.reply(f"发送竞拍失败：{exc}")
+            sent = await bot.send_message(
+                group.id,
+                text,
+                reply_markup=keyboards.auction_kb(auction.id, _auction_label(auction)),
+            )
+        except TelegramAPIError:
+            auction.status = "cancelled"
+            _auction_drafts.pop(user_id, None)
+            await callback.answer(
+                "发布竞拍失败，请检查机器人在群内的权限。", show_alert=True
+            )
             return
+        auction.message_id = sent.message_id
         detail = (
-            f"起拍价：{start_price} {escape(group.points_name or '积分')}\n"
-            f"加价幅度：{max(0, step)}\n"
+            f"起拍价：{draft.start_price} 积分\n"
+            f"加价幅度：{draft.step_amount}\n"
             f"截止时间：{ends_text}（UTC）"
         )
-    await message.reply("竞拍已开始！")
+        group_title = group.title or ""
+    _auction_drafts.pop(user_id, None)
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("竞拍已发布。")
     _schedule_promotion(
         bot,
-        group_id=group.id,
-        group_title=group.title or "",
+        group_id=draft.group_id,
+        group_title=group_title,
         kind="auction",
-        title=title,
+        title=draft.item,
         detail=detail,
-        exclude_user_id=message.from_user.id,
+        exclude_user_id=user_id,
     )
+
+
+async def _send_auction_history_page(message: Message, user_id: int, page: int) -> None:
+    async with session_scope() as session:
+        rows = (
+            await session.execute(
+                select(Auction, Group.title)
+                .outerjoin(Group, Group.id == Auction.group_id)
+                .where(Auction.creator_id == int(user_id))
+                .order_by(Auction.id.desc())
+                .offset((page - 1) * _lottery_history_page_size)
+                .limit(_lottery_history_page_size + 1)
+            )
+        ).all()
+        if not rows:
+            await message.answer("没有更多竞拍记录。")
+            return
+        has_next = len(rows) > _lottery_history_page_size
+        cards = []
+        for auction, _group_title in rows[:_lottery_history_page_size]:
+            cards.append((int(auction.id), _auction_label(auction), auction.item or "", auction.status))
+        await message.answer(
+            f"🔨 <b>我创建的竞拍</b> · 第 {page} 页\n点击对应竞拍查看详情或取消。",
+            reply_markup=keyboards.auction_history_list_kb(cards),
+        )
+        if page > 1 or has_next:
+            await message.answer(
+                "翻页",
+                reply_markup=keyboards.lottery_history_pagination_kb(page, page > 1, has_next),
+            )
+
+
+@router.message(Command("jphistory"))
+async def auction_history(message: Message) -> None:
+    if message.chat.type != "private" or message.from_user is None:
+        await message.reply("请私聊机器人使用 /jphistory。")
+        return
+    page = 1
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].strip().isdigit():
+        page = max(1, int(parts[1].strip()))
+    await _send_auction_history_page(message, int(message.from_user.id), page)
+
+
+@router.message(Command("jpcancel"))
+async def auction_cancel_created(message: Message) -> None:
+    if message.chat.type != "private" or message.from_user is None:
+        await message.reply("请私聊机器人使用 /jpcancel 竞拍编号或内部ID。")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].strip():
+        await message.reply("用法：/jpcancel 竞拍编号或内部ID")
+        return
+    async with session_scope() as session:
+        auction = await _creator_auction(session, parts[1].strip(), message.from_user.id)
+        result = await _cancel_auction(session, auction, message.from_user.id)
+    await message.reply(result)
+
+
+async def _creator_auction(session: AsyncSession, key: str, user_id: int) -> Auction | None:
+    stmt = select(Auction).where(Auction.creator_id == int(user_id))
+    if key.isdigit():
+        auction = await session.scalar(stmt.where(Auction.id == int(key)))
+        if auction is not None:
+            return auction
+    return await session.scalar(stmt.where(Auction.code == key.upper()))
+
+
+async def _cancel_auction(
+    session: AsyncSession, auction: Auction | None, user_id: int
+) -> str:
+    if auction is None:
+        return "找不到你创建的这个竞拍。"
+    if auction.status != "open":
+        return "只有尚未结束的竞拍可以取消。"
+    changed = (
+        await session.execute(
+            update(Auction)
+            .where(
+                Auction.id == auction.id,
+                Auction.creator_id == int(user_id),
+                Auction.status == "open",
+            )
+            .values(status="cancelled")
+            .returning(Auction.id)
+        )
+    ).first()
+    if changed is None:
+        return "竞拍已被处理，不能取消。"
+    if auction.current_bidder is not None:
+        await repo.adjust_points(
+            session,
+            auction.group_id,
+            auction.current_bidder,
+            int(auction.current_price or 0),
+            f"竞拍取消退款：{auction.item}",
+        )
+    return f"竞拍 {_auction_label(auction)} 已取消。"
+
+
+@router.callback_query(F.data.startswith("aucmanage:"))
+async def auction_management_callback(callback: CallbackQuery, bot: Bot) -> None:
+    if callback.message is None or callback.message.chat.type != "private":
+        await callback.answer("请在私聊中操作。", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) >= 3 and parts[1] == "select" and parts[2].isdigit():
+        async with session_scope() as session:
+            auction = await session.get(Auction, int(parts[2]))
+            if auction is None or auction.creator_id != callback.from_user.id:
+                await callback.answer("找不到这个竞拍。", show_alert=True)
+                return
+            group = await session.get(Group, auction.group_id)
+            bids = int(
+                await session.scalar(
+                    select(func.count(AuctionBid.id)).where(AuctionBid.auction_id == auction.id)
+                )
+                or 0
+            )
+            status_label = {"open": "进行中", "finished": "已成交", "cancelled": "已取消"}.get(
+                auction.status, auction.status
+            )
+            await callback.message.edit_text(
+                f"{_auction_label(auction)} · {escape(auction.item)}\n"
+                f"群组：{escape(group.title if group else str(auction.group_id))}\n"
+                f"状态：{status_label}\n"
+                f"当前价：{auction.current_price} 积分\n"
+                f"领先者：{auction.current_bidder or '—'}\n"
+                f"出价记录：{bids} 条\n"
+                f"截止时间：{auction.ends_at.strftime('%Y-%m-%d %H:%M') if auction.ends_at else '—'}",
+                reply_markup=keyboards.auction_management_kb(
+                    auction.id, auction.status == "open"
+                ),
+            )
+            await callback.answer()
+        return
+    if len(parts) >= 3 and parts[1] == "cancel" and parts[2].isdigit():
+        async with session_scope() as session:
+            auction = await session.get(Auction, int(parts[2]))
+            result = await _cancel_auction(session, auction, callback.from_user.id)
+        await callback.answer(result, show_alert=True)
+        if auction is not None:
+            await _send_auction_history_page(callback.message, callback.from_user.id, 1)
+        return
+    if len(parts) >= 3 and parts[1] == "delete" and parts[2].isdigit():
+        async with session_scope() as session:
+            changed = (
+                await session.execute(
+                    update(Auction)
+                    .where(
+                        Auction.id == int(parts[2]),
+                        Auction.creator_id == int(callback.from_user.id),
+                        Auction.status != "open",
+                    )
+                    .values(status="deleted")
+                    .returning(Auction.id)
+                )
+            ).first()
+        await callback.answer(
+            "记录已删除。" if changed else "只有已结束的竞拍记录可以删除。",
+            show_alert=True,
+        )
+        if changed:
+            await _send_auction_history_page(callback.message, callback.from_user.id, 1)
+        return
+    await callback.answer("未知操作。", show_alert=True)
 
 
 @router.callback_query(F.data.startswith("bid:"))
@@ -1672,7 +2026,10 @@ async def on_bid_button(callback: CallbackQuery) -> None:
             )
             return
         minimum = auction.start_price if auction.current_bidder is None else auction.current_price + max(1, auction.step)
-        await callback.answer(f"发送 /bid 金额 出价，最低 {minimum} 积分。", show_alert=True)
+        await callback.answer(
+            f"{_auction_bid_hint(auction)}，最低 {minimum} 积分。",
+            show_alert=True,
+        )
 
 
 @router.message(Command("bid"))
@@ -1681,10 +2038,15 @@ async def cmd_bid(message: Message, bot: Bot) -> None:
         await message.reply("请在群组中使用。")
         return
     args = helpers.parse_args(message.text)
-    if not args or not args[0].isdigit():
-        await message.reply("用法：/bid 金额（可回复竞拍消息）")
+    code = None
+    amount_arg = args[0] if args else ""
+    if args and not args[0].isdigit():
+        code = args[0].upper()
+        amount_arg = args[1] if len(args) > 1 else ""
+    if not amount_arg.isdigit():
+        await message.reply("用法：/bid 金额，或 /bid 竞拍编号 金额（可回复竞拍消息）")
         return
-    amount = int(args[0])
+    amount = int(amount_arg)
     async with session_scope() as session:
         group = await _group_for_message(session, message)
         if await _feature_denied(session, group, "games"):
@@ -1693,17 +2055,33 @@ async def cmd_bid(message: Message, bot: Bot) -> None:
         if not group.points_enabled:
             await message.reply("本群未开启积分系统。")
             return
-        query = select(Auction).where(
-            Auction.group_id == group.id, Auction.status == "open"
-        )
-        if message.reply_to_message:
-            query = query.where(Auction.message_id == message.reply_to_message.message_id)
+        if code:
+            auction = await _open_auction_for_bid(session, group.id, code)
+            if auction is None:
+                await message.reply("找不到该编号的进行中竞拍。")
+                return
+        elif message.reply_to_message:
+            auction = await session.scalar(
+                select(Auction).where(
+                    Auction.group_id == group.id,
+                    Auction.status == "open",
+                    Auction.message_id == message.reply_to_message.message_id,
+                )
+            )
+            if auction is None:
+                await message.reply("这条消息没有对应的进行中竞拍。")
+                return
         else:
-            query = query.order_by(Auction.id.desc())
-        auction = await session.scalar(query.limit(1))
-        if auction is None:
-            await message.reply("当前没有进行中的竞拍。")
-            return
+            auction = await _open_auction_for_bid(session, group.id)
+            if auction is None:
+                active = await _active_auction_for_group(session, group.id)
+                if active is None:
+                    await message.reply("当前没有进行中的竞拍。")
+                else:
+                    await message.reply(
+                        f"当前有多个竞拍，请发送 /bid {escape(_auction_label(active))} 金额 指定。"
+                    )
+                return
         now = utcnow()
         if auction.ends_at and auction.ends_at <= now:
             await message.reply("竞拍已经结束，等待结算。")
@@ -1712,7 +2090,9 @@ async def cmd_bid(message: Message, bot: Bot) -> None:
         observed_bidder = auction.current_bidder
         minimum = auction.start_price if observed_bidder is None else observed_price + max(1, auction.step)
         if amount < minimum:
-            await message.reply(f"出价太低，最低需要 {minimum} 积分。")
+            await message.reply(
+                f"出价太低，{_auction_bid_hint(auction)}，最低需要 {minimum} 积分。"
+            )
             return
         member = await repo.ensure_member(
             session,
@@ -1738,6 +2118,7 @@ async def cmd_bid(message: Message, bot: Bot) -> None:
                 "出价未生效：已有其他用户抢先出价，请重新出价。"
             )
             return
+        await _refresh_auction_deadline(auction, now)
         if observed_bidder is not None:
             await repo.adjust_points(
                 session,
@@ -1765,8 +2146,10 @@ async def cmd_bid(message: Message, bot: Bot) -> None:
             )
         )
         _member, balance = result
+        deadline = auction.ends_at.strftime("%Y-%m-%d %H:%M") if auction.ends_at else "未设置"
     await message.reply(
-        f"✅ 出价成功：<b>{amount}</b> 积分\n"
+        f"✅ 出价成功：{_auction_label(auction)} · <b>{amount}</b> 积分\n"
         f"当前余额：{balance}\n"
+        f"新的截止时间：{deadline}（UTC）\n"
         "被其他用户超过时，积分会自动退回。"
     )
