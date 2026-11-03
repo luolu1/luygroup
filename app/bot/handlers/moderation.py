@@ -1,6 +1,8 @@
 """Real-time message moderation, flood control and AI mention replies."""
 from __future__ import annotations
 
+import base64
+import io
 import logging
 from datetime import datetime, timedelta
 
@@ -42,6 +44,27 @@ async def _notice(bot: Bot, chat_id: int, text: str, delay: int = 12) -> None:
     await helpers.send_temp_notice(bot, chat_id, text, delay=delay)
 
 
+async def _message_image_data(bot: Bot, message: Message) -> str | None:
+    file_id = ""
+    mime = "image/jpeg"
+    photo = getattr(message, "photo", None)
+    document = getattr(message, "document", None)
+    if photo:
+        file_id = photo[-1].file_id
+    elif document and str(document.mime_type or "").startswith("image/"):
+        file_id = document.file_id
+        mime = document.mime_type or mime
+    if not file_id:
+        return None
+    try:
+        file = await bot.get_file(file_id)
+        buffer = io.BytesIO()
+        await bot.download_file(file.file_path, destination=buffer)
+    except TelegramAPIError:
+        return None
+    return f"data:{mime};base64,{base64.b64encode(buffer.getvalue()).decode()}"
+
+
 @router.message(F.chat.type.in_(["group", "supergroup"]))
 async def on_group_message(message: Message, bot: Bot) -> None:
     user = message.from_user
@@ -52,6 +75,7 @@ async def on_group_message(message: Message, bot: Bot) -> None:
         return
 
     text = message.text or message.caption or ""
+    image_data_url = await _message_image_data(bot, message)
     async with session_scope() as session:
         group = await repo.ensure_group(
             session,
@@ -234,7 +258,7 @@ async def on_group_message(message: Message, bot: Bot) -> None:
         if (
             not detection.hit
             and group.ai_ad_enabled
-            and len(text) >= 4
+            and (len(text) >= 4 or image_data_url is not None)
             and await access.can("ai")
             and await quota.allow_sample(session, group, access=await access.resolve())
             and await quota.allow_request(session, group, access=await access.resolve())
@@ -247,6 +271,7 @@ async def on_group_message(message: Message, bot: Bot) -> None:
                     group.title,
                     group.id,
                     owner_user_id=owner_user_id,
+                    image_data_url=image_data_url,
                 )
             except Exception:
                 log.exception(

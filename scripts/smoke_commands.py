@@ -142,6 +142,9 @@ class FakeMessage:
         self.replies: list[str] = []
         self.reply_kwargs: dict[str, object] = {}
         self.message_id = 7001
+        self.photo = None
+        self.document = None
+        self.caption = ""
 
     async def answer(self, text: str, **kwargs) -> None:
         self.answers.append(text)
@@ -207,6 +210,15 @@ class FakeBot:
     async def send_message(self, *args, **kwargs):
         self.calls.append("send_message")
         return SimpleNamespace(message_id=8001)
+
+    async def get_file(self, file_id):
+        self.calls.append(f"get_file:{file_id}")
+        return SimpleNamespace(file_path=f"photos/{file_id}.jpg")
+
+    async def download_file(self, file_path, destination=None):
+        if destination is not None:
+            destination.write(b"fake-image")
+        return SimpleNamespace()
 
 def command_names_from_menu(text: str) -> set[str]:
     return set(re.findall(r"^/([a-z]+)\b", text, flags=re.MULTILINE))
@@ -656,6 +668,46 @@ async def run_tests() -> None:
     )
     await moderation.on_group_message(ai_failure_message, FakeBot())
     moderation.ai.check_ad = original_check_ad
+
+    ai_image_group = -100920013
+    ai_image_user = 920013
+    await create_group(ai_image_group, "AI image moderation")
+    await create_member(ai_image_group, ai_image_user)
+    async with session_scope() as session:
+        group = await session.get(Group, ai_image_group)
+        assert group is not None
+        group.ai_ad_enabled = True
+        group.anti_ad_enabled = False
+    captured: dict[str, object] = {}
+
+    async def image_check_ad(session, text, group_title, group_id, **kwargs):
+        captured.update(kwargs)
+        return True, "图片广告", SimpleNamespace(
+            ok=True,
+            text="广告",
+            provider="vision-smoke",
+            attempts=1,
+            latency_ms=5,
+            error="",
+        )
+
+    moderation.ai.check_ad = image_check_ad
+    image_message = FakeMessage(
+        user_id=ai_image_user,
+        chat_id=ai_image_group,
+        text="",
+    )
+    image_message.caption = "扫码进群"
+    image_message.photo = [SimpleNamespace(file_id="photo-smoke")]
+    image_bot = FakeBot()
+    await moderation.on_group_message(image_message, image_bot)
+    moderation.ai.check_ad = original_check_ad
+    check(
+        "ai image moderation passes data URL",
+        captured.get("image_data_url", "").startswith("data:image/jpeg;base64,")
+        and "owner_user_id" in captured,
+        str(captured),
+    )
     async with session_scope() as session:
         ai_event = await session.scalar(
             select(AIEvent)

@@ -61,6 +61,7 @@ async def main() -> None:
                     name="second",
                     base_url="https://second.example/v1",
                     model="model-b",
+                    vision_model="vision-b",
                     enabled=True,
                     priority=2,
                 ),
@@ -119,6 +120,60 @@ async def main() -> None:
     assert not failed.ok and failed.attempts == 2
     assert len(exhausted_clients) == 1 and exhausted_clients[0].closed
     print("PASS exhausted provider fallback closes its HTTP client")
+
+    vision_clients: list[FakeClient] = []
+
+    def vision_client_factory(**kwargs):
+        client = FakeClient(responses=[response_ok], **kwargs)
+        vision_clients.append(client)
+        return client
+
+    ai.httpx.AsyncClient = vision_client_factory
+    try:
+        async with session_scope() as session:
+            image_result = await ai.check_ad(
+                session,
+                "图片广告",
+                "测试群",
+                -1001,
+                image_data_url="data:image/jpeg;base64,AAAA",
+            )
+    finally:
+        ai.httpx.AsyncClient = original_client
+    assert image_result[2].ok and image_result[2].provider == "second"
+    assert vision_clients[0].posts == [
+        "https://second.example/v1/chat/completions"
+    ]
+    print("PASS vision check uses configured image model")
+
+    original_get = ai.httpx.AsyncClient
+    class FakeResponse:
+        def __init__(self):
+            self.status_code = 200
+            self.text = ""
+        def json(self):
+            return {"data": [
+                {"id": "deepseek-chat"},
+                {"id": "qwen2.5-vl-32b-instruct"},
+                {"id": "gpt-4o-mini"},
+                {"id": "embedding-v1"},
+            ]}
+    class FakeGetClient:
+        def __init__(self, **_kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *_args):
+            pass
+        async def get(self, *args, **kwargs):
+            return FakeResponse()
+    ai.httpx.AsyncClient = FakeGetClient
+    try:
+        vision_models = await ai.fetch_models("https://api.deepseek.com/v1", kind="vision")
+    finally:
+        ai.httpx.AsyncClient = original_get
+    assert vision_models == ["gpt-4o-mini", "qwen2.5-vl-32b-instruct"], vision_models
+    print("PASS vision model filtering returns image-capable models")
     await dispose_db()
 
 

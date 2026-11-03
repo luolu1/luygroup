@@ -206,8 +206,9 @@ async def fetch_models(
     api_key: str = "",
     *,
     timeout: float | None = None,
+    kind: str = "text",
 ) -> list[str]:
-    """Fetch the supplier's model list through the OpenAI-compatible /models API."""
+    """Fetch text or vision-capable models through the OpenAI-compatible /models API."""
     endpoint = _models_endpoint(validated_base_url(base_url))
     headers = {"Accept": "application/json"}
     if api_key:
@@ -261,25 +262,48 @@ async def fetch_models(
         raw = payload.get("models")
     if not isinstance(raw, list):
         raise ValueError("供应商没有返回模型列表")
-    models: set[str] = set()
+    models: dict[str, dict[str, Any]] = {}
     for item in raw:
         if isinstance(item, str):
-            value = item
+            value = item.strip()
+            metadata: dict[str, Any] = {}
         elif isinstance(item, dict):
-            value = item.get("id") or item.get("name") or item.get("model") or ""
+            value = str(item.get("id") or item.get("name") or item.get("model") or "").strip()
+            metadata = item
         else:
             value = ""
-        value = str(value).strip()
+            metadata = {}
         if value:
-            models.add(value)
+            models[value] = metadata
     if not models:
         raise ValueError("供应商返回的模型列表为空")
-    # Hide obvious non-chat models while keeping the list usable.
+    if kind == "vision":
+        vision_models = {
+            name: metadata
+            for name, metadata in models.items()
+            if _looks_like_vision_model(name, metadata)
+        }
+        if not vision_models:
+            raise ValueError("供应商模型列表中没有识别到支持图像的模型，请手动填写模型名")
+        return sorted(vision_models)[:500]
     blocked = ("embedding", "whisper", "tts", "dall-e", "moderation", "rerank")
     cleaned = sorted(
-        model for model in models if not any(token in model.lower() for token in blocked)
+        name for name in models if not any(token in name.lower() for token in blocked)
     )
     return cleaned[:500] or sorted(models)[:500]
+
+
+def _looks_like_vision_model(name: str, metadata: dict[str, Any]) -> bool:
+    capabilities = metadata.get("capabilities") or metadata.get("modalities") or metadata.get("input_modalities")
+    if isinstance(capabilities, dict):
+        capabilities = list(capabilities)
+    if isinstance(capabilities, list) and any("vision" in str(item).lower() or "image" in str(item).lower() for item in capabilities):
+        return True
+    text = " ".join(
+        str(metadata.get(key) or "")
+        for key in ("id", "name", "model", "description", "architecture")
+    ).lower()
+    return any(token in text for token in ("vision", "vl", "multimodal", "qwen2.5-vl", "gpt-4o", "gemini", "claude-3"))
 
 
 async def enabled_providers(
@@ -302,16 +326,83 @@ async def enabled_providers(
     return [p for p in result.all() if p.base_url and p.model]
 
 
+async def _chat_once(
+    provider: AIProvider,
+    client: httpx.AsyncClient,
+    messages: list[dict[str, Any]],
+    *,
+    model: str,
+    temperature: float,
+    max_tokens: int,
+    json_mode: bool,
+) -> AIResult:
+    endpoint = _endpoint(provider.base_url)
+    headers = {"Content-Type": "application/json"}
+    if provider.api_key:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    if json_mode:
+        payload["response_format"] = {"type": "json_object"}
+    started = time.monotonic()
+    try:
+        response = await client.post(endpoint, headers=headers, json=payload)
+        latency = int((time.monotonic() - started) * 1000)
+        if response.status_code >= 400:
+            return AIResult(
+                ok=False,
+                error=f"{provider.name}: HTTP {response.status_code} {response.text[:200]}",
+                provider=provider.name,
+                latency_ms=latency,
+            )
+        data = response.json()
+        text = (
+            data.get("choices", [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+        if isinstance(text, list):
+            text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
+        if not text:
+            return AIResult(
+                ok=False,
+                error=f"{provider.name}: 空响应",
+                provider=provider.name,
+                latency_ms=latency,
+            )
+        return AIResult(
+            ok=True,
+            text=text.strip(),
+            provider=provider.name,
+            latency_ms=latency,
+        )
+    except Exception as exc:
+        return AIResult(
+            ok=False,
+            error=f"{provider.name}: {type(exc).__name__}: {exc}",
+            provider=provider.name,
+        )
+
+
 async def chat(
     session: AsyncSession,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     *,
     temperature: float = 0.3,
     max_tokens: int = 600,
     json_mode: bool = False,
     owner_user_id: int | None = None,
+    vision: bool = False,
 ) -> AIResult:
     providers = await enabled_providers(session, owner_user_id)
+    if vision:
+        providers = [p for p in providers if p.vision_model]
+        if not providers:
+            return AIResult(ok=False, error="没有配置图像模型的启用接口")
     if not providers:
         return AIResult(ok=False, error="没有启用可用的 AI 接口")
 
@@ -322,47 +413,20 @@ async def chat(
     async with httpx.AsyncClient(timeout=timeout) as client:
         for provider in providers:
             attempts += 1
-            endpoint = _endpoint(provider.base_url)
-            headers = {"Content-Type": "application/json"}
-            if provider.api_key:
-                headers["Authorization"] = f"Bearer {provider.api_key}"
-            payload: dict[str, Any] = {
-                "model": provider.model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            }
-            if json_mode:
-                payload["response_format"] = {"type": "json_object"}
-
-            started = time.monotonic()
-            try:
-                response = await client.post(endpoint, headers=headers, json=payload)
-                latency = int((time.monotonic() - started) * 1000)
-                if response.status_code >= 400:
-                    last_error = f"{provider.name}: HTTP {response.status_code} {response.text[:200]}"
-                    continue
-                data = response.json()
-                text = (
-                    data.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                )
-                if isinstance(text, list):
-                    text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
-                if not text:
-                    last_error = f"{provider.name}: 空响应"
-                    continue
-                return AIResult(
-                    ok=True,
-                    text=text.strip(),
-                    provider=provider.name,
-                    latency_ms=latency,
-                    attempts=attempts,
-                )
-            except Exception as exc:
-                last_error = f"{provider.name}: {type(exc).__name__}: {exc}"
-                continue
+            model = provider.vision_model if vision else provider.model
+            result = await _chat_once(
+                provider,
+                client,
+                messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=json_mode,
+            )
+            if result.ok:
+                result.attempts = attempts
+                return result
+            last_error = result.error
 
     return AIResult(ok=False, error=last_error or "AI 调用失败", attempts=attempts)
 
@@ -401,6 +465,7 @@ async def check_ad(
     group_id: int = 0,
     *,
     owner_user_id: int | None = None,
+    image_data_url: str | None = None,
 ) -> tuple[bool, str, AIResult]:
     cached = learning_store.get("ad", group_id, text)
     if cached is not None:
@@ -412,6 +477,37 @@ async def check_ad(
             provider="learning-cache",
             cached=True,
         )
+
+    if image_data_url:
+        content: list[dict[str, Any]] = [
+            {"type": "text", "text": f"群组：{group_title or '未命名'}\n待审核图片："},
+            {"type": "image_url", "image_url": {"url": image_data_url}},
+        ]
+        if text:
+            content[0]["text"] += f"\n图片说明：{text[:2000]}"
+        messages = [
+            {"role": "system", "content": MODERATION_SYSTEM},
+            {"role": "user", "content": content},
+        ]
+        result = await chat(
+            session,
+            messages,
+            temperature=0.0,
+            max_tokens=220,
+            json_mode=True,
+            owner_user_id=owner_user_id,
+            vision=True,
+        )
+        if result.ok:
+            is_ad, reason, _confidence = parse_moderation(result.text)
+            await learning_store.put(
+                "ad",
+                group_id,
+                text or "[image]",
+                reason or ("广告" if is_ad else "正常消息"),
+                meta={"is_ad": is_ad, "reason": reason, "provider": result.provider},
+            )
+            return is_ad, reason, result
 
     messages = [
         {"role": "system", "content": MODERATION_SYSTEM},
@@ -429,7 +525,6 @@ async def check_ad(
         owner_user_id=owner_user_id,
     )
     if not result.ok:
-        # Some gateways reject response_format. Retry once without it.
         result = await chat(
             session,
             messages,
