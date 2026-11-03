@@ -168,7 +168,11 @@ class FakeBot:
         self.restricted.append((int(chat_id), int(user_id)))
 
     async def ban_chat_member(self, chat_id, user_id, **kwargs) -> None:
-        self.calls.append(f"ban:{chat_id}:{user_id}")
+        revoke = bool(kwargs.get("revoke_messages"))
+        if revoke and getattr(self, "fail_revoke", False):
+            from aiogram.exceptions import TelegramAPIError
+            raise TelegramAPIError(method="banChatMember", message="cannot delete messages")
+        self.calls.append(f"ban:{chat_id}:{user_id}:revoke={int(revoke)}")
 
     async def delete_message(self, chat_id, message_id) -> None:
         self.calls.append(f"delete_message:{message_id}")
@@ -374,11 +378,34 @@ async def run_tests() -> None:
     await asyncio.sleep(2.1)
     check(
         "/ban deletes its command message when enabled",
-        "ban:-100915000:915099" in command_bot.calls
+        "ban:-100915000:915099:revoke=1" in command_bot.calls
         and "delete_message:7001" in command_bot.calls
         and "send_message" in command_bot.calls
         and not command_msg.replies,
         str(command_bot.calls),
+    )
+
+    ban2_group_id = -100915003
+    ban2_user_id = 915003
+    await create_console_user(ban2_user_id, "subscriber")
+    await create_group(ban2_group_id, "Ban revoke fallback")
+    await bind_group(ban2_user_id, ban2_group_id)
+    ban2_bot = FakeBot()
+    ban2_bot.membership_status = "administrator"
+    ban2_bot.membership_by_user[915199] = "member"
+    ban2_bot.fail_revoke = True
+    ban2_msg = FakeMessage(
+        user_id=ban2_user_id, chat_id=ban2_group_id, text="/ban",
+    )
+    ban2_msg.reply_to_message = SimpleNamespace(
+        message_id=7002,
+        from_user=FakeUser(915199, "Target"),
+    )
+    await admin_handlers.cmd_ban(ban2_msg, ban2_bot)
+    check(
+        "/ban falls back to plain ban when cannot delete messages",
+        "ban:-100915003:915199:revoke=0" in ban2_bot.calls,
+        str(ban2_bot.calls),
     )
 
     token_user_id = 915001

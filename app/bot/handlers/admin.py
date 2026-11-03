@@ -97,19 +97,42 @@ async def cmd_ban(message: Message, bot: Bot) -> None:
             await _reply_error(message, why)
             return
         reason = " ".join(args[1:]) if not message.reply_to_message else " ".join(args)
+        revoked = True
         try:
             result = await helpers.ban_user(
+                bot,
+                session,
+                group,
+                target,
+                reason=reason,
+                admin_id=actor,
+                revoke=True,
+            )
+        except TelegramAPIError:
+            revoked = False
+            try:
+                result = await helpers.ban_user(
+                    bot,
+                    session,
+                    group,
+                    target,
+                    reason=reason,
+                    admin_id=actor,
+                    revoke=False,
+                )
+            except TelegramAPIError as exc:
+                await _reply_error(message, f"封禁失败：{exc}")
+                return
+        if group.crossban_enabled:
+            linked = await helpers.apply_crossban(
                 bot, session, group, target, reason=reason, admin_id=actor
             )
-            if group.crossban_enabled:
-                linked = await helpers.apply_crossban(
-                    bot, session, group, target, reason=reason, admin_id=actor
-                )
-                if linked:
-                    result += f"\n🔗 已联动封禁：{escape('、'.join(linked))}"
-        except TelegramAPIError as exc:
-            await _reply_error(message, f"封禁失败：{exc}")
-            return
+            if linked:
+                result += f"\n🔗 已联动封禁：{escape('、'.join(linked))}"
+        if revoked:
+            result += "\n🧹 已同时删除该用户在群内的全部消息与回应。"
+        else:
+            result += "\n⚠️ 机器人缺少删除消息权限，已仅执行封禁。"
         if message.reply_to_message is not None:
             await helpers.delete_message_safe(
                 bot, group.id, message.reply_to_message.message_id
