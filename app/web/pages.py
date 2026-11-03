@@ -2974,8 +2974,11 @@ async def ai_models(
             return JSONResponse({"ok": False, "error": "接口不存在"}, status_code=404)
         base_url = base_url or provider.base_url
         api_key = api_key or provider.api_key
+    kind = str(payload.get("kind") or "text").strip().lower()
+    if kind not in {"text", "vision"}:
+        kind = "text"
     try:
-        models = await ai_service.fetch_models(base_url, api_key)
+        models = await ai_service.fetch_models(base_url, api_key, kind=kind)
     except ValueError as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
     return JSONResponse({"ok": True, "models": models})
@@ -3029,6 +3032,7 @@ async def add_ai_provider(
             base_url=base_url,
             api_key=_text(form, "api_key", 512),
             model=model,
+            vision_model=_text(form, "vision_model", 128),
             priority=_int(form, "priority", 100, 0, 100000),
             enabled=_bool(form, "enabled"),
             builtin=False,
@@ -3064,6 +3068,7 @@ async def update_ai_provider(
     if new_key:
         provider.api_key = new_key
     provider.model = model
+    provider.vision_model = _text(form, "vision_model", 128, provider.vision_model or "")
     provider.priority = _int(form, "priority", provider.priority or 100, 0, 100000)
     provider.enabled = _bool(form, "enabled")
     return _redirect("/ai", msg="接口配置已更新")

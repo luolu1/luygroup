@@ -43,20 +43,28 @@
         <div class="hint">可以省略协议：例如 <code>vyceai.com/v1</code> 会自动补全为 <code>https://vyceai.com/v1</code>。</div>
       </div>
       <div class="field span-2">
-        <label for="model">模型</label>
+        <label for="model">文本模型</label>
         <div class="row">
-          <input id="model" name="model" type="text" maxlength="128" required
-                 placeholder="deepseek-chat" style="flex:1;min-width:220px" data-model>
-          <button type="button" class="ghost sm" data-fetch-models>获取供应商模型</button>
+          <select id="model" name="model" data-model-select required></select>
+          <button type="button" class="ghost sm nowrap" data-fetch-models
+                  title="重新获取供应商模型" aria-label="重新获取文本模型">刷新</button>
         </div>
-        <select data-model-select style="margin-top:8px;display:none"></select>
-        <div class="hint" data-model-status>也可以直接手动填写模型 ID。</div>
+        <div class="hint" data-model-status>自动获取供应商模型列表。</div>
       </div>
-      <div class="field">
-        <label for="priority">优先级</label>
-        <input id="priority" name="priority" type="number" min="0" max="100000" value="100">
-        <div class="hint">数值越小越优先。</div>
-      </div>
+       <div class="field span-2">
+         <label for="vision_model">图像模型（可选）</label>
+         <div class="row">
+           <select id="vision_model" name="vision_model" data-vision-model-select></select>
+           <button type="button" class="ghost sm nowrap" data-fetch-vision-models
+                   title="重新获取图像模型" aria-label="重新获取图像模型">刷新</button>
+         </div>
+         <div class="hint" data-vision-model-status>仅显示支持图像输入的模型，留空表示不启用。</div>
+       </div>
+       <div class="field">
+         <label for="priority">优先级</label>
+         <input id="priority" name="priority" type="number" min="0" max="100000" value="100">
+         <div class="hint">数值越小越优先。</div>
+       </div>
       <div class="field">
         <label>状态</label>
         <label class="inline"><input class="check" type="checkbox" name="enabled" checked> 启用</label>
@@ -82,5 +90,5 @@
 </div>
 {% endblock %}
 {% block scripts %}
-<script src="/static/ai.js?v=20261020-7"></script>
+<script src="/static/ai.js?v=20261103-2"></script>
 {% endblock %}

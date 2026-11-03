@@ -514,12 +514,30 @@ try:
             f"{r.status_code} {row}",
         )
 
+        r = client.post(
+            f"/ai/providers/{provider_id}/update",
+            data={"vision_model": "vision-smoke", "enabled": "on"},
+            follow_redirects=False,
+        )
+        con = connect()
+        row = con.execute(
+            "SELECT vision_model FROM ai_providers WHERE id=?",
+            (provider_id,),
+        ).fetchone()
+        con.close()
+        check(
+            "ai provider saves vision model",
+            r.status_code == 303 and row == ("vision-smoke",),
+            f"{r.status_code} {row}",
+        )
+
         # Restore the fixture provider for the remaining AI checks.
         client.post(
             f"/ai/providers/{provider_id}/update",
             data={
                 "base_url": "https://api.deepseek.com/v1",
                 "model": "deepseek-chat",
+                "vision_model": "",
                 "enabled": "on",
             },
             follow_redirects=False,
@@ -530,7 +548,10 @@ try:
             "ai add page",
             r.status_code == 200
             and 'action="/ai/providers/add"' in r.text
-            and "获取供应商模型" in r.text,
+            and 'data-fetch-models' in r.text
+            and 'data-fetch-vision-models' in r.text
+            and 'data-model-select' in r.text
+            and 'data-vision-model-select' in r.text,
             r.text[:500],
         )
 
@@ -546,30 +567,20 @@ try:
             r.text[:500],
         )
         check(
-            "ai js edit toggle and auto submit",
-            'querySelectorAll("[data-edit-toggle]")' in ai_js
-            and 'closest("[data-auto-submit]")' in ai_js
-            and "form.submit()" in ai_js,
+            "ai js auto-submit change listener",
+            'closest("[data-auto-submit]")' in ai_js and "form.submit()" in ai_js,
             ai_js[:300],
         )
         check(
-            "ai js quick model fetch and custom input",
-            'querySelectorAll("form[data-model-form]")' in ai_js
-            and 'querySelector("[data-model-trigger]")' in ai_js
-            and 'querySelector("[data-model-menu]")' in ai_js
-            and 'querySelector("[data-model-search]")' in ai_js
-            and 'querySelector("[data-model-list]")' in ai_js
+            "ai js model dropdown auto-fetch",
+            "setupModelSelect" in ai_js
+            and 'data-model-select' in ai_js
+            and 'data-vision-model-select' in ai_js
+            and 'kind: "vision"' in ai_js
+            and 'kind === "vision"' in ai_js
             and 'fetch("/ai/models"' in ai_js
             and "provider_id" in ai_js
-            and "form.dataset.fallback" in ai_js
-            and 'event.key !== "Enter"' in ai_js
-            and 'event.key !== "Escape"' in ai_js
-            and "applyModel" in ai_js
-            and "form.submit()" in ai_js
-            and 'classList.add("loading")' in ai_js
-            and "aria-busy" in ai_js
-            and "dataset.skipChange" not in ai_js
-            and 'querySelector("[data-model-input]")' not in ai_js,
+            and "load(false)" in ai_js,
             ai_js[:300],
         )
 
@@ -760,8 +771,10 @@ try:
 
         model_calls: list[tuple[str, str]] = []
 
-        async def fake_fetch_models(base_url: str, api_key: str) -> list[str]:
-            model_calls.append((base_url, api_key))
+        async def fake_fetch_models(base_url: str, api_key: str, *, kind: str = "text") -> list[str]:
+            model_calls.append((base_url, api_key, kind))
+            if kind == "vision":
+                return ["gpt-4o-mini", "qwen2.5-vl-32b-instruct"]
             return ["deepseek-chat", "deepseek-reasoner"]
 
         web_pages.ai_service.fetch_models = fake_fetch_models
@@ -774,12 +787,30 @@ try:
             r.status_code == 200 and r.json().get("models") == ["deepseek-chat", "deepseek-reasoner"],
             r.text[:300],
         )
+        r = client.post(
+            "/ai/models",
+            json={"base_url": "https://api.deepseek.com/v1", "api_key": "sk-smoke", "kind": "vision"},
+        )
+        check(
+            "ai vision models fetch",
+            r.status_code == 200 and r.json().get("models") == ["gpt-4o-mini", "qwen2.5-vl-32b-instruct"],
+            r.text[:300],
+        )
         r = client.post("/ai/models", json={"provider_id": provider_id})
         check(
             "ai models fetch by provider",
             r.status_code == 200
             and r.json().get("models") == ["deepseek-chat", "deepseek-reasoner"]
-            and model_calls[-1] == ("https://api.deepseek.com/v1", "sk-smoke"),
+            and model_calls[-1] == ("https://api.deepseek.com/v1", "sk-smoke", "text"),
+            f"{r.status_code} {r.text[:300]} {model_calls[-1:]!r}",
+        )
+
+        r = client.post("/ai/models", json={"provider_id": provider_id, "kind": "vision"})
+        check(
+            "ai vision models fetch by provider",
+            r.status_code == 200
+            and r.json().get("models") == ["gpt-4o-mini", "qwen2.5-vl-32b-instruct"]
+            and model_calls[-1] == ("https://api.deepseek.com/v1", "sk-smoke", "vision"),
             f"{r.status_code} {r.text[:300]} {model_calls[-1:]!r}",
         )
 
