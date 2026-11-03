@@ -140,8 +140,7 @@
                 data-confirm="确定删除接口 {{ p.name }}？">
             <button class="provider-action danger" type="submit">删除</button>
           </form>
-          <button type="button" class="provider-action accent" data-edit-toggle="provider-edit-{{ p.id }}"
-                  aria-expanded="false" aria-controls="provider-edit-{{ p.id }}">编辑</button>
+          <a class="provider-action accent" href="/ai/providers/{{ p.id }}">编辑</a>
           {% endif %}
           <span class="badge">优先级 {{ p.priority }}</span>
           {% if provider_editable(p) %}
@@ -173,115 +172,15 @@
           <span class="badge bad"><span class="dot"></span>未配置</span>
           {% endif %}
         </div>
-        {% if provider_editable(p) %}
-        <form method="post" action="/ai/providers/{{ p.id }}/update" class="quick-control">
-          {% if p.enabled %}<input type="hidden" name="enabled" value="on">{% endif %}
-          <span class="quick-label">供应商</span>
-          <select name="base_url" data-auto-submit title="选择后立即保存供应商">
-            {% if not preset %}
-            <option value="{{ p.base_url or '' }}" selected>自定义（当前地址）</option>
-            {% endif %}
-            {% for item in presets if item.base_url %}
-            <option value="{{ item.base_url }}" {% if preset and item.id == preset.id %}selected{% endif %}>{{ item.label }}</option>
-            {% endfor %}
-          </select>
-        </form>
-        {% set models = preset.models if preset else [] %}
-        <form method="post" action="/ai/providers/{{ p.id }}/update"
-              class="quick-control quick-model" data-model-form
-              data-provider-id="{{ p.id }}"
-              data-base-url="{{ p.base_url or '' }}"
-              data-fallback="{% if p.model and p.model not in models %}{{ p.model }}|{% endif %}{{ models|join('|') }}">
-          {% if p.enabled %}<input type="hidden" name="enabled" value="on">{% endif %}
-          <span class="quick-label">模型</span>
-          <input type="hidden" name="model" value="{{ p.model or '' }}" data-model-value>
-          <div class="quick-model-picker" data-model-picker>
-            <button type="button" class="quick-model-trigger" data-model-trigger
-                    aria-haspopup="listbox" aria-expanded="false"
-                    aria-controls="model-menu-{{ p.id }}"
-                    title="点击获取并选择模型，也可手动输入">
-              <span class="quick-model-current" data-model-current
-                    title="{{ p.model or '选择模型' }}">{{ p.model or '选择模型' }}</span>
-              <svg class="quick-model-caret" viewBox="0 0 24 24" width="12" height="12"
-                   fill="none" stroke="currentColor" stroke-width="2"
-                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="m6 9 6 6 6-6"></path>
-              </svg>
-            </button>
-            <div class="quick-model-menu" id="model-menu-{{ p.id }}" data-model-menu hidden>
-              <div class="quick-model-loading" data-model-loading>正在获取模型…</div>
-              <input type="text" class="quick-model-search" data-model-search
-                     placeholder="搜索或输入自定义模型" autocomplete="off"
-                     spellcheck="false" aria-label="搜索或输入模型">
-              <div class="quick-model-list" role="listbox" data-model-list></div>
-              <div class="quick-model-empty" data-model-empty hidden>暂无可选模型</div>
-              <div class="quick-model-error" data-model-error hidden></div>
-              <div class="quick-model-footer">
-                <button type="button" class="quick-model-refresh" data-model-refresh>↻ 重新获取</button>
-                <span class="quick-model-hint">回车应用自定义名称</span>
-              </div>
-            </div>
-          </div>
-        </form>
-        {% else %}
         <div class="provider-fact">
-          <span class="fact-label">模型</span>
+          <span class="fact-label">文本模型</span>
           <span class="mono small">{{ p.model or '—' }}</span>
         </div>
-        {% endif %}
+        <div class="provider-fact">
+          <span class="fact-label">图像模型</span>
+          <span class="mono small">{{ p.vision_model or '—' }}</span>
+        </div>
       </div>
-
-      {% if provider_editable(p) %}
-      <div class="provider-edit-panel" id="provider-edit-{{ p.id }}" hidden>
-        <form method="post" action="/ai/providers/{{ p.id }}/update" class="provider-form"
-              data-provider-id="{{ p.id }}">
-          <div class="form-grid">
-            <div class="field">
-              <label>供应商模板</label>
-              <select data-preset>
-                {% for item in presets %}
-                <option value="{{ item.id }}" data-base-url="{{ item.base_url }}"
-                        data-models="{{ item.models|join('|') }}" data-hint="{{ item.hint }}">{{ item.label }}</option>
-                {% endfor %}
-              </select>
-              <div class="hint" data-preset-hint>切换供应商会修改下方接口地址；模型可重新拉取。</div>
-            </div>
-            <div class="field">
-              <label>显示名称</label>
-              <input name="label" type="text" maxlength="128" value="{{ p.label or '' }}">
-            </div>
-            <div class="field span-2">
-              <label>接口地址</label>
-              <input name="base_url" type="text" maxlength="512" value="{{ p.base_url or '' }}" data-base-url>
-            </div>
-            <div class="field">
-              <label>API Key（留空保持不变）</label>
-              <input name="api_key" type="password" maxlength="512" data-api-key
-                     placeholder="{{ '已配置，留空不修改' if p.api_key else '未配置' }}">
-            </div>
-            <div class="field">
-              <label>模型</label>
-              <div class="row">
-                <input name="model" type="text" maxlength="128" value="{{ p.model or '' }}"
-                       style="flex:1;min-width:180px" data-model>
-                <button type="button" class="ghost sm" data-fetch-models>获取模型</button>
-              </div>
-              <select data-model-select style="margin-top:8px;display:none"></select>
-              <div class="hint" data-model-status>可以直接切换为供应商提供的其它模型。</div>
-            </div>
-            <div class="field">
-              <label>优先级</label>
-              <input name="priority" type="number" min="0" max="100000" value="{{ p.priority }}">
-            </div>
-            <div class="field">
-              <label>状态</label>
-              <label class="inline"><input class="check" type="checkbox" name="enabled" {% if p.enabled %}checked{% endif %}> 启用</label>
-            </div>
-          </div>
-          <div class="form-actions"><button class="ghost sm" type="submit">保存修改</button></div>
-        </form>
-      </div>
-      {% endif %}
     </div>
     {% endfor %}
   </div>
@@ -342,5 +241,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/ai.js?v=20261020-7"></script>
+<script src="/static/ai.js?v=20261103-2"></script>
 {% endblock %}

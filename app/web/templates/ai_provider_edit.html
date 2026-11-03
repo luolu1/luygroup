@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}编辑 AI 接口{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">AI PROVIDERS</div>
+    <h1>编辑 AI 接口</h1>
+    <div class="muted small">配置 {{ provider.label or provider.name }} 的供应商、文本模型与图像模型。</div>
+  </div>
+  <a class="btn ghost sm" href="/ai">返回接口列表</a>
+</div>
+
+<div class="card">
+  <form method="post" action="/ai/providers/{{ provider.id }}/update" class="provider-form" data-provider-id="{{ provider.id }}">
+    <div class="form-grid">
+      <div class="field">
+        <label>供应商模板</label>
+        <select data-preset>
+          {% for item in presets %}
+          <option value="{{ item.id }}" data-base-url="{{ item.base_url }}"
+                  data-models="{{ item.models|join('|') }}" data-hint="{{ item.hint }}">{{ item.label }}</option>
+          {% endfor %}
+        </select>
+        <div class="hint" data-preset-hint>切换供应商会修改下方接口地址；模型可重新拉取。</div>
+      </div>
+      <div class="field">
+        <label>显示名称</label>
+        <input name="label" type="text" maxlength="128" value="{{ provider.label or '' }}">
+      </div>
+      <div class="field span-2">
+        <label>接口地址</label>
+        <input name="base_url" type="text" maxlength="512" value="{{ provider.base_url or '' }}" data-base-url>
+      </div>
+      <div class="field">
+        <label>API Key（留空保持不变）</label>
+        <input name="api_key" type="password" maxlength="512" data-api-key
+               placeholder="{{ '已配置，留空不修改' if provider.api_key else '未配置' }}">
+      </div>
+      <div class="field span-2">
+        <label>文本模型</label>
+        <div class="row">
+          <select name="model" data-model-select data-current="{{ provider.model or '' }}" required></select>
+          <button type="button" class="ghost sm nowrap" data-fetch-models
+                  title="重新获取供应商模型" aria-label="重新获取文本模型">刷新</button>
+        </div>
+        <div class="hint" data-model-status>自动获取供应商模型列表。</div>
+      </div>
+      <div class="field span-2">
+        <label>图像模型</label>
+        <div class="row">
+          <select name="vision_model" data-vision-model-select data-current="{{ provider.vision_model or '' }}"></select>
+          <button type="button" class="ghost sm nowrap" data-fetch-vision-models
+                  title="重新获取图像模型" aria-label="重新获取图像模型">刷新</button>
+        </div>
+        <div class="hint" data-vision-model-status>仅显示支持图像输入的模型，留空表示不启用。</div>
+      </div>
+      <div class="field">
+        <label>优先级</label>
+        <input name="priority" type="number" min="0" max="100000" value="{{ provider.priority }}">
+      </div>
+      <div class="field">
+        <label>状态</label>
+        <label class="inline"><input class="check" type="checkbox" name="enabled" {% if provider.enabled %}checked{% endif %}> 启用</label>
+      </div>
+    </div>
+    <div class="form-actions">
+      <button class="ghost sm" type="submit">保存修改</button>
+      <a class="btn ghost sm" href="/ai">取消</a>
+    </div>
+  </form>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="/static/ai.js?v=20261103-2"></script>
+{% endblock %}

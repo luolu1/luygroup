@@ -447,12 +447,14 @@ try:
             all(
                 marker in r.text
                 for marker in (
-                    'class="provider-tools"',
-                    ">测试连通</button>",
-                    ">删除</button>",
-                    'data-edit-toggle="provider-edit-',
-                    'class="provider-switch"',
-                    ">优先级 1</span>",
+                     'class="provider-tools"',
+                     ">测试连通</button>",
+                     ">删除</button>",
+                     'href="/ai/providers/',
+                     'class="provider-switch"',
+                     ">优先级 1</span>",
+                     "文本模型",
+                     "图像模型",
                 )
             )
             and "编辑 / 切换供应商与模型" not in r.text
@@ -461,21 +463,26 @@ try:
         )
         check(
             "ai provider quick model dropdown",
-            r.text.count('class="quick-control"') >= 2
-            and 'name="base_url" data-auto-submit' in r.text
-            and 'class="quick-control quick-model" data-model-form' in r.text
-            and 'data-fallback=' in r.text
-            and 'class="quick-model-trigger"' in r.text
-            and 'data-model-trigger' in r.text
-            and 'data-model-menu' in r.text
-            and 'data-model-search' in r.text
-            and 'data-model-refresh' in r.text
-            and 'data-model-value' in r.text
-            and 'class="quick-model-input"' not in r.text
-            and "<datalist" not in r.text
-            and 'name="model" data-auto-submit' not in r.text
-            and 'class="provider-edit-panel"' in r.text,
+            'href="/ai/providers/' in r.text
+            and 'data-edit-toggle=' not in r.text
+            and "文本模型" in r.text
+            and "图像模型" in r.text
+            and "provider-edit-panel" not in r.text,
             r.text[:600],
+        )
+
+        edit_page = client.get(f"/ai/providers/{provider_id}")
+        check(
+            "ai provider edit subpage",
+            edit_page.status_code == 200
+            and 'action="/ai/providers/' in edit_page.text
+            and 'name="model"' in edit_page.text
+            and 'name="vision_model"' in edit_page.text
+            and 'data-model-select' in edit_page.text
+            and 'data-vision-model-select' in edit_page.text
+            and 'data-fetch-vision-models' in edit_page.text
+            and "保存修改" in edit_page.text,
+            edit_page.text[:600],
         )
 
         r = client.post(

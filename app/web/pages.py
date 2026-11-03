@@ -2852,6 +2852,27 @@ async def ai_add_page(request: Request) -> HTMLResponse:
     )
 
 
+@router.get("/ai/providers/{provider_id}", response_class=HTMLResponse)
+async def ai_provider_edit_page(
+    provider_id: int,
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+) -> HTMLResponse:
+    ent = _require_feature(request, "ai_providers")
+    provider = await session.get(AIProvider, provider_id)
+    if provider is None or not _provider_visible(ent, provider):
+        raise HTTPException(status_code=404, detail="接口不存在")
+    if not _provider_editable(ent, provider):
+        raise HTTPException(status_code=403, detail="不能编辑其他用户或系统内置接口")
+    return _render(
+        request,
+        "ai_provider_edit.html",
+        provider=provider,
+        defaults=get_config().ai,
+        presets=ai_service.PROVIDER_PRESETS,
+    )
+
+
 @router.get("/ai", response_class=HTMLResponse)
 async def ai_page(request: Request, session: AsyncSession = Depends(get_session)) -> HTMLResponse:
     ent = _require_feature(request, "ai_providers")
