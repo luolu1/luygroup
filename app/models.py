@@ -423,6 +423,7 @@ class AIProvider(Base):
     base_url = Column(String(512), default="")
     api_key = Column(String(512), default="")
     model = Column(String(128), default="")
+    vision_model = Column(String(128), default="")
     priority = Column(Integer, default=100)
     enabled = Column(Boolean, default=True)
     builtin = Column(Boolean, default=False)

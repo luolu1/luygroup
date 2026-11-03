@@ -111,6 +111,7 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
         },
         "ai_providers": {
             "owner_user_id": "INTEGER",
+            "vision_model": "VARCHAR(128) DEFAULT ''",
         },
         "global_blacklist": {
             "owner_user_id": "INTEGER",
