@@ -25,12 +25,18 @@ from app.db import dispose_db, get_engine, init_db, session_scope  # noqa: E402
 from app.models import (  # noqa: E402
     AdminLog,
     Group,
+    Lottery,
+    LotteryEntry,
     Member,
     RequiredChannel,
     Verification,
     utcnow,
 )
-from app.services.scheduler import cleanup_members, expire_verifications  # noqa: E402
+from app.services.scheduler import (
+    cleanup_members,
+    draw_lotteries,
+    expire_verifications,
+)  # noqa: E402
 
 
 class FakeBot:
@@ -144,6 +150,49 @@ async def main() -> None:
     assert muted == 0
     assert cleanup_statements <= 3, cleanup_statements
     print(f"PASS expired mute cleanup is set-based ({cleanup_statements} statements)")
+
+    lottery_group = -100811003
+    async with session_scope() as session:
+        participant_lotteries = [
+            Lottery(
+                group_id=lottery_group,
+                creator_id=811003,
+                title=f"query lottery {index}",
+                prize="query prize",
+                winners_count=1,
+                status="open",
+                draw_type="participant",
+                draw_participant_count=2,
+            )
+            for index in range(3)
+        ]
+        session.add_all(participant_lotteries)
+        await session.flush()
+        session.add_all(
+            [
+                LotteryEntry(lottery_id=lottery.id, user_id=811100 + index)
+                for index, lottery in enumerate(participant_lotteries)
+            ]
+        )
+
+    statement_count = 0
+    lottery_count_queries = 0
+
+    def count_lottery_query(*_args) -> None:
+        nonlocal statement_count, lottery_count_queries
+        statement_count += 1
+        statement = str(_args[2]).lower()
+        if "count(" in statement and "lottery_entries" in statement:
+            lottery_count_queries += 1
+
+    event.listen(get_engine().sync_engine, "before_cursor_execute", count_lottery_query)
+    await draw_lotteries(FakeBot())
+    event.remove(get_engine().sync_engine, "before_cursor_execute", count_lottery_query)
+    assert lottery_count_queries == 1, lottery_count_queries
+    print(
+        "PASS participant lottery counts are batched "
+        f"({statement_count} statements, {lottery_count_queries} count query)"
+    )
     event.remove(get_engine().sync_engine, "before_cursor_execute", count_statement)
     await dispose_db()
 

@@ -203,24 +203,6 @@ async def _claim_lottery(session, lottery_id: int) -> bool:
     return row is not None
 
 
-async def _lottery_due(session, lottery: Lottery, now) -> bool:
-    """Return whether a lottery reached its configured draw condition."""
-    if (lottery.draw_type or "time").lower() == "participant":
-        target = int(lottery.draw_participant_count or 0)
-        if target <= 0:
-            return False
-        entries = int(
-            await session.scalar(
-                select(func.count(LotteryEntry.id)).where(
-                    LotteryEntry.lottery_id == lottery.id
-                )
-            )
-            or 0
-        )
-        return entries >= target
-    return lottery.ends_at is not None and lottery.ends_at <= now
-
-
 async def _claim_auction(
     session, auction_id: int, current_bidder: int | None, current_price: int
 ) -> bool:
@@ -271,8 +253,31 @@ async def draw_lotteries(bot: Bot) -> None:
                 select(Lottery).where(Lottery.status == "open")
             )
         ).all()
+        participant_lotteries = {
+            lottery.id: lottery
+            for lottery in lotteries
+            if (lottery.draw_type or "time").lower() == "participant"
+            and int(lottery.draw_participant_count or 0) > 0
+        }
+        participant_counts: dict[int, int] = {}
+        if participant_lotteries:
+            participant_counts = {
+                int(lottery_id): int(count)
+                for lottery_id, count in (
+                    await session.execute(
+                        select(LotteryEntry.lottery_id, func.count(LotteryEntry.id))
+                        .where(LotteryEntry.lottery_id.in_(participant_lotteries))
+                        .group_by(LotteryEntry.lottery_id)
+                    )
+                ).all()
+            }
         for lottery in lotteries:
-            if not await _lottery_due(session, lottery, now):
+            if (lottery.draw_type or "time").lower() == "participant":
+                target = int(lottery.draw_participant_count or 0)
+                due = target > 0 and participant_counts.get(lottery.id, 0) >= target
+            else:
+                due = lottery.ends_at is not None and lottery.ends_at <= now
+            if not due:
                 continue
             if not await _claim_lottery(session, lottery.id):
                 continue
