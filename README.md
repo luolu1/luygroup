@@ -546,7 +546,7 @@ Telegram 命令面板按聊天类型分别注册：私聊只显示私聊命令�
 - 频道、联动与协助管理：`/channels`、`/addchannel`、`/delchannel`、`/assistant`、`/crosslink`、`/reportlink`、`/gblacklist`。
 - 积分与玩法扩展：`/checkin`、`/shop`、`/buy`、`/redpacket`、`/bid`。
 
-> 抽奖、竞拍、红包的时间在机器人消息中按 UTC 显示；数据库与控制台同样存储/显示 UTC 时间。
+> 抽奖、竞拍、红包的时间在机器人消息中按**北京时间**显示；数据库与控制台存储/显示 UTC 时间。
 
 ## AI 功能
 
@@ -661,10 +661,29 @@ data/ai_learning/
 ### 竞拍
 
 ```text
-/auction 稀有头像框 | 100 10 30
+/jp 稀有头像框 | 100 10 30
 ```
 
-表示起拍价 100、加价幅度 10、30 分钟结束。成员用 `/bid 金额` 出价；出价时扣除积分，被更高价超过后自动退回。到期最高价成交。
+管理员通过私聊与机器人的交互式向导创建竞拍，配置项包括：
+
+- 拍品名称和描述
+- 竞拍类型（积分竞拍 / 货币竞拍）
+- 起拍价和加价幅度
+- 持续时间
+- 延时规则（出价后至少保留的分钟数）
+- **落锤间隔**（1-60 分钟，默认 1 分钟）
+
+成员用 `/bid 金额` 或 `/bid 编号 金额` 出价；出价时扣除积分，被更高价超过后自动退回。
+
+**落锤提醒机制**：
+- 系统在截止前 `间隔×2` 和 `间隔×1` 分钟发送两次提醒
+- 只有在最后 `间隔×2` 分钟内的出价才会延时截止时间
+- 示例：
+  - `间隔=1分钟`：提醒在截止前 2 分钟和 1 分钟，延时窗口为最后 2 分钟
+  - `间隔=2分钟`：提醒在截止前 4 分钟和 2 分钟，延时窗口为最后 4 分钟
+  - `间隔=3分钟`：提醒在截止前 6 分钟和 3 分钟，延时窗口为最后 6 分钟
+
+到期最高价成交。旧别名命令 `/auction` 仍可使用。
 
 ---
 
@@ -823,6 +842,22 @@ docker compose down
 docker compose up -d --build
 ```
 
+### 数据库迁移
+
+更新代码后，如果数据库结构发生变化（例如添加了新字段），需要手动执行迁移：
+
+**Docker Compose 部署**：
+```bash
+docker compose exec bot python -c "import sqlite3; conn = sqlite3.connect('data/groupguard.db'); conn.execute('ALTER TABLE auctions ADD COLUMN hammer_interval INTEGER DEFAULT 1'); conn.commit()"
+```
+
+**systemd 部署**：
+```bash
+sudo -u groupguard python3 -c "import sqlite3; conn = sqlite3.connect('/opt/groupguard/data/groupguard.db'); conn.execute('ALTER TABLE auctions ADD COLUMN hammer_interval INTEGER DEFAULT 1'); conn.commit()"
+```
+
+> 注意：上述示例命令适用于 v1.x 到 v2.x 的迁移。未来版本如有新的迁移需求，请查看 commit message 或更新日志。
+
 ### Nginx + HTTPS 反向代理
 
 参考 `deploy/nginx.conf.example`。要点：
@@ -857,7 +892,7 @@ docker compose up -d --build
 - **抽奖/竞拍/红包没有资金托管**：奖品由管理员线下发放，机器人只记录结果。
 - **AI 可能误判**：广告检测结果仅作为辅助，重要群组建议保留人工复核；可在控制台查看 AI 事件。
 - **反刷屏与重复检测为进程内内存状态**：重启后清空；多进程部署时各进程独立统计。
-- **时间显示为 UTC**：抽奖、竞拍、红包截止时间与控制台时间均为 UTC。
+- **时间显示**：机器人消息中显示北京时间（东八区），数据库和控制台存储/显示 UTC 时间。
 - **SQLite 单机限制**：适合中小型群组；大规模多实例部署建议改用 PostgreSQL 并调整数据库驱动。
 - **必关频道依赖机器人权限**：机器人必须是频道管理员，否则无法查询成员关注状态。
 

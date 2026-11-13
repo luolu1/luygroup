@@ -39,10 +39,28 @@ prepare_files() {
   fi
 }
 
+migrate_database() {
+  local db_path="$APP_DIR/data/groupguard.db"
+  [[ -f "$db_path" ]] || { log "数据库不存在，跳过迁移。"; return 0; }
+  
+  # Check if hammer_interval column exists
+  local has_hammer_interval
+  has_hammer_interval=$(python3 -c "import sqlite3; conn = sqlite3.connect('$db_path'); cursor = conn.cursor(); cursor.execute('PRAGMA table_info(auctions)'); print(any(row[1] == 'hammer_interval' for row in cursor.fetchall()))")
+  
+  if [[ "$has_hammer_interval" == "False" ]]; then
+    log "检测到数据库需要迁移，正在添加 hammer_interval 字段..."
+    python3 -c "import sqlite3; conn = sqlite3.connect('$db_path'); conn.execute('ALTER TABLE auctions ADD COLUMN hammer_interval INTEGER DEFAULT 1'); conn.commit(); print('迁移完成')"
+    log "数据库迁移成功。"
+  else
+    log "数据库已是最新版本，跳过迁移。"
+  fi
+}
+
 install_compose() {
   command -v docker >/dev/null || die "缺少 Docker。"
   docker compose version >/dev/null 2>&1 || die "缺少 Docker Compose 插件。"
   prepare_files
+  migrate_database
   docker compose -f "$APP_DIR/docker-compose.yml" up -d --build
   log "Docker Compose 已启动。查看状态：docker compose ps"
 }
@@ -50,6 +68,7 @@ install_compose() {
 install_docker() {
   command -v docker >/dev/null || die "缺少 Docker。"
   prepare_files
+  migrate_database
   docker build -t groupguard:latest "$APP_DIR"
   docker network inspect groupguard >/dev/null 2>&1 || docker network create groupguard >/dev/null
   docker rm -f groupguard-web groupguard-bot >/dev/null 2>&1 || true
