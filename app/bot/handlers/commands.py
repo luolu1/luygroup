@@ -1,4 +1,5 @@
 """General commands: help, rules, info, warnings lookup, stats."""
+
 from __future__ import annotations
 
 from datetime import timedelta
@@ -66,7 +67,9 @@ GROUP_MENU_TEXT = (
     "/id —— 查询用户/群 ID\n"
     "/report —— 回复消息举报\n"
     "/cj —— 群内管理员发起，私聊配置抽奖\n"
-    "/jp —— 群内管理员发起，私聊配置竞拍\n\n"
+    "/jp —— 群内管理员发起，私聊配置竞拍\n"
+    "/bidinfo [编号] —— 查询本群竞拍与最近出价\n"
+    "/bid [编号] 金额 —— 出价，也可回复竞拍卡片\n\n"
     "进群验证、反广告、警告、关键词、必关频道等设置由管理员在群内或控制台配置。\n"
     "订阅用户可私聊机器人发送 /console 打开订阅控制台，发送 /sub 查看订阅。"
 )
@@ -107,29 +110,19 @@ async def cmd_start(message: Message, bot: Bot) -> None:
             chat_type=message.chat.type,
         )
         _ = group
-    await message.answer(
-        "🛡 luygroup 已就位。发送 /ads 查看总菜单，/rules 查看群规。"
-    )
+    await message.answer("🛡 luygroup 已就位。发送 /ads 查看总菜单，/rules 查看群规。")
 
 
 @router.message(Command("ads"))
 async def cmd_ads(message: Message) -> None:
     """Show the command menu for the current chat type."""
-    text = (
-        GROUP_MENU_TEXT
-        if message.chat.type in {"group", "supergroup"}
-        else PRIVATE_MENU_TEXT
-    )
+    text = GROUP_MENU_TEXT if message.chat.type in {"group", "supergroup"} else PRIVATE_MENU_TEXT
     await message.answer(text)
 
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
-    text = (
-        GROUP_MENU_TEXT
-        if message.chat.type in {"group", "supergroup"}
-        else PRIVATE_MENU_TEXT
-    )
+    text = GROUP_MENU_TEXT if message.chat.type in {"group", "supergroup"} else PRIVATE_MENU_TEXT
     await message.answer(text)
 
 
@@ -176,8 +169,7 @@ async def cmd_panel(message: Message, bot: Bot) -> None:
             )
         else:
             await message.reply(
-                "🔒 订阅控制台仅限私聊使用，群组或频道内不会展示地址。"
-                "请私聊机器人发送 /console。"
+                "🔒 订阅控制台仅限私聊使用，群组或频道内不会展示地址。请私聊机器人发送 /console。"
             )
         return
     if not await _has_console_user(user_id):
@@ -226,16 +218,18 @@ async def _issue_console_access(message: Message) -> None:
         if entitlements.subscription is not None:
             plan = entitlements.plan
             plan_name = plan.name if plan else "订阅版"
-            expiry = "永久" if entitlements.subscription.expires_at is None else repo.dt(entitlements.subscription.expires_at)
+            expiry = (
+                "永久"
+                if entitlements.subscription.expires_at is None
+                else repo.dt(entitlements.subscription.expires_at)
+            )
             subscription_text = f"{plan_name}，到期 {expiry}"
         elif entitlements.is_superadmin:
             subscription_text = "超级管理员（长期有效）"
         else:
             subscription_text = "无"
         account = (
-            f"{user.telegram_id} (@{user.username})"
-            if user.username
-            else str(user.telegram_id)
+            f"{user.telegram_id} (@{user.username})" if user.username else str(user.telegram_id)
         )
         balance_cents = int(user.balance_cents or 0)
         balance = f"{balance_cents // 100}.{balance_cents % 100:02d}"
@@ -335,11 +329,7 @@ async def cmd_sub(message: Message) -> None:
                     "基础进群验证、成员查询、管理日志。"
                 )
             else:
-                ai_quota = (
-                    "不限"
-                    if not ent.ai_daily_quota
-                    else f"{ent.ai_daily_quota} 次/天"
-                )
+                ai_quota = "不限" if not ent.ai_daily_quota else f"{ent.ai_daily_quota} 次/天"
                 feature_text = (
                     "高级功能：AI 检测/助理/闲聊、跨群封禁、全局黑名单、"
                     "积分/商城/红包、欢迎语、抽奖/竞拍、协助管理员、多群绑定。"
@@ -370,10 +360,7 @@ async def _toggle_push(message: Message, field: str, label: str, command: str) -
     args = helpers.parse_args(message.text)
     raw = (args[0].lower() if args else "").strip()
     if raw not in {"", "on", "off", "开", "关", "开启", "关闭", "1", "0"}:
-        await message.reply(
-            f"用法：/{command} [on|off]\n"
-            f"不带参数时切换当前的{label}状态。"
-        )
+        await message.reply(f"用法：/{command} [on|off]\n不带参数时切换当前的{label}状态。")
         return
     async with session_scope() as session:
         pref = await session.scalar(
@@ -410,9 +397,7 @@ async def cmd_jptz(message: Message) -> None:
     await _toggle_push(message, "auction_enabled", "竞拍", "jptz")
 
 
-async def _ensure_console_user(
-    message: Message, session=None
-) -> ConsoleUser | None:
+async def _ensure_console_user(message: Message, session=None) -> ConsoleUser | None:
     """Create the console identity on the user's first private interaction."""
     telegram_user = message.from_user
     if telegram_user is None or message.chat.type != "private":
@@ -438,7 +423,9 @@ async def _ensure_console_user(
             await db_session.flush()
         else:
             user.username = telegram_user.username or user.username or ""
-            user.display_name = (telegram_user.full_name or telegram_user.first_name or user.display_name or "")[:255]
+            user.display_name = (
+                telegram_user.full_name or telegram_user.first_name or user.display_name or ""
+            )[:255]
             if is_global_admin(telegram_user.id):
                 user.role = "superadmin"
         return user
@@ -480,16 +467,12 @@ async def cmd_unbanme(message: Message, bot: Bot) -> None:
             select(GlobalBlacklist.id).where(GlobalBlacklist.user_id == int(user_id)).limit(1)
         )
         if blacklisted is not None:
-            await message.reply(
-                "⛔ 你仍在全局黑名单中，无法自助解封。请联系超级管理员处理。"
-            )
+            await message.reply("⛔ 你仍在全局黑名单中，无法自助解封。请联系超级管理员处理。")
             return
         members = list(
             (
                 await session.scalars(
-                    select(Member).where(
-                        Member.user_id == int(user_id), Member.is_banned.is_(True)
-                    )
+                    select(Member).where(Member.user_id == int(user_id), Member.is_banned.is_(True))
                 )
             ).all()
         )
@@ -523,9 +506,7 @@ async def cmd_unbanme(message: Message, bot: Bot) -> None:
             # Self-unban only clears the ban.  A previous ban/kick still
             # carries the rejoin-mute flag; only an explicit admin unmute (or
             # the web "解禁" action) clears that persistent restriction.
-            await repo.add_log(
-                session, group.id, user_id, "self_unban", user_id, "自助解封"
-            )
+            await repo.add_log(session, group.id, user_id, "self_unban", user_id, "自助解封")
             unlocked.append(title)
 
     if not unlocked and not manual and not failed:
@@ -564,9 +545,7 @@ async def cmd_unmuteme(message: Message, bot: Bot) -> None:
         members = list(
             (
                 await session.scalars(
-                    select(Member).where(
-                        Member.user_id == int(user_id), Member.is_muted.is_(True)
-                    )
+                    select(Member).where(Member.user_id == int(user_id), Member.is_muted.is_(True))
                 )
             ).all()
         )
@@ -578,6 +557,9 @@ async def cmd_unmuteme(message: Message, bot: Bot) -> None:
             if group is None or not group.is_active:
                 continue
             title = group.title or str(group.id)
+            if member.verification_restricted:
+                manual.append(f"{title}（验证失败，需人工审核）")
+                continue
             if member.mute_on_rejoin:
                 manual.append(f"{title}（入群自动禁言）")
                 continue
@@ -586,12 +568,14 @@ async def cmd_unmuteme(message: Message, bot: Bot) -> None:
                 .where(
                     AdminLog.group_id == group.id,
                     AdminLog.target_id == int(user_id),
-                    AdminLog.action == "mute",
+                    AdminLog.action.in_(("mute", "web_member_mute")),
                 )
                 .order_by(AdminLog.created_at.desc(), AdminLog.id.desc())
                 .limit(1)
             )
-            if latest is not None and latest.admin_id is not None:
+            if latest is not None and (
+                latest.admin_id is not None or latest.action == "web_member_mute"
+            ):
                 manual.append(title)
                 continue
             target = helpers.Target(
@@ -601,9 +585,7 @@ async def cmd_unmuteme(message: Message, bot: Bot) -> None:
             )
             if member.is_member:
                 try:
-                    await helpers.unmute_user(
-                        bot, session, group, target, admin_id=user_id
-                    )
+                    await helpers.unmute_user(bot, session, group, target, admin_id=user_id)
                 except TelegramAPIError:
                     failed.append(title)
                     continue
@@ -738,9 +720,7 @@ async def cmd_warns(message: Message, bot: Bot) -> None:
         return
     lines = [f"⚠️ <b>{escape(target.label)} 的警告记录</b>（{len(warnings)} 条）"]
     for warning in warnings[:15]:
-        lines.append(
-            f"· {repo.dt(warning.created_at)} · {escape(warning.reason or '未填写原因')}"
-        )
+        lines.append(f"· {repo.dt(warning.created_at)} · {escape(warning.reason or '未填写原因')}")
     if len(warnings) > 15:
         lines.append(f"…… 其余 {len(warnings) - 15} 条请在 Web 面板查看")
     await message.reply("\n".join(lines))
@@ -958,7 +938,7 @@ async def cmd_stats(message: Message, bot: Bot) -> None:
         f"📅 今日消息：{stat.messages if stat else 0} · 进群 {stat.joins if stat else 0} · 退群 {stat.leaves if stat else 0}",
         f"⚠️ 有效警告：{total_warn}",
         f"🧹 违规命中：{total_hits}",
-        f"🤖 今日 AI：请求 {usage.requests}/{group.ai_daily_quota} · 拦截 {usage.hits}",
+        f"🤖 今日 AI：文本 {usage.text_requests} · 图片 {usage.image_requests} · 命中 {usage.hits}",
     ]
     if top:
         lines.append("\n🏆 <b>发言榜</b>")

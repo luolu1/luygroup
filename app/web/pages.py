@@ -1,4 +1,5 @@
 """Server-rendered control panel routes."""
+
 from __future__ import annotations
 
 import json
@@ -9,23 +10,19 @@ from datetime import timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import (
-    FileResponse,
     HTMLResponse,
-    JSONResponse,
-    PlainTextResponse,
     RedirectResponse,
-    Response,
 )
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import case, delete, func, or_, select, update
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..config import get_config, save_learning_dir
+from ..config import get_config
 from ..db import get_session
 from ..entitlements import (
     EMPTY_ENTITLEMENTS,
@@ -33,6 +30,7 @@ from ..entitlements import (
     FIELD_FEATURES,
     TAB_FEATURES,
     Entitlements,
+    group_owner,
     group_owner_user_id,
 )
 from ..models import (
@@ -55,7 +53,6 @@ from ..models import (
     LotteryEntry,
     LotteryWinner,
     Member,
-    PaymentChannel,
     PaymentOrder,
     RedPacket,
     Report,
@@ -74,7 +71,12 @@ from ..services import ai as ai_service
 from ..services import repo
 from ..services.payments import service as payment_service
 from ..services.subscriptions import MONTHLY_PRICE_CENTS, purchase_month
-from .auth import LoginRequired, current_admin_id, hash_console_token, new_console_token, require_admin, safe_next
+from .auth import (
+    LoginRequired,
+    current_admin_id,
+    require_admin,
+)
+from .form_values import bool_value as _bool, int_value as _int, text_value as _text
 from .utils import fmt_date, fmt_dt, fmt_money, n, short, user_label
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -152,6 +154,7 @@ SETTING_SCOPES: dict[str, set[str]] = {
         "ai_chat_enabled",
         "ai_daily_quota",
         "sample_daily_quota",
+        "ai_provider_id",
     },
     "join": {
         "verify_enabled",
@@ -171,11 +174,7 @@ def _current_entitlements(request: Request) -> Entitlements:
 
 
 def _visible_tabs(ent: Entitlements) -> list[tuple[str, str]]:
-    return [
-        (key, label)
-        for key, label in TABS
-        if ent.can(TAB_FEATURES.get(key, ""))
-    ]
+    return [(key, label) for key, label in TABS if ent.can(TAB_FEATURES.get(key, ""))]
 
 
 def _render(request: Request, name: str, **context: Any) -> HTMLResponse:
@@ -221,9 +220,7 @@ def _subscription_message(status: str) -> str:
     }.get(status, "订阅购买失败，请稍后再试")
 
 
-async def _accessible_group_ids(
-    session: AsyncSession, request: Request
-) -> set[int] | None:
+async def _accessible_group_ids(session: AsyncSession, request: Request) -> set[int] | None:
     """Return the groups a non-superadmin may see; ``None`` means all."""
     ent = _current_entitlements(request)
     if ent.is_superadmin:
@@ -231,9 +228,7 @@ async def _accessible_group_ids(
     if ent.user is None:
         return set()
     rows = await session.scalars(
-        select(ConsoleGroupAccess.group_id).where(
-            ConsoleGroupAccess.user_id == ent.user.id
-        )
+        select(ConsoleGroupAccess.group_id).where(ConsoleGroupAccess.user_id == ent.user.id)
     )
     return {int(gid) for gid in rows.all()}
 
@@ -249,22 +244,6 @@ def _redirect(url: str, *, msg: str = "", err: str = "", **params: Any) -> Redir
     return RedirectResponse(url, status_code=303)
 
 
-def _text(form: Any, key: str, limit: int = 4000, default: str = "") -> str:
-    value = form.get(key)
-    if value is None:
-        return default
-    return str(value).strip()[:limit]
-
-
-def _int(form: Any, key: str, default: int, low: int = 0, high: int = 2_000_000_000) -> int:
-    raw = form.get(key)
-    try:
-        value = int(str(raw))
-    except (TypeError, ValueError):
-        return default
-    return max(low, min(high, value))
-
-
 def _optional_int(form: Any, key: str) -> int | None:
     raw = str(form.get(key) or "").strip()
     if not raw:
@@ -275,8 +254,30 @@ def _optional_int(form: Any, key: str) -> int | None:
         return None
 
 
-def _bool(form: Any, key: str) -> bool:
-    return form.get(key) is not None
+async def _bindable_providers(session: AsyncSession, group_id: int) -> list[AIProvider]:
+    owner_id = await group_owner_user_id(session, group_id)
+    stmt = select(AIProvider).where(AIProvider.enabled.is_(True))
+    if owner_id is not None:
+        stmt = stmt.where(
+            or_(AIProvider.owner_user_id.is_(None), AIProvider.owner_user_id == owner_id)
+        )
+    else:
+        stmt = stmt.where(AIProvider.owner_user_id.is_(None))
+    rows = (
+        await session.scalars(stmt.order_by(AIProvider.priority.asc(), AIProvider.id.asc()))
+    ).all()
+    return [p for p in rows if p.base_url and p.model]
+
+
+async def _provider_bindable(session: AsyncSession, group_id: int, provider_id: int) -> bool:
+    providers = await _bindable_providers(session, group_id)
+    return any(p.id == provider_id for p in providers)
+
+
+async def _provider_labels(session: AsyncSession) -> dict[str, str]:
+    """Map the stored provider name to the label shown in the panel."""
+    rows = (await session.execute(select(AIProvider.name, AIProvider.label))).all()
+    return {str(name): str(label or name) for name, label in rows}
 
 
 async def _group_or_404(session: AsyncSession, group_id: int) -> Group:
@@ -291,9 +292,7 @@ async def _group_or_404(session: AsyncSession, group_id: int) -> Group:
     return group
 
 
-async def _require_group_access(
-    session: AsyncSession, request: Request, group: Group
-) -> None:
+async def _require_group_access(session: AsyncSession, request: Request, group: Group) -> None:
     ent = _current_entitlements(request)
     if ent.is_superadmin:
         return
@@ -308,290 +307,10 @@ async def _require_group_access(
         raise HTTPException(status_code=404, detail="群组不存在")
 
 
-# ---------------------------------------------------------------------------
-# Authentication
-# ---------------------------------------------------------------------------
-@public_router.get("/login", response_class=HTMLResponse)
-async def login_page(request: Request) -> Response:
-    if current_admin_id(request) is not None:
-        return RedirectResponse("/", status_code=303)
-    return _render(request, "login.html", error="", admin_id_input="", next_url=safe_next(request.query_params.get("next")))
+# Authentication routes live in pages_auth.py; importing here keeps route order.
+from . import pages_auth  # noqa: E402, F401
 
 
-async def _login_with_token(
-    request: Request,
-    token: str,
-    session: AsyncSession,
-    next_url: str,
-) -> Response:
-    token = token.strip()
-    if not token:
-        return _render(request, "login.html", error="请输入控制台 Token。", admin_id_input="", next_url=next_url)
-    consumed = await session.execute(
-        update(ConsoleUser)
-        .where(
-            ConsoleUser.token_hash == hash_console_token(token),
-            ConsoleUser.is_active.is_(True),
-            ConsoleUser.token_expires_at.is_not(None),
-            ConsoleUser.token_expires_at > utcnow(),
-        )
-        .values(
-            token_hash=hash_console_token(new_console_token()),
-            token_value=None,
-            token_expires_at=None,
-            last_login_at=utcnow(),
-        )
-        .returning(ConsoleUser.id, ConsoleUser.role)
-    )
-    identity = consumed.one_or_none()
-    if identity is None:
-        return _render(request, "login.html", error="登录码无效、已过期或已被使用。", admin_id_input="", next_url=next_url)
-    request.session.clear()
-    request.session["admin_id"] = int(identity.id)
-    request.session["console_role"] = identity.role
-    request.session["console_auth"] = True
-    return RedirectResponse(next_url, status_code=303)
-
-
-@public_router.get("/console", response_class=HTMLResponse)
-async def console_code_page(
-    request: Request,
-    token: str = "",
-    session: AsyncSession = Depends(get_session),
-) -> Response:
-    if not token:
-        return RedirectResponse("/login", status_code=303)
-    response = await _login_with_token(request, token, session, "/")
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["Referrer-Policy"] = "no-referrer"
-    return response
-
-
-@public_router.post("/login")
-async def login_submit(request: Request, session: AsyncSession = Depends(get_session)):
-    form = await request.form()
-    token = str(form.get("token") or "").strip()
-    next_url = safe_next(str(form.get("next") or request.query_params.get("next") or "/"))
-    return await _login_with_token(request, token, session, next_url)
-
-
-@public_router.post("/logout")
-async def logout(request: Request):
-    request.session.clear()
-    return RedirectResponse("/login", status_code=303)
-
-
-async def _users_context(session: AsyncSession, q: str = "") -> dict[str, Any]:
-    query = select(ConsoleUser).order_by(ConsoleUser.id)
-    q = q.strip()
-    if q:
-        conditions = [
-            ConsoleUser.display_name.ilike(f"%{q}%"),
-            ConsoleUser.username.ilike(f"%{q}%"),
-        ]
-        telegram_id = q.lstrip("-")
-        if telegram_id.isdigit():
-            conditions.append(ConsoleUser.telegram_id == int(q))
-        query = query.where(or_(*conditions))
-    users = (await session.scalars(query)).all()
-    plans = (
-        await session.scalars(
-            select(SubscriptionPlan)
-            .where(SubscriptionPlan.enabled.is_(True))
-            .order_by(SubscriptionPlan.id.asc())
-        )
-    ).all()
-    plan_by_id = {plan.id: plan for plan in plans}
-    now = utcnow()
-    subscription_by_user: dict[int, Subscription] = {}
-    if users:
-        rows = (
-            await session.scalars(
-                select(Subscription)
-                .where(
-                    Subscription.user_id.in_([u.id for u in users]),
-                    Subscription.status == "active",
-                    or_(Subscription.expires_at.is_(None), Subscription.expires_at > now),
-                )
-                .order_by(Subscription.id.desc())
-            )
-        ).all()
-        for item in rows:
-            subscription_by_user.setdefault(item.user_id, item)
-    binding_count_by_user: dict[int, int] = {}
-    if users:
-        counts = await session.execute(
-            select(ConsoleGroupAccess.user_id, func.count(ConsoleGroupAccess.id))
-            .where(ConsoleGroupAccess.user_id.in_([user.id for user in users]))
-            .group_by(ConsoleGroupAccess.user_id)
-        )
-        binding_count_by_user = {
-            int(user_id): int(count) for user_id, count in counts.all()
-        }
-    return {
-        "users": users,
-        "plans": plans,
-        "plan_by_id": plan_by_id,
-        "subscription_by_user": subscription_by_user,
-        "binding_count_by_user": binding_count_by_user,
-        "binding_count_total": sum(binding_count_by_user.values()),
-        "q": q,
-    }
-
-
-@router.get("/users", response_class=HTMLResponse)
-async def users_page(
-    request: Request,
-    q: str = "",
-    session: AsyncSession = Depends(get_session),
-) -> HTMLResponse:
-    _require_superadmin(request)
-    return _render(
-        request,
-        "users.html",
-        **(await _users_context(session, q)),
-        issued_url="",
-    )
-
-
-@router.post("/users/{user_id}/role")
-async def update_user_role(
-    user_id: int,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-):
-    _require_superadmin(request)
-    q = str(request.query_params.get("q") or "").strip()
-    user = await session.get(ConsoleUser, user_id)
-    if user is None:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    if user.role == "superadmin":
-        return _redirect("/users", err="不能在这里修改超级管理员角色", q=q)
-    form = await request.form()
-    role = str(form.get("role") or "user")
-    if role not in {"user", "subscriber"}:
-        role = "user"
-    user.role = role
-    return _redirect("/users", msg=f"已更新 {user.display_name or user.id} 的角色", q=q)
-
-
-@router.post("/users/{user_id}/subscription")
-async def update_user_subscription(
-    user_id: int,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-):
-    _require_superadmin(request)
-    q = str(request.query_params.get("q") or "").strip()
-    user = await session.get(ConsoleUser, user_id)
-    if user is None:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    if user.role == "superadmin":
-        return _redirect("/users", err="超级管理员不需要订阅", q=q)
-    form = await request.form()
-    action = str(form.get("action") or "activate")
-    active_rows = (
-        await session.scalars(
-            select(Subscription).where(
-                Subscription.user_id == user.id,
-                Subscription.status == "active",
-            )
-        )
-    ).all()
-    if action == "cancel":
-        for item in active_rows:
-            item.status = "cancelled"
-        user.role = "user"
-        return _redirect("/users", msg="订阅已取消，用户已恢复为基础权限", q=q)
-    plan_id = _optional_int(form, "plan_id")
-    plan = await session.get(SubscriptionPlan, plan_id) if plan_id else None
-    if plan is None or not plan.enabled:
-        return _redirect("/users", err="请选择有效的订阅套餐", q=q)
-    days = _int(form, "days", 30, 1, 3650)
-    expires_at = utcnow() + timedelta(days=days)
-    for item in active_rows:
-        item.status = "expired"
-    session.add(
-        Subscription(
-            user_id=user.id,
-            plan_id=plan.id,
-            status="active",
-            starts_at=utcnow(),
-            expires_at=expires_at,
-        )
-    )
-    user.role = "subscriber"
-    return _redirect(
-        "/users",
-        msg=f"已为 {user.display_name or user.id} 开通 {plan.label or plan.name}，群组上限为 5，到期 {expires_at:%Y-%m-%d}",
-        q=q,
-    )
-
-
-@router.post("/users/{user_id}/toggle")
-async def toggle_console_user(
-    user_id: int,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-):
-    _require_superadmin(request)
-    q = str(request.query_params.get("q") or "").strip()
-    user = await session.get(ConsoleUser, user_id)
-    if user is None:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    if user.role == "superadmin":
-        return _redirect("/users", err="不能停用超级管理员", q=q)
-    user.is_active = not bool(user.is_active)
-    return _redirect("/users", msg="用户状态已更新", q=q)
-
-
-@router.post("/users/{user_id}/balance")
-async def update_user_balance(
-    user_id: int,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-):
-    _require_superadmin(request)
-    q = str(request.query_params.get("q") or "").strip()
-    user = await session.get(ConsoleUser, user_id)
-    if user is None:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    if user.role == "superadmin":
-        return _redirect("/users", err="不能修改超级管理员余额", q=q)
-    raw = str((await request.form()).get("balance") or "").strip()
-    try:
-        amount = Decimal(raw)
-        if not amount.is_finite() or amount < 0 or amount.as_tuple().exponent < -2:
-            raise InvalidOperation
-        cents = int((amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-    except (InvalidOperation, ValueError):
-        return _redirect("/users", err="余额必须是非负金额，最多保留两位小数", q=q)
-    user.balance_cents = cents
-    return _redirect("/users", msg="用户余额已更新", q=q)
-
-
-@router.post("/users/{user_id}/token", response_class=HTMLResponse)
-async def reset_console_token(
-    user_id: int,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-) -> HTMLResponse:
-    _require_superadmin(request)
-    q = str(request.query_params.get("q") or "").strip()
-    user = await session.get(ConsoleUser, user_id)
-    if user is None:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    token = new_console_token()
-    user.token_hash = hash_console_token(token)
-    user.token_value = None
-    user.token_expires_at = utcnow() + timedelta(minutes=15)
-    url = f"{get_config().web.base_url.rstrip('/')}/console?token={token}"
-    return _render(
-        request,
-        "users.html",
-        **(await _users_context(session, q)),
-        issued_url=url,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -848,333 +567,6 @@ async def account_subscribe_pay(
     return RedirectResponse(creation.pay_url, status_code=303)
 
 
-@public_router.api_route("/payments/epay/notify", methods=["GET", "POST"])
-async def epay_notify(
-    request: Request, session: AsyncSession = Depends(get_session)
-) -> Response:
-    if request.method == "POST":
-        form = await request.form()
-        form_items = list(form.multi_items())
-    else:
-        form_items = list(request.query_params.multi_items())
-    if len({key for key, _value in form_items}) != len(form_items):
-        return PlainTextResponse("fail", status_code=400)
-    params = {str(k): str(v) for k, v in form_items}
-    try:
-        status, _order = await payment_service.handle_notification(
-            session, None, params
-        )
-    except ValueError as exc:
-        log.info("Rejected Epay notification: %s", exc)
-        return PlainTextResponse("fail", status_code=400)
-    except Exception:
-        await session.rollback()
-        log.exception("Epay notification processing failed")
-        return PlainTextResponse("fail", status_code=400)
-    if status in {"paid", "already_paid"}:
-        return PlainTextResponse("success")
-    return PlainTextResponse("fail", status_code=400)
-
-
-def _payment_channel_fields(form: Any, *, existing: PaymentChannel | None = None) -> dict[str, object]:
-    name = _text(form, "name", 64)
-    gateway = _text(form, "gateway", 255).rstrip("/")
-    merchant_id = _text(form, "merchant_id", 64)
-    merchant_key = _text(form, "merchant_key", 255)
-    if not name or not gateway or not merchant_id:
-        raise ValueError("渠道名称、支付网关和商户 ID 必填")
-    parsed_gateway = urlsplit(gateway)
-    if parsed_gateway.scheme not in {"http", "https"} or not parsed_gateway.netloc:
-        raise ValueError("支付网关必须是完整的 http:// 或 https:// 地址")
-    if parsed_gateway.username or parsed_gateway.password:
-        raise ValueError("支付网关地址不能包含用户名或密码")
-    if not merchant_key and existing is None:
-        raise ValueError("商户密钥必填")
-    version = _text(form, "version", 8, "V1").upper()
-    if version not in {"V1", "V2"}:
-        raise ValueError("仅支持 V1 或 V2")
-    channel_type = _text(form, "channel_type", 32, "epay")
-    if channel_type != "epay":
-        raise ValueError("当前仅支持 Epay 易支付渠道")
-    pay_type = _text(form, "pay_type", 32, "alipay")
-    if pay_type not in {"alipay", "wxpay", "qqpay", "bank", "usdt"}:
-        raise ValueError("不支持的支付方式")
-    interact_type = _text(form, "interact_type", 16, "qrcode")
-    if interact_type not in {"qrcode", "redirect"}:
-        raise ValueError("不支持的交互方式")
-    currency = _text(form, "currency", 8, "CNY").upper() or "CNY"
-    rate_base = _text(form, "rate_base", 16)
-    rate = Decimal(rate_base) if rate_base else None
-    if rate is not None and (not rate.is_finite() or rate <= 0):
-        raise ValueError("汇率基数必须是大于 0 的数字")
-    try:
-        fee_percent = Decimal(_text(form, "fee_percent", 16, "0") or "0")
-        fee_fixed = Decimal(_text(form, "fee_fixed", 16, "0") or "0")
-    except InvalidOperation as exc:
-        raise ValueError("手续费必须是有效数字") from exc
-    if not fee_percent.is_finite() or fee_percent < 0 or fee_percent > 100:
-        raise ValueError("百分比手续费须在 0 到 100 之间")
-    if not fee_fixed.is_finite() or fee_fixed < 0:
-        raise ValueError("固定手续费不能小于 0")
-    icon = existing.icon if existing is not None else ""
-    upload = form.get("icon")
-    if isinstance(upload, UploadFile) and upload.filename:
-        payload = upload.file.read(payment_service.ICON_MAX_BYTES + 1)
-        icon = payment_service.save_icon(
-            name, upload.content_type or "", payload
-        )
-    if _text(form, "remove_icon", 8) == "on":
-        icon = ""
-    return {
-        "name": name,
-        "icon": icon,
-        "channel_type": channel_type,
-        "pay_type": pay_type,
-        "interact_type": interact_type,
-        "sort_weight": _int(form, "sort_weight", 10, 0, 100000),
-        "fee_percent": int((fee_percent * 100).quantize(Decimal("1"))),
-        "fee_fixed_cents": int((fee_fixed * 100).quantize(Decimal("1"))),
-        "enabled": _bool(form, "enabled"),
-        "version": version,
-        "gateway": gateway,
-        "merchant_id": merchant_id,
-        "merchant_key": merchant_key or (existing.merchant_key if existing else ""),
-        "notify_url": _text(form, "notify_url", 255),
-        "return_url": _text(form, "return_url", 255),
-        "currency": currency,
-        "rate_base": rate_base,
-    }
-
-
-@router.get("/payments", response_class=HTMLResponse)
-async def payment_channels_page(
-    request: Request,
-    channel_type: str = "",
-    pay_type: str = "",
-    session: AsyncSession = Depends(get_session),
-) -> HTMLResponse:
-    _require_superadmin(request)
-    stmt = select(PaymentChannel)
-    if channel_type:
-        stmt = stmt.where(PaymentChannel.channel_type == channel_type)
-    if pay_type:
-        stmt = stmt.where(PaymentChannel.pay_type == pay_type)
-    channels = (
-        await session.scalars(
-            stmt.order_by(PaymentChannel.sort_weight.asc(), PaymentChannel.id.asc())
-        )
-    ).all()
-    return _render(
-        request,
-        "payment_channels.html",
-        channels=channels,
-        channel_type=channel_type,
-        pay_type=pay_type,
-        channel_type_options=[("epay", "Epay 易支付")],
-        pay_type_options=[
-            ("alipay", "支付宝"),
-            ("wxpay", "微信支付"),
-            ("qqpay", "QQ 钱包"),
-            ("bank", "网银支付"),
-            ("usdt", "USDT"),
-        ],
-    )
-
-
-@router.get("/payments/orders", response_class=HTMLResponse)
-async def payment_orders_page(
-    request: Request,
-    q: str = "",
-    status: str = "",
-    purpose: str = "",
-    session: AsyncSession = Depends(get_session),
-) -> HTMLResponse:
-    _require_superadmin(request)
-    payment_stmt = (
-        select(PaymentOrder, ConsoleUser)
-        .join(ConsoleUser, ConsoleUser.id == PaymentOrder.user_id)
-        .order_by(PaymentOrder.id.desc())
-    )
-    ledger_stmt = (
-        select(AccountLedgerEntry, ConsoleUser)
-        .join(ConsoleUser, ConsoleUser.id == AccountLedgerEntry.user_id)
-        .where(AccountLedgerEntry.kind == "subscription_balance")
-        .order_by(AccountLedgerEntry.id.desc())
-    )
-    q = q.strip()
-    if q:
-        user_match = (
-            ConsoleUser.display_name.ilike(f"%{q}%")
-            | ConsoleUser.username.ilike(f"%{q}%")
-        )
-        payment_stmt = payment_stmt.where(
-            PaymentOrder.order_no.ilike(f"%{q}%") | user_match
-        )
-        ledger_stmt = ledger_stmt.where(user_match)
-    include_ledger = True
-    if status in {"pending", "paid", "failed", "expired"}:
-        payment_stmt = payment_stmt.where(PaymentOrder.status == status)
-        include_ledger = status == "paid"
-    else:
-        status = ""
-    if purpose in {"recharge", "subscription"}:
-        payment_stmt = payment_stmt.where(PaymentOrder.purpose == purpose)
-        include_ledger = include_ledger and purpose == "subscription"
-    else:
-        purpose = ""
-    payment_rows = (await session.execute(payment_stmt.limit(1000))).all()
-    ledger_rows = (
-        (await session.execute(ledger_stmt.limit(1000))).all() if include_ledger else []
-    )
-    orders: list[dict[str, Any]] = [
-        {
-            "user": user,
-            "order_no": order.order_no,
-            "purpose": order.purpose,
-            "amount_cents": order.amount_cents,
-            "fee_cents": order.fee_cents,
-            "charge_cents": order.charge_cents or order.amount_cents + order.fee_cents,
-            "charge_currency": order.charge_currency,
-            "provider": order.provider,
-            "pay_type": order.pay_type,
-            "status": order.status,
-            "created_at": order.created_at,
-            "paid_at": order.paid_at,
-        }
-        for order, user in payment_rows
-    ]
-    orders.extend(
-        {
-            "user": user,
-            "order_no": f"余额-{entry.id}",
-            "purpose": "subscription_balance",
-            "amount_cents": -entry.amount_cents,
-            "fee_cents": 0,
-            "charge_cents": -entry.amount_cents,
-            "charge_currency": "CNY",
-            "provider": "余额抵扣",
-            "pay_type": "余额",
-            "status": "paid",
-            "created_at": entry.created_at,
-            "paid_at": entry.created_at,
-        }
-        for entry, user in ledger_rows
-    )
-    orders.sort(key=lambda item: item["created_at"], reverse=True)
-    orders = orders[:1000]
-    return _render(
-        request,
-        "payment_orders.html",
-        orders=orders,
-        q=q,
-        status=status,
-        purpose=purpose,
-    )
-
-
-@router.get("/payments/new", response_class=HTMLResponse)
-@router.get("/payments/{channel_id}/edit", response_class=HTMLResponse)
-async def payment_channel_form(
-    request: Request,
-    channel_id: int | None = None,
-    session: AsyncSession = Depends(get_session),
-) -> HTMLResponse:
-    _require_superadmin(request)
-    channel = await session.get(PaymentChannel, channel_id) if channel_id else None
-    if channel_id and channel is None:
-        raise HTTPException(status_code=404, detail="支付渠道不存在")
-    cfg = get_config()
-    return _render(
-        request,
-        "payment_channel_form.html",
-        channel=channel,
-        channel_type_options=[("epay", "Epay 易支付")],
-        pay_type_options=[
-            ("alipay", "支付宝"),
-            ("wxpay", "微信支付"),
-            ("qqpay", "QQ 钱包"),
-            ("bank", "网银支付"),
-            ("usdt", "USDT"),
-        ],
-        interact_type_options=[("qrcode", "二维码"), ("redirect", "跳转支付")],
-        default_notify=f"{cfg.web.base_url.rstrip('/')}/payments/epay/notify",
-        default_return=f"{cfg.web.base_url.rstrip('/')}/account/recharge/return",
-    )
-
-
-@router.post("/payments/new")
-async def payment_channel_create(
-    request: Request, session: AsyncSession = Depends(get_session)
-) -> RedirectResponse:
-    _require_superadmin(request)
-    form = await request.form()
-    try:
-        fields = _payment_channel_fields(form)
-    except (ValueError, InvalidOperation) as exc:
-        return _redirect("/payments/new", err=str(exc))
-    await payment_service.create_channel(session, fields)
-    return _redirect("/payments", msg="支付渠道已新增")
-
-
-@router.post("/payments/{channel_id}/update")
-async def payment_channel_update(
-    channel_id: int,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-) -> RedirectResponse:
-    _require_superadmin(request)
-    channel = await session.get(PaymentChannel, channel_id)
-    if channel is None:
-        raise HTTPException(status_code=404, detail="支付渠道不存在")
-    form = await request.form()
-    try:
-        fields = _payment_channel_fields(form, existing=channel)
-    except (ValueError, InvalidOperation) as exc:
-        return _redirect(f"/payments/{channel_id}/edit", err=str(exc))
-    await payment_service.update_channel(session, channel_id, fields)
-    return _redirect("/payments", msg="支付渠道已更新")
-
-
-@router.post("/payments/{channel_id}/toggle")
-async def payment_channel_toggle(
-    channel_id: int,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-) -> RedirectResponse:
-    _require_superadmin(request)
-    channel = await session.get(PaymentChannel, channel_id)
-    if channel is None:
-        raise HTTPException(status_code=404, detail="支付渠道不存在")
-    channel.enabled = not channel.enabled
-    return _redirect("/payments", msg="渠道状态已更新")
-
-
-@router.post("/payments/{channel_id}/delete")
-async def payment_channel_delete(
-    channel_id: int,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-) -> RedirectResponse:
-    _require_superadmin(request)
-    try:
-        deleted = await payment_service.delete_channel(session, channel_id)
-    except ValueError as exc:
-        return _redirect("/payments", err=str(exc))
-    if not deleted:
-        raise HTTPException(status_code=404, detail="支付渠道不存在")
-    return _redirect("/payments", msg="支付渠道已删除")
-
-
-@public_router.get("/payments/icons/{filename}")
-async def payment_channel_icon(filename: str) -> FileResponse:
-    if Path(filename).name != filename:
-        raise HTTPException(status_code=404, detail="图标不存在")
-    path = payment_service.icons_dir() / filename
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="图标不存在")
-    return FileResponse(path, headers={"Cache-Control": "public, max-age=86400"})
-
-
 @router.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request, session: AsyncSession = Depends(get_session)) -> HTMLResponse:
     ent = _current_entitlements(request)
@@ -1189,9 +581,7 @@ async def dashboard(request: Request, session: AsyncSession = Depends(get_sessio
     groups_total = int(await session.scalar(group_stmt(select(func.count(Group.id)))) or 0)
     active_groups = int(
         await session.scalar(
-            group_stmt(
-                select(func.count(Group.id)).where(Group.is_active.is_(True))
-            )
+            group_stmt(select(func.count(Group.id)).where(Group.is_active.is_(True)))
         )
         or 0
     )
@@ -1208,18 +598,16 @@ async def dashboard(request: Request, session: AsyncSession = Depends(get_sessio
     )
     warnings_total = int(
         await session.scalar(
-            select(func.count(Warning.id)).where(
-                Warning.active.is_(True), *warning_filter
-            )
+            select(func.count(Warning.id)).where(Warning.active.is_(True), *warning_filter)
         )
         or 0
     )
     if ent.can("reports"):
         reports_total = int(
             await session.scalar(
-                select(func.count(Report.id)).where(*(
-                    [] if gids is None else [Report.group_id.in_(gids)]
-                ))
+                select(func.count(Report.id)).where(
+                    *([] if gids is None else [Report.group_id.in_(gids)])
+                )
             )
             or 0
         )
@@ -1251,9 +639,7 @@ async def dashboard(request: Request, session: AsyncSession = Depends(get_sessio
 
     recent_groups = (
         await session.scalars(
-            group_stmt(
-                select(Group).order_by(Group.updated_at.desc(), Group.id.desc()).limit(6)
-            )
+            group_stmt(select(Group).order_by(Group.updated_at.desc(), Group.id.desc()).limit(6))
         )
     ).all()
     log_stmt = select(AdminLog).order_by(AdminLog.id.desc()).limit(10)
@@ -1271,17 +657,12 @@ async def dashboard(request: Request, session: AsyncSession = Depends(get_sessio
         key = (utcnow() - timedelta(days=offset)).strftime("%Y-%m-%d")
         by_day[key] = {"messages": 0, "joins": 0, "bans": 0, "ai": 0}
     for item in stat_rows:
-        bucket = by_day.setdefault(
-            item.day, {"messages": 0, "joins": 0, "bans": 0, "ai": 0}
-        )
+        bucket = by_day.setdefault(item.day, {"messages": 0, "joins": 0, "bans": 0, "ai": 0})
         bucket["messages"] += item.messages or 0
         bucket["joins"] += item.joins or 0
         bucket["bans"] += item.bans or 0
         bucket["ai"] += item.ai_requests or 0
-    series = [
-        {"day": key, "label": key[5:], **value}
-        for key, value in by_day.items()
-    ]
+    series = [{"day": key, "label": key[5:], **value} for key, value in by_day.items()]
     max_messages = max([p["messages"] for p in series] or [1]) or 1
 
     return _render(
@@ -1612,11 +993,14 @@ async def group_detail(
     show_left_flag = show_left == "1"
     context: dict[str, Any] = {
         "group": group,
+        "group_owner_id": await group_owner_user_id(session, group.id),
         "tab": tab,
         "q": q,
         "show_left": show_left_flag,
         "bot_username": get_config().bot.username,
     }
+    group_owner_record = await group_owner(session, group.id)
+    context["group_owner"] = group_owner_record
     try:
         context["bot_member"] = await _fetch_bot_membership(group.id)
     except ValueError as exc:
@@ -1632,10 +1016,14 @@ async def group_detail(
         ).all()
         uids = {item.user_id for item in admins}
         members = (
-            await session.scalars(
-                select(Member).where(Member.group_id == group.id, Member.user_id.in_(uids))
-            )
-        ).all() if uids else []
+            (
+                await session.scalars(
+                    select(Member).where(Member.group_id == group.id, Member.user_id.in_(uids))
+                )
+            ).all()
+            if uids
+            else []
+        )
         context.update(admins=admins, member_map={m.user_id: m for m in members})
     elif tab == "members":
         stmt = select(Member).where(Member.group_id == group.id)
@@ -1673,16 +1061,21 @@ async def group_detail(
     elif tab == "warnings":
         stmt = select(Warning).where(Warning.group_id == group.id)
         act = act if act in {"warn", "mute", "kick", "ban"} else ""
-        src = src if src in {
-            "manual",
-            "keyword",
-            "builtin",
-            "ai",
-            "flood",
-            "forward",
-            "length",
-            "repeat",
-        } else ""
+        src = (
+            src
+            if src
+            in {
+                "manual",
+                "keyword",
+                "builtin",
+                "ai",
+                "flood",
+                "forward",
+                "length",
+                "repeat",
+            }
+            else ""
+        )
         review = review if review in {"pending", "false_positive", "confirmed"} else ""
         if q:
             conditions = [
@@ -1721,15 +1114,17 @@ async def group_detail(
             )
         elif review:
             stmt = stmt.where(Warning.review_status == review)
-        rows = (
-            await session.scalars(stmt.order_by(Warning.id.desc()).limit(200))
-        ).all()
+        rows = (await session.scalars(stmt.order_by(Warning.id.desc()).limit(200))).all()
         uids = {item.user_id for item in rows}
         members = (
-            await session.scalars(
-                select(Member).where(Member.group_id == group.id, Member.user_id.in_(uids))
-            )
-        ).all() if uids else []
+            (
+                await session.scalars(
+                    select(Member).where(Member.group_id == group.id, Member.user_id.in_(uids))
+                )
+            ).all()
+            if uids
+            else []
+        )
         context.update(
             warnings=rows,
             member_map={m.user_id: m for m in members},
@@ -1740,9 +1135,7 @@ async def group_detail(
     elif tab == "keywords":
         context["keywords"] = (
             await session.scalars(
-                select(Keyword)
-                .where(Keyword.group_id == group.id)
-                .order_by(Keyword.id.desc())
+                select(Keyword).where(Keyword.group_id == group.id).order_by(Keyword.id.desc())
             )
         ).all()
     elif tab == "whitelist":
@@ -1755,10 +1148,14 @@ async def group_detail(
         ).all()
         uids = {item.user_id for item in rows}
         members = (
-            await session.scalars(
-                select(Member).where(Member.group_id == group.id, Member.user_id.in_(uids))
-            )
-        ).all() if uids else []
+            (
+                await session.scalars(
+                    select(Member).where(Member.group_id == group.id, Member.user_id.in_(uids))
+                )
+            ).all()
+            if uids
+            else []
+        )
         context.update(whitelist=rows, member_map={m.user_id: m for m in members})
     elif tab == "channels":
         context["channels"] = (
@@ -1786,22 +1183,27 @@ async def group_detail(
             )
         ).all()
         other_ids = {
-            item.linked_group_id if item.group_id == group.id else item.group_id
-            for item in cross
+            item.linked_group_id if item.group_id == group.id else item.group_id for item in cross
         }
         others = (
-            await session.scalars(select(Group).where(Group.id.in_(other_ids)))
-        ).all() if other_ids else []
+            (await session.scalars(select(Group).where(Group.id.in_(other_ids)))).all()
+            if other_ids
+            else []
+        )
         other_map = {g.id: g for g in others}
         cross_items = [
             {
                 "link": item,
                 "other_id": item.linked_group_id if item.group_id == group.id else item.group_id,
-                "title": (other_map.get(
-                    item.linked_group_id if item.group_id == group.id else item.group_id
-                ).title if other_map.get(
-                    item.linked_group_id if item.group_id == group.id else item.group_id
-                ) else ""),
+                "title": (
+                    other_map.get(
+                        item.linked_group_id if item.group_id == group.id else item.group_id
+                    ).title
+                    if other_map.get(
+                        item.linked_group_id if item.group_id == group.id else item.group_id
+                    )
+                    else ""
+                ),
             }
             for item in cross
         ]
@@ -1814,8 +1216,10 @@ async def group_detail(
         ).all()
         subscriber_ids = {item.subscriber_id for item in report_links}
         subscribers = (
-            await session.scalars(select(Group).where(Group.id.in_(subscriber_ids)))
-        ).all() if subscriber_ids else []
+            (await session.scalars(select(Group).where(Group.id.in_(subscriber_ids)))).all()
+            if subscriber_ids
+            else []
+        )
         context.update(
             cross_items=cross_items,
             report_links=report_links,
@@ -1885,21 +1289,13 @@ async def group_detail(
                 .limit(100)
             )
         ).all()
-        owner_id = await group_owner_user_id(session, group.id)
-        provider_stmt = select(func.count()).select_from(AIProvider).where(
-            AIProvider.enabled.is_(True)
-        )
-        if owner_id is not None:
-            provider_stmt = provider_stmt.where(
-                or_(AIProvider.owner_user_id.is_(None), AIProvider.owner_user_id == owner_id)
-            )
-        else:
-            provider_stmt = provider_stmt.where(AIProvider.owner_user_id.is_(None))
-        provider_count = await session.scalar(provider_stmt)
+        bindable = await _bindable_providers(session, group.id)
         context.update(
             usage=usage,
             events=events,
-            ai_provider_count=int(provider_count or 0),
+            ai_provider_count=len(bindable),
+            ai_providers=bindable,
+            provider_labels=await _provider_labels(session),
         )
     elif tab == "moderation":
         stats = (
@@ -2011,19 +1407,39 @@ async def save_group_settings(
     if want("warn_limit"):
         group.warn_limit = _int(form, "warn_limit", group.warn_limit or 3, 0, 1000)
     if want("mute_minutes"):
-        group.mute_minutes = _int(form, "mute_minutes", group.mute_minutes or 60, 1, 100000)
+        group.mute_minutes = _int(
+            form,
+            "mute_minutes",
+            group.mute_minutes if group.mute_minutes is not None else 60,
+            0,
+            100000,
+        )
     if want("flood_limit"):
         group.flood_limit = _int(form, "flood_limit", group.flood_limit or 8, 1, 100000)
     if want("flood_window"):
         group.flood_window = _int(form, "flood_window", group.flood_window or 10, 1, 86400)
     if want("ai_daily_quota"):
-        group.ai_daily_quota = _int(
-            form, "ai_daily_quota", group.ai_daily_quota or 0, 0, 1000000
-        )
+        value = _int(form, "ai_daily_quota", group.ai_daily_quota or 0, 0, 1000000)
+        owner = await group_owner(session, group.id)
+        if owner is None:
+            group.ai_daily_quota = value
+        else:
+            cap = ent.ai_daily_quota
+            owner.ai_text_daily_quota = min(value, cap) if cap and value else value
     if want("sample_daily_quota"):
-        group.sample_daily_quota = _int(
-            form, "sample_daily_quota", group.sample_daily_quota or 0, 0, 1000000
-        )
+        value = _int(form, "sample_daily_quota", group.sample_daily_quota or 0, 0, 1000000)
+        owner = await group_owner(session, group.id)
+        if owner is None:
+            group.sample_daily_quota = value
+        else:
+            cap = ent.sample_daily_quota
+            owner.ai_image_daily_quota = min(value, cap) if cap and value else value
+    if want("ai_provider_id"):
+        chosen = _optional_int(form, "ai_provider_id")
+        if chosen is None:
+            group.ai_provider_id = None
+        elif await _provider_bindable(session, group.id, chosen):
+            group.ai_provider_id = chosen
     if want("verify_timeout"):
         group.verify_timeout = _int(form, "verify_timeout", group.verify_timeout or 300, 60, 86400)
     if want("points_per_message"):
@@ -2031,9 +1447,7 @@ async def save_group_settings(
             form, "points_per_message", group.points_per_message or 0, 0, 100000
         )
     if want("points_cooldown"):
-        group.points_cooldown = _int(
-            form, "points_cooldown", group.points_cooldown or 0, 0, 86400
-        )
+        group.points_cooldown = _int(form, "points_cooldown", group.points_cooldown or 0, 0, 86400)
     if want("daily_bonus"):
         group.daily_bonus = _int(form, "daily_bonus", group.daily_bonus or 0, 0, 100000)
     if want("log_channel_id"):
@@ -2041,7 +1455,9 @@ async def save_group_settings(
     if want("report_chat_id"):
         group.report_chat_id = _optional_int(form, "report_chat_id")
     group.updated_at = utcnow()
-    await repo.add_log(session, group.id, admin_id, "web_settings", None, f"Web 面板更新设置（{scope}）")
+    await repo.add_log(
+        session, group.id, admin_id, "web_settings", None, f"Web 面板更新设置（{scope}）"
+    )
     tab = SCOPE_TABS.get(scope, "settings")
     return _redirect(f"/groups/{group.id}", msg="群设置已保存", tab=tab)
 
@@ -2064,7 +1480,13 @@ async def add_group_admin(
     if role not in {"owner", "admin", "assistant"}:
         role = "assistant"
     allowed = {"ban", "mute", "warn", "delete", "info", "settings"}
-    permissions = sorted(set(form.getlist("permissions")) & allowed) or ["ban", "mute", "warn", "delete", "info"]
+    permissions = sorted(set(form.getlist("permissions")) & allowed) or [
+        "ban",
+        "mute",
+        "warn",
+        "delete",
+        "info",
+    ]
     existing = await repo.get_admin(session, group.id, user_id)
     if existing:
         existing.role = role
@@ -2253,14 +1675,35 @@ async def sync_members(
     failed = 0
     admins_added = 0
 
-    # Admins are the one member category the Bot API can enumerate.  Adding
-    # them makes the panel useful right after the bot is promoted.
+    # Gather every Telegram answer before writing, so no SQLite write lock is
+    # held while waiting on the network.
     try:
-        admins = await _telegram_call(
-            "getChatAdministrators", {"chat_id": group.id}, timeout=10
-        )
+        admins = await _telegram_call("getChatAdministrators", {"chat_id": group.id}, timeout=10)
     except ValueError:
         admins = []
+    member_ids = list(
+        (
+            await session.scalars(
+                select(Member.user_id)
+                .where(Member.group_id == group.id)
+                .order_by(Member.last_seen.desc())
+                .limit(200)
+            )
+        ).all()
+    )
+    statuses: dict[int, dict] = {}
+    for user_id in member_ids:
+        try:
+            data = await _telegram_call(
+                "getChatMember",
+                {"chat_id": group.id, "user_id": user_id},
+                timeout=8,
+            )
+        except ValueError:
+            failed += 1
+            continue
+        statuses[int(user_id)] = data if isinstance(data, dict) else {}
+
     if isinstance(admins, list):
         for entry in admins:
             user = entry.get("user") if isinstance(entry, dict) else None
@@ -2283,25 +1726,11 @@ async def sync_members(
             member.is_verified = True
             member.is_banned = False
 
-    rows = (
-        await session.scalars(
-            select(Member)
-            .where(Member.group_id == group.id)
-            .order_by(Member.last_seen.desc())
-            .limit(200)
-        )
-    ).all()
-    for member in rows:
-        try:
-            data = await _telegram_call(
-                "getChatMember",
-                {"chat_id": group.id, "user_id": member.user_id},
-                timeout=8,
-            )
-        except ValueError:
-            failed += 1
+    for user_id, data in statuses.items():
+        member = await repo.get_member(session, group.id, user_id)
+        if member is None:
             continue
-        status = str(data.get("status") or "") if isinstance(data, dict) else ""
+        status = str(data.get("status") or "")
         in_chat = status in {"creator", "administrator", "member"} or (
             status == "restricted" and bool(data.get("is_member"))
         )
@@ -2314,9 +1743,7 @@ async def sync_members(
         updated += 1
 
     try:
-        count = await _telegram_call(
-            "getChatMemberCount", {"chat_id": group.id}, timeout=8
-        )
+        count = await _telegram_call("getChatMemberCount", {"chat_id": group.id}, timeout=8)
         if isinstance(count, int):
             group.member_count = count
     except ValueError:
@@ -2368,20 +1795,26 @@ async def member_action(
 
     try:
         if action == "mute":
-            minutes = _int(form, "minutes", group.mute_minutes or 60, 1, 100000)
-            await _telegram_action(
-                "restrictChatMember",
-                {
-                    "chat_id": group.id,
-                    "user_id": user_id,
-                    "permissions": _MUTE_PERMISSIONS,
-                    "until_date": int(time.time()) + minutes * 60,
-                    "use_independent_chat_permissions": True,
-                },
+            minutes = _int(
+                form,
+                "minutes",
+                group.mute_minutes if group.mute_minutes is not None else 60,
+                0,
+                100000,
             )
+            params = {
+                "chat_id": group.id,
+                "user_id": user_id,
+                "permissions": _MUTE_PERMISSIONS,
+                "use_independent_chat_permissions": True,
+            }
+            if minutes > 0:
+                params["until_date"] = int(time.time()) + minutes * 60
+            await _telegram_action("restrictChatMember", params)
             member.is_muted = True
-            member.muted_until = utcnow() + timedelta(minutes=minutes)
-            message = f"已禁言 {target}（{minutes} 分钟）"
+            member.muted_until = utcnow() + timedelta(minutes=minutes) if minutes > 0 else None
+            duration = "永久" if minutes == 0 else f"{minutes} 分钟"
+            message = f"已禁言 {target}（{duration}）"
         elif action == "unmute":
             await _telegram_action(
                 "restrictChatMember",
@@ -2448,9 +1881,7 @@ async def member_action(
             message = f"已踢出 {target}"
         elif action == "clearwarns":
             await session.execute(
-                delete(Warning).where(
-                    Warning.group_id == group.id, Warning.user_id == user_id
-                )
+                delete(Warning).where(Warning.group_id == group.id, Warning.user_id == user_id)
             )
             message = f"已清除 {target} 的全部警告"
         else:
@@ -2549,9 +1980,7 @@ async def add_whitelist(
     if not user_id:
         return _redirect(f"/groups/{group.id}", err="用户 ID 无效", tab="whitelist")
     exists = await session.scalar(
-        select(Whitelist.id).where(
-            Whitelist.group_id == group.id, Whitelist.user_id == user_id
-        )
+        select(Whitelist.id).where(Whitelist.group_id == group.id, Whitelist.user_id == user_id)
     )
     if exists:
         return _redirect(f"/groups/{group.id}", err="该用户已在白名单中", tab="whitelist")
@@ -2738,7 +2167,9 @@ async def delete_reportlink(
     entry = await session.get(ReportLink, entry_id)
     if entry and entry.group_id == group_id:
         await session.delete(entry)
-        await repo.add_log(session, group_id, admin_id, "web_reportlink_del", entry.subscriber_id, "")
+        await repo.add_log(
+            session, group_id, admin_id, "web_reportlink_del", entry.subscriber_id, ""
+        )
     return _redirect(f"/groups/{group_id}", msg="通报订阅已删除", tab="links")
 
 
@@ -2824,599 +2255,10 @@ async def adjust_group_points(
     return _redirect(f"/groups/{group.id}", msg=f"积分已调整，当前余额 {balance}", tab="members")
 
 
-# ---------------------------------------------------------------------------
-# AI providers
-# ---------------------------------------------------------------------------
-def _provider_visible(ent: Entitlements, provider: AIProvider) -> bool:
-    if ent.is_superadmin:
-        return True
-    if ent.user is None:
-        return False
-    return provider.owner_user_id in (None, ent.user.id)
+# AI provider routes live in pages_ai.py. Importing it here registers them on
+# ``router`` at this exact position, preserving the original route order.
+from . import pages_ai  # noqa: E402, F401
 
 
-def _provider_editable(ent: Entitlements, provider: AIProvider) -> bool:
-    if ent.is_superadmin:
-        return True
-    return bool(ent.user and provider.owner_user_id == ent.user.id)
-
-
-@router.get("/ai/add", response_class=HTMLResponse)
-async def ai_add_page(request: Request) -> HTMLResponse:
-    _require_feature(request, "ai_providers")
-    return _render(
-        request,
-        "ai_add.html",
-        defaults=get_config().ai,
-        presets=ai_service.PROVIDER_PRESETS,
-    )
-
-
-@router.get("/ai/providers/{provider_id}", response_class=HTMLResponse)
-async def ai_provider_edit_page(
-    provider_id: int,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-) -> HTMLResponse:
-    ent = _require_feature(request, "ai_providers")
-    provider = await session.get(AIProvider, provider_id)
-    if provider is None or not _provider_visible(ent, provider):
-        raise HTTPException(status_code=404, detail="接口不存在")
-    if not _provider_editable(ent, provider):
-        raise HTTPException(status_code=403, detail="不能编辑其他用户或系统内置接口")
-    return _render(
-        request,
-        "ai_provider_edit.html",
-        provider=provider,
-        defaults=get_config().ai,
-        presets=ai_service.PROVIDER_PRESETS,
-    )
-
-
-@router.get("/ai", response_class=HTMLResponse)
-async def ai_page(request: Request, session: AsyncSession = Depends(get_session)) -> HTMLResponse:
-    ent = _require_feature(request, "ai_providers")
-    provider_stmt = select(AIProvider)
-    if not ent.is_superadmin and ent.user is not None:
-        provider_stmt = provider_stmt.where(
-            or_(AIProvider.owner_user_id.is_(None), AIProvider.owner_user_id == ent.user.id)
-        )
-    providers = (
-        await session.scalars(
-            provider_stmt.order_by(AIProvider.priority.asc(), AIProvider.id.asc())
-        )
-    ).all()
-    gids = await _accessible_group_ids(session, request)
-    start = (utcnow() - timedelta(days=13)).strftime("%Y-%m-%d")
-    usage_stmt = select(AIUsage).where(AIUsage.day >= start).order_by(AIUsage.day.desc())
-    event_stmt = select(AIEvent).order_by(AIEvent.id.desc()).limit(100)
-    if gids is not None:
-        usage_stmt = usage_stmt.where(AIUsage.group_id.in_(gids))
-        event_stmt = event_stmt.where(AIEvent.group_id.in_(gids))
-    usage = (await session.scalars(usage_stmt)).all()
-    events = (await session.scalars(event_stmt)).all()
-    provider_usage_stmt = (
-        select(
-            AIEvent.provider,
-            func.count(AIEvent.id),
-            func.coalesce(func.sum(case((AIEvent.hit.is_(True), 1), else_=0)), 0),
-        )
-        .where(AIEvent.created_at >= utcnow() - timedelta(days=13))
-        .group_by(AIEvent.provider)
-        .order_by(func.count(AIEvent.id).desc(), AIEvent.provider.asc())
-    )
-    if gids is not None:
-        provider_usage_stmt = provider_usage_stmt.where(AIEvent.group_id.in_(gids))
-    provider_usage = (await session.execute(provider_usage_stmt)).all()
-    today = day_key()
-    today_stmt = select(
-        func.coalesce(func.sum(AIUsage.requests), 0),
-        func.coalesce(func.sum(AIUsage.samples), 0),
-        func.coalesce(func.sum(AIUsage.hits), 0),
-    ).where(AIUsage.day == today)
-    if gids is not None:
-        today_stmt = today_stmt.where(AIUsage.group_id.in_(gids))
-    today_requests, today_samples, today_hits = (
-        await session.execute(today_stmt)
-    ).one()
-    request_limit = ent.ai_daily_quota
-    sample_limit = ent.sample_daily_quota
-    if gids is not None:
-        bound_groups = (
-            await session.scalars(select(Group).where(Group.id.in_(gids)))
-        ).all() if gids else []
-        def capped(limit: int | None, configured: int | None) -> int:
-            if limit is None:
-                return int(configured or 0)
-            configured_value = int(configured or 0)
-            return int(limit) if configured_value <= 0 else min(int(limit), configured_value)
-
-        request_limit = sum(
-            capped(ent.ai_daily_quota, group.ai_daily_quota) for group in bound_groups
-        )
-        sample_limit = sum(
-            capped(ent.sample_daily_quota, group.sample_daily_quota) for group in bound_groups
-        )
-    ai_summary = {
-        "day": today,
-        "requests": int(today_requests or 0),
-        "samples": int(today_samples or 0),
-        "hits": int(today_hits or 0),
-        "request_limit": request_limit,
-        "sample_limit": sample_limit,
-    }
-    group_ids = {item.group_id for item in usage} | {item.group_id for item in events}
-    groups = (
-        await session.scalars(select(Group).where(Group.id.in_(group_ids)))
-    ).all() if group_ids else []
-    owner_ids = {p.owner_user_id for p in providers if p.owner_user_id}
-    owners = (
-        await session.scalars(select(ConsoleUser).where(ConsoleUser.id.in_(owner_ids)))
-    ).all() if owner_ids else []
-    return _render(
-        request,
-        "ai.html",
-        providers=providers,
-        owner_map={u.id: u for u in owners},
-        provider_editable=lambda p: _provider_editable(ent, p),
-        usage=usage,
-        events=events,
-        group_map={g.id: g for g in groups},
-        defaults=get_config().ai,
-        presets=ai_service.PROVIDER_PRESETS,
-        learning=ai_service.learning_store.stats(),
-        ai_summary=ai_summary,
-        provider_usage=provider_usage,
-    )
-
-
-@router.post("/ai/models")
-async def ai_models(
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-):
-    """Return the supplier model list for the panel's model picker."""
-    ent = _require_feature(request, "ai_providers")
-    try:
-        payload = await request.json()
-    except ValueError:
-        payload = {}
-    if not isinstance(payload, dict):
-        payload = {}
-    base_url = str(payload.get("base_url") or "").strip()
-    api_key = str(payload.get("api_key") or "").strip()
-    provider_id = payload.get("provider_id")
-    if provider_id:
-        try:
-            provider = await session.get(AIProvider, int(provider_id))
-        except (TypeError, ValueError):
-            provider = None
-        if provider is None or not _provider_visible(ent, provider):
-            return JSONResponse({"ok": False, "error": "接口不存在"}, status_code=404)
-        base_url = base_url or provider.base_url
-        api_key = api_key or provider.api_key
-    kind = str(payload.get("kind") or "text").strip().lower()
-    if kind not in {"text", "vision"}:
-        kind = "text"
-    try:
-        models = await ai_service.fetch_models(base_url, api_key, kind=kind)
-    except ValueError as exc:
-        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
-    return JSONResponse({"ok": True, "models": models})
-
-
-@router.post("/ai/learning/dir")
-async def change_ai_learning_dir(
-    request: Request,
-    admin_id: int = Depends(require_admin),
-):
-    _require_superadmin(request)
-    form = await request.form()
-    raw = _text(form, "directory", 1024)
-    try:
-        path = save_learning_dir(raw)
-    except (OSError, ValueError) as exc:
-        return _redirect("/ai", err=f"学习数据目录设置失败：{exc}")
-    try:
-        await ai_service.learning_store.set_directory(path)
-    except OSError as exc:
-        return _redirect("/ai", err=f"目录已保存，但迁移学习数据失败：{exc}")
-    return _redirect("/ai", msg=f"AI 学习数据目录已切换为 {path}")
-
-
-@router.post("/ai/providers/add")
-async def add_ai_provider(
-    request: Request,
-    admin_id: int = Depends(require_admin),
-    session: AsyncSession = Depends(get_session),
-):
-    ent = _require_feature(request, "ai_providers")
-    form = await request.form()
-    name = _text(form, "name", 64)
-    if not name:
-        return _redirect("/ai/add", err="接口名称不能为空")
-    exists = await session.scalar(select(AIProvider.id).where(AIProvider.name == name))
-    if exists:
-        return _redirect("/ai/add", err="接口名称已存在")
-    raw_base_url = _text(form, "base_url", 512)
-    model = _text(form, "model", 128)
-    if not raw_base_url or not model:
-        return _redirect("/ai/add", err="接口地址和模型不能为空")
-    try:
-        base_url = ai_service.validated_base_url(raw_base_url)
-    except ValueError as exc:
-        return _redirect("/ai/add", err=str(exc))
-    session.add(
-        AIProvider(
-            name=name,
-            label=_text(form, "label", 128) or name,
-            base_url=base_url,
-            api_key=_text(form, "api_key", 512),
-            model=model,
-            vision_model=_text(form, "vision_model", 128),
-            priority=_int(form, "priority", 100, 0, 100000),
-            enabled=_bool(form, "enabled"),
-            builtin=False,
-            owner_user_id=None if ent.is_superadmin else ent.user.id,
-        )
-    )
-    return _redirect("/ai", msg="AI 接口已添加")
-
-
-@router.post("/ai/providers/{provider_id}/update")
-async def update_ai_provider(
-    provider_id: int,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-):
-    ent = _require_feature(request, "ai_providers")
-    provider = await session.get(AIProvider, provider_id)
-    if provider is None:
-        raise HTTPException(status_code=404, detail="接口不存在")
-    if not _provider_editable(ent, provider):
-        raise HTTPException(status_code=403, detail="不能修改其他用户或系统内置接口")
-    form = await request.form()
-    provider.label = _text(form, "label", 128, provider.label or provider.name)
-    base_url = _text(form, "base_url", 512, provider.base_url or "")
-    model = _text(form, "model", 128, provider.model or "")
-    if not base_url or not model:
-        return _redirect("/ai", err="接口地址和模型不能为空")
-    try:
-        provider.base_url = ai_service.validated_base_url(base_url)
-    except ValueError as exc:
-        return _redirect("/ai", err=str(exc))
-    new_key = _text(form, "api_key", 512)
-    if new_key:
-        provider.api_key = new_key
-    provider.model = model
-    provider.vision_model = _text(form, "vision_model", 128, provider.vision_model or "")
-    provider.priority = _int(form, "priority", provider.priority or 100, 0, 100000)
-    provider.enabled = _bool(form, "enabled")
-    return _redirect("/ai", msg="接口配置已更新")
-
-
-@router.post("/ai/providers/{provider_id}/delete")
-async def delete_ai_provider(
-    provider_id: int,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-):
-    ent = _require_feature(request, "ai_providers")
-    provider = await session.get(AIProvider, provider_id)
-    if provider is None:
-        raise HTTPException(status_code=404, detail="接口不存在")
-    if not _provider_editable(ent, provider):
-        raise HTTPException(status_code=403, detail="不能删除其他用户或系统内置接口")
-    await session.delete(provider)
-    return _redirect("/ai", msg="接口已删除")
-
-
-@router.post("/ai/providers/{provider_id}/test")
-async def test_ai_provider(
-    provider_id: int,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-):
-    ent = _require_feature(request, "ai_providers")
-    provider = await session.get(AIProvider, provider_id)
-    if provider is None or not _provider_visible(ent, provider):
-        return _redirect("/ai", err="接口不存在")
-    result = await ai_service.test_provider(provider)
-    if result.ok:
-        return _redirect("/ai", msg=f"{provider.name} 连通正常（{result.latency_ms}ms）：{result.text[:80]}")
-    return _redirect("/ai", err=f"{provider.name} 测试失败：{result.error[:200]}")
-
-
-# ---------------------------------------------------------------------------
-# Global blacklist / reports / statistics
-# ---------------------------------------------------------------------------
-@router.get("/blacklist", response_class=HTMLResponse)
-async def blacklist_page(
-    request: Request,
-    q: str = "",
-    session: AsyncSession = Depends(get_session),
-) -> HTMLResponse:
-    ent = _require_feature(request, "global_blacklist")
-    stmt = select(GlobalBlacklist).order_by(GlobalBlacklist.id.desc())
-    if not ent.is_superadmin and ent.user:
-        stmt = stmt.where(
-            or_(
-                GlobalBlacklist.owner_user_id.is_(None),
-                GlobalBlacklist.owner_user_id == ent.user.id,
-            )
-        )
-    q = q.strip()
-    if q:
-        if q.lstrip("-").isdigit():
-            stmt = stmt.where(GlobalBlacklist.user_id == int(q))
-        else:
-            stmt = stmt.where(GlobalBlacklist.reason.ilike(f"%{q}%"))
-    entries = (await session.scalars(stmt.limit(300))).all()
-    return _render(request, "blacklist.html", entries=entries, q=q)
-
-
-@router.post("/blacklist/add")
-async def add_blacklist(
-    request: Request,
-    admin_id: int = Depends(require_admin),
-    session: AsyncSession = Depends(get_session),
-):
-    ent = _require_feature(request, "global_blacklist")
-    form = await request.form()
-    user_id = _optional_int(form, "user_id")
-    if not user_id:
-        return _redirect("/blacklist", err="用户 ID 无效")
-    reason = _text(form, "reason", 500)
-    owner_id = None if ent.is_superadmin else (ent.user.id if ent.user else None)
-    existing = await session.scalar(
-        select(GlobalBlacklist).where(GlobalBlacklist.user_id == user_id)
-    )
-    if existing:
-        if not ent.is_superadmin and existing.owner_user_id != owner_id:
-            return _redirect("/blacklist", err="该用户已在平台通用黑名单或其他用户名单中")
-        existing.reason = reason or existing.reason
-    else:
-        session.add(
-            GlobalBlacklist(
-                user_id=user_id,
-                owner_user_id=owner_id,
-                reason=reason,
-                added_by=admin_id,
-            )
-        )
-    return _redirect("/blacklist", msg="已加入黑名单")
-
-
-@router.post("/blacklist/{entry_id}/delete")
-async def delete_blacklist(
-    entry_id: int,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-):
-    ent = _require_feature(request, "global_blacklist")
-    entry = await session.get(GlobalBlacklist, entry_id)
-    if entry is None:
-        return _redirect("/blacklist", err="记录不存在")
-    if not ent.is_superadmin and (
-        ent.user is None or entry.owner_user_id != ent.user.id
-    ):
-        return _redirect("/blacklist", err="只能删除自己添加的黑名单记录")
-    await session.delete(entry)
-    return _redirect("/blacklist", msg="已移出黑名单")
-
-
-@router.get("/reports", response_class=HTMLResponse)
-async def reports_page(
-    request: Request,
-    group_id: int | None = None,
-    session: AsyncSession = Depends(get_session),
-) -> HTMLResponse:
-    _require_feature(request, "reports")
-    allowed = await _accessible_group_ids(session, request)
-    stmt = select(Report).order_by(Report.id.desc())
-    if allowed is not None:
-        stmt = stmt.where(Report.group_id.in_(allowed))
-    if group_id:
-        stmt = stmt.where(Report.group_id == group_id)
-    reports = (await session.scalars(stmt.limit(300))).all()
-    gids = {item.group_id for item in reports}
-    groups = (
-        await session.scalars(select(Group).where(Group.id.in_(gids)))
-    ).all() if gids else []
-    group_stmt = select(Group).order_by(Group.title.asc())
-    if allowed is not None:
-        group_stmt = group_stmt.where(Group.id.in_(allowed))
-    all_groups = (await session.scalars(group_stmt)).all()
-    return _render(
-        request,
-        "reports.html",
-        reports=reports,
-        group_map={g.id: g for g in groups},
-        all_groups=all_groups,
-        group_id=group_id,
-    )
-
-
-@router.post("/reports/{entry_id}/delete")
-async def delete_report(
-    entry_id: int,
-    request: Request,
-    session: AsyncSession = Depends(get_session),
-):
-    _require_feature(request, "reports")
-    entry = await session.get(Report, entry_id)
-    if entry is None:
-        return _redirect("/reports", msg="举报记录已删除")
-    allowed = await _accessible_group_ids(session, request)
-    if allowed is not None and entry.group_id not in allowed:
-        raise HTTPException(status_code=403, detail="无权删除其他群组的举报")
-    await session.delete(entry)
-    return _redirect("/reports", msg="举报记录已删除")
-
-
-@router.post("/reports/{entry_id}/review")
-async def review_report(
-    entry_id: int,
-    request: Request,
-    admin_id: int = Depends(require_admin),
-    session: AsyncSession = Depends(get_session),
-):
-    _require_feature(request, "reports")
-    report = await session.get(Report, entry_id)
-    if report is None:
-        raise HTTPException(status_code=404, detail="举报记录不存在")
-    allowed = await _accessible_group_ids(session, request)
-    if allowed is not None and report.group_id not in allowed:
-        raise HTTPException(status_code=403, detail="无权审核其他群组的举报")
-    form = await request.form()
-    decision = _text(form, "decision", 16)
-    note = _text(form, "note", 500)
-    if decision not in {"confirmed", "rejected"}:
-        return _redirect("/reports", err="未知审核操作")
-    if report.review_status != "pending":
-        return _redirect("/reports", err="该举报已审核")
-    excerpt = (report.excerpt or "").strip()
-    if decision == "confirmed" and not excerpt:
-        return _redirect("/reports", err="举报没有原文内容，无法写入广告学习")
-    report.review_status = decision
-    report.reviewed_by = admin_id
-    report.reviewed_at = utcnow()
-    report.review_note = note
-    if decision == "confirmed":
-        await ai_service.learning_store.put(
-            "ad",
-            report.group_id,
-            excerpt,
-            note or "管理员确认举报为广告",
-            meta={
-                "provider": "admin-report-review",
-                "is_ad": True,
-                "reason": note or "管理员确认举报为广告",
-                "reviewed_by": admin_id,
-                "report_id": report.id,
-            },
-        )
-    elif excerpt:
-        await ai_service.learning_store.put(
-            "ad",
-            report.group_id,
-            excerpt,
-            note or "管理员驳回举报，判定为正常消息",
-            meta={
-                "provider": "admin-report-review",
-                "is_ad": False,
-                "reason": note or "管理员驳回举报，判定为正常消息",
-                "reviewed_by": admin_id,
-                "report_id": report.id,
-            },
-        )
-    await repo.add_log(
-        session,
-        report.group_id,
-        admin_id,
-        f"report_{decision}",
-        report.target_user_id,
-        f"举报 #{report.id} {note}".strip(),
-    )
-    return _redirect(
-        "/reports",
-        msg="已确认并写入 AI 广告学习" if decision == "confirmed" else "已驳回举报",
-    )
-
-
-@router.get("/stats", response_class=HTMLResponse)
-async def stats_page(request: Request, session: AsyncSession = Depends(get_session)) -> HTMLResponse:
-    _require_feature(request, "stats_global")
-    allowed = await _accessible_group_ids(session, request)
-    days = 30
-    start_dt = utcnow() - timedelta(days=days - 1)
-    start = start_dt.strftime("%Y-%m-%d")
-    stat_stmt = select(GroupDailyStat).where(GroupDailyStat.day >= start)
-    if allowed is not None:
-        stat_stmt = stat_stmt.where(GroupDailyStat.group_id.in_(allowed))
-    rows = (await session.scalars(stat_stmt)).all()
-    by_day: dict[str, dict[str, int]] = {}
-    for offset in range(days - 1, -1, -1):
-        key = (utcnow() - timedelta(days=offset)).strftime("%Y-%m-%d")
-        by_day[key] = {"messages": 0, "joins": 0, "leaves": 0, "bans": 0, "ai": 0, "hits": 0}
-    per_group: dict[int, int] = {}
-    for item in rows:
-        bucket = by_day.setdefault(
-            item.day, {"messages": 0, "joins": 0, "leaves": 0, "bans": 0, "ai": 0, "hits": 0}
-        )
-        bucket["messages"] += item.messages or 0
-        bucket["joins"] += item.joins or 0
-        bucket["leaves"] += item.leaves or 0
-        bucket["bans"] += item.bans or 0
-        bucket["ai"] += item.ai_requests or 0
-        bucket["hits"] += item.ai_hits or 0
-        per_group[item.group_id] = per_group.get(item.group_id, 0) + (item.messages or 0)
-    series = [{"day": key, "label": key[5:], **value} for key, value in by_day.items()]
-    max_messages = max([point["messages"] for point in series] or [1]) or 1
-
-    top_ids = sorted(per_group, key=per_group.get, reverse=True)[:10]
-    top_groups = (
-        await session.scalars(select(Group).where(Group.id.in_(top_ids)))
-    ).all() if top_ids else []
-    top_map = {g.id: g for g in top_groups}
-    top_rows = [
-        {"group": top_map.get(gid), "messages": per_group[gid]}
-        for gid in top_ids
-        if top_map.get(gid)
-    ]
-
-    keyword_cond = [KeywordHit.created_at >= start_dt]
-    ai_cond = [AIUsage.day >= start]
-    if allowed is not None:
-        keyword_cond.append(KeywordHit.group_id.in_(allowed))
-        ai_cond.append(AIUsage.group_id.in_(allowed))
-    source_rows = await session.execute(
-        select(KeywordHit.source, func.count(KeywordHit.id))
-        .where(*keyword_cond)
-        .group_by(KeywordHit.source)
-    )
-    sources = [{"source": source or "未分类", "count": int(count)} for source, count in source_rows.all()]
-    total_hits = int(
-        await session.scalar(
-            select(func.count(KeywordHit.id)).where(*keyword_cond)
-        )
-        or 0
-    )
-    ai_rows = (
-        await session.scalars(
-            select(AIUsage).where(*ai_cond).order_by(AIUsage.day.desc())
-        )
-    ).all()
-    ai_requests = sum(item.requests or 0 for item in ai_rows)
-    ai_hits = sum(item.hits or 0 for item in ai_rows)
-    ai_samples = sum(item.samples or 0 for item in ai_rows)
-    return _render(
-        request,
-        "stats.html",
-        series=series,
-        max_messages=max_messages,
-        total_messages=sum(p["messages"] for p in series),
-        total_joins=sum(p["joins"] for p in series),
-        total_leaves=sum(p["leaves"] for p in series),
-        total_bans=sum(p["bans"] for p in series),
-        top_rows=top_rows,
-        sources=sources,
-        total_hits=total_hits,
-        ai_requests=ai_requests,
-        ai_hits=ai_hits,
-        ai_samples=ai_samples,
-        days=days,
-    )
-
-
-@router.get("/favicon.svg", include_in_schema=False)
-async def favicon() -> Response:
-    svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
-        '<rect width="64" height="64" rx="14" fill="#0b1020"/>'
-        '<path d="M32 8l20 8v16c0 13-8 20-20 24C20 52 12 45 12 32V16z" '
-        'fill="none" stroke="#4f8cff" stroke-width="4"/>'
-        '<path d="M22 32l7 7 14-15" fill="none" stroke="#22d3a6" stroke-width="5" '
-        'stroke-linecap="round" stroke-linejoin="round"/></svg>'
-    )
-    return Response(content=svg, media_type="image/svg+xml")
+# Global blacklist / reports / statistics routes live in pages_admin.py; importing here keeps route order.
+from . import pages_admin  # noqa: E402, F401

@@ -11,33 +11,15 @@ import asyncio
 import json
 import os
 import sys
-import tempfile
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import patch
+
+from sqlalchemy import select
 
 ROOT = Path(__file__).resolve().parents[1]
-TMP = Path(tempfile.mkdtemp(prefix="groupguard-rejoin-"))
-DB = TMP / "rejoin.db"
-TMP_CONFIG = TMP / "config.json"
-
-config_path = ROOT / "config.json"
-if not config_path.exists():
-    print("未找到 config.json，请先复制 config.example.json 并填写。")
-    sys.exit(2)
-
-cfg = json.loads(config_path.read_text(encoding="utf-8"))
-cfg["database"]["url"] = f"sqlite+aiosqlite:///{DB}"
-cfg.setdefault("ai", {})["learning_dir"] = str(TMP / "learning")
-TMP_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
 sys.path.insert(0, str(ROOT))
-
-from sqlalchemy import select  # noqa: E402
-
-from app.bot import captcha, helpers  # noqa: E402
-from app.bot.handlers import join  # noqa: E402
-from app.db import init_db, session_scope  # noqa: E402
-from app.models import AdminLog, Group, InviteCode, Member, Verification, utcnow  # noqa: E402
 
 CHAT_ID = -1009876543210
 USER_ID = 7788
@@ -187,7 +169,7 @@ async def test_disabled_invite_redemption_keeps_code_usage() -> None:
         )
 
 
-async def main() -> None:
+async def run_tests() -> None:
     await init_db()
     async with session_scope() as session:
         session.add(
@@ -315,5 +297,37 @@ async def main() -> None:
     print("FAILURES: none")
 
 
+async def main() -> None:
+    try:
+        await run_tests()
+    finally:
+        tasks = tuple(helpers._background_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await dispose_db()
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    with TemporaryDirectory(prefix="groupguard-rejoin-", dir="/tmp/opencode") as directory:
+        temp = Path(directory)
+        config_path = temp / "config.json"
+        config_path.write_text(json.dumps({
+            "bot": {"token": "123456789:REJOIN_SMOKE_SYNTHETIC_TOKEN", "admin_ids": [123456789], "username": "smokebot", "proxy": ""},
+            "database": {"url": f"sqlite+aiosqlite:///{temp / 'rejoin.db'}"},
+            "web": {"secret_key": "rejoin-smoke-synthetic-secret", "base_url": "https://example.test"},
+            "ai": {"learning_dir": str(temp / "learning"), "providers": []},
+            "payments": {"enabled": False},
+        }), encoding="utf-8")
+        with patch.dict(os.environ, {"GROUPGUARD_CONFIG": str(config_path)}):
+            from app.config import get_config
+
+            try:
+                from app.bot import captcha, helpers
+                from app.bot.handlers import join
+                from app.db import dispose_db, init_db, session_scope
+                from app.models import AdminLog, Group, InviteCode, Member, Verification, utcnow
+
+                asyncio.run(main())
+            finally:
+                get_config.cache_clear()

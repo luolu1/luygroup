@@ -1,12 +1,18 @@
 """Local (non-AI) advertising and keyword detection."""
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
+import regex
+
 from ..models import utcnow
+
+log = logging.getLogger(__name__)
+KEYWORD_REGEX_TIMEOUT = 0.5  # seconds
 
 # Strong advertising signals. Keep this list conservative: false positives annoy
 # members, while the AI layer can catch the subtle cases.
@@ -189,10 +195,13 @@ def check_keywords(
         reply_text = item[3] if len(item) > 3 else ""
         try:
             if is_regex:
-                matched = re.search(pattern, text, re.I)
+                matched = regex.search(pattern, text, regex.I, timeout=KEYWORD_REGEX_TIMEOUT)
             else:
                 matched = pattern.lower() in text.lower()
-        except re.error:
+        except TimeoutError:
+            log.warning("keyword regex timed out pattern=%r", pattern[:100])
+            continue
+        except (re.error, regex.error):
             continue
         if matched:
             if action == "reply" and not reply_text:

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && printf '%s/' "$PWD")"
+APP_DIR="${APP_DIR%/}"
 MODE="docker-compose"
 SERVICE_USER="groupguard"
 
@@ -65,7 +66,24 @@ install_docker() {
   log "Docker 容器已启动：groupguard-web、groupguard-bot。"
 }
 
-install_systemd() {
+install_systemd() (
+  case "$APP_DIR" in
+    *[[:cntrl:]]*|*'%'*|*'$'*|*'\'*|*'"'*|*"'"*|*' ')
+      die 'systemd 安装路径不支持控制字符、%、$、反斜杠、引号或末尾空格。' ;;
+  esac
+  unit_dir="$(mktemp -d)"
+  trap 'rm -rf -- "$unit_dir"' EXIT
+  for role in web bot; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      case "$line" in
+        WorkingDirectory=*) printf 'WorkingDirectory=%s\n' "$APP_DIR" ;;
+        Environment=GROUPGUARD_CONFIG=*) printf 'Environment="GROUPGUARD_CONFIG=%s/config.json"\n' "$APP_DIR" ;;
+        ExecStart=/opt/groupguard/.venv/bin/python*)
+          printf 'ExecStart="%s/.venv/bin/python"%s\n' "$APP_DIR" "${line#ExecStart=/opt/groupguard/.venv/bin/python}" ;;
+        *) printf '%s\n' "$line" ;;
+      esac
+    done < "$APP_DIR/deploy/groupguard-$role.service" > "$unit_dir/groupguard-$role.service"
+  done
   command -v systemctl >/dev/null || die "当前系统没有 systemd。"
   id "$SERVICE_USER" >/dev/null 2>&1 || useradd --system --home-dir "$APP_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
   if [[ ! -x "$APP_DIR/.venv/bin/python" ]]; then
@@ -74,12 +92,12 @@ install_systemd() {
   fi
   prepare_files
   chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR/data"
-  install -m 0644 "$APP_DIR/deploy/groupguard-web.service" /etc/systemd/system/groupguard-web.service
-  install -m 0644 "$APP_DIR/deploy/groupguard-bot.service" /etc/systemd/system/groupguard-bot.service
+  install -m 0644 "$unit_dir/groupguard-web.service" /etc/systemd/system/groupguard-web.service
+  install -m 0644 "$unit_dir/groupguard-bot.service" /etc/systemd/system/groupguard-bot.service
   systemctl daemon-reload
   systemctl enable --now groupguard-web.service groupguard-bot.service
   log "systemd 服务已启动：groupguard-web、groupguard-bot。"
-}
+)
 
 case "$MODE" in
   docker-compose) install_compose ;;

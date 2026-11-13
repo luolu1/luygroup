@@ -630,6 +630,14 @@ async def on_my_chat_member(update: ChatMemberUpdated, bot: Bot) -> None:
             chat_type=chat.type,
         )
         actor_id = update.from_user.id if update.from_user else None
+        if actor_id is not None and not (
+            is_global_admin(actor_id)
+            or await helpers.is_telegram_admin(bot, chat.id, int(actor_id))
+        ):
+            log.info(
+                "skip owner binding for non-admin inviter group=%s user=%s", chat.id, actor_id
+            )
+            actor_id = None
         if actor_id is not None:
             owner = await session.scalar(
                 select(ConsoleUser).where(
@@ -756,6 +764,11 @@ async def on_chat_member(update: ChatMemberUpdated, bot: Bot) -> None:
                 update.new_chat_member.user,
                 invite_redeemed=invite_redeemed,
             )
+    elif old == "kicked" and new == "left":
+        async with session_scope() as session:
+            member = await repo.get_member(session, group.id, update.new_chat_member.user.id)
+            if member:
+                member.is_banned = False
     elif left:
         pending_messages: list[tuple[int, int]] = []
         async with session_scope() as session:

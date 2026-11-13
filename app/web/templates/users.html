@@ -181,7 +181,7 @@
 <div class="card">
   <h2>订阅套餐</h2>
   {% if plans %}
-  <div class="table-wrap"><table><thead><tr><th>套餐</th><th>群组上限</th><th class="num">每日 AI 请求</th><th class="num">每日样本</th></tr></thead><tbody>
+  <div class="table-wrap"><table><thead><tr><th>套餐</th><th>群组上限</th><th class="num">用户每日文本额度</th><th class="num">用户每日图片额度</th></tr></thead><tbody>
   {% for plan in plans %}<tr><td>{{ plan.label or plan.name }}</td><td>{{ plan.group_limit }}</td><td class="num">{{ plan.ai_daily_quota }}</td><td class="num">{{ plan.sample_daily_quota }}</td></tr>{% endfor %}
   </tbody></table></div>
   {% else %}<div class="empty">暂无套餐。</div>{% endif %}

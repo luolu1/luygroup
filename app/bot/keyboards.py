@@ -225,17 +225,52 @@ def auction_history_list_kb(rows: list[tuple[int, str, str, str]]) -> InlineKeyb
     return builder.as_markup()
 
 
-def auction_back_kb(target_step: str) -> InlineKeyboardMarkup:
+def auction_back_kb(
+    target_step: str, *, allow_description_skip: bool = False
+) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
+    if allow_description_skip:
+        builder.row(
+            InlineKeyboardButton(text="⏭ 跳过描述", callback_data="aucsetup:skip:description")
+        )
     builder.row(
         InlineKeyboardButton(text="⬅️ 返回上一步", callback_data=f"aucsetup:back:{target_step}")
     )
     return builder.as_markup()
 
 
-def auction_kb(auction_id: int, code: str = "") -> InlineKeyboardMarkup:
+def auction_type_kb() -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    builder.row(InlineKeyboardButton(text=f"💰 出价 {code or auction_id}", callback_data=f"bid:{auction_id}"))
+    builder.row(
+        InlineKeyboardButton(text="积分竞拍（消耗积分）", callback_data="aucsetup:type:points"),
+        InlineKeyboardButton(text="货币竞拍（10积分门槛，CNY计价）", callback_data="aucsetup:type:currency"),
+    )
+    return builder.as_markup()
+
+
+def auction_kb(
+    auction_id: int, code: str = "", bid_amount: int | None = None, *, unit: str = "积分"
+) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    amount = f":{bid_amount}" if bid_amount is not None else ""
+    label = f"💰 出价 {bid_amount} {unit}" if bid_amount is not None else f"💰 出价 {code or auction_id}"
+    builder.row(
+        InlineKeyboardButton(text=label, callback_data=f"bid:{auction_id}{amount}")
+    )
+    builder.row(
+        InlineKeyboardButton(text="🔎 查看出价", callback_data=f"aucquery:{auction_id}")
+    )
+    return builder.as_markup()
+
+
+def auction_query_list_kb(rows: list[tuple[int, str, str]]) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for auction_id, code, item in rows:
+        builder.row(
+            InlineKeyboardButton(
+                text=f"{code} · {item}", callback_data=f"aucquery:{auction_id}"
+            )
+        )
     return builder.as_markup()
 
 

@@ -1,4 +1,5 @@
 """Database engine, session factory, schema bootstrap and seed data."""
+
 from __future__ import annotations
 
 import asyncio
@@ -36,6 +37,7 @@ def get_engine() -> AsyncEngine:
         _engine = create_async_engine(url, echo=False, pool_pre_ping=True)
 
         if url.startswith("sqlite"):
+
             @event.listens_for(_engine.sync_engine, "connect")
             def _set_sqlite_pragma(dbapi_connection, _connection_record):  # type: ignore[no-untyped-def]
                 cursor = dbapi_connection.cursor()
@@ -108,10 +110,16 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
             "token_value": "VARCHAR(128)",
             "token_expires_at": "DATETIME",
             "balance_cents": "INTEGER NOT NULL DEFAULT 0",
+            "ai_text_daily_quota": "INTEGER",
+            "ai_image_daily_quota": "INTEGER",
         },
         "ai_providers": {
             "owner_user_id": "INTEGER",
             "vision_model": "VARCHAR(128) DEFAULT ''",
+        },
+        "ai_usage": {
+            "text_requests": "INTEGER DEFAULT 0",
+            "image_requests": "INTEGER DEFAULT 0",
         },
         "global_blacklist": {
             "owner_user_id": "INTEGER",
@@ -124,6 +132,7 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
         },
         "groups": {
             "auto_delete_messages": "BOOLEAN DEFAULT 1",
+            "ai_provider_id": "INTEGER",
         },
         "payment_orders": {
             "fee_cents": "INTEGER NOT NULL DEFAULT 0",
@@ -134,6 +143,10 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
         },
         "auctions": {
             "code": "VARCHAR(12)",
+            "description": "VARCHAR(500) DEFAULT ''",
+            "auction_type": "VARCHAR(8) DEFAULT 'points'",
+            "entry_fee": "INTEGER DEFAULT 0",
+            "extend_minutes": "INTEGER DEFAULT 1",
         },
         "lotteries": {
             "participation_type": "VARCHAR(16) DEFAULT 'none'",
@@ -146,8 +159,7 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
     }
     for table, additions in columns.items():
         existing = {
-            str(row[1])
-            for row in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
+            str(row[1]) for row in conn.exec_driver_sql(f"PRAGMA table_info({table})").fetchall()
         }
         if not existing:
             continue
@@ -162,8 +174,7 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
                         raise
 
     conn.exec_driver_sql(
-        "CREATE TABLE IF NOT EXISTS groupguard_migrations "
-        "(name TEXT PRIMARY KEY NOT NULL)"
+        "CREATE TABLE IF NOT EXISTS groupguard_migrations (name TEXT PRIMARY KEY NOT NULL)"
     )
 
     def has_migration(name: str) -> bool:
@@ -181,10 +192,42 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
 
     if not has_migration("default_message_cleanup_settings_v1"):
         conn.exec_driver_sql(
-            "UPDATE groups SET delete_command_messages = 1 "
-            "WHERE delete_command_messages = 0"
+            "UPDATE groups SET delete_command_messages = 1 WHERE delete_command_messages = 0"
         )
         mark_migration("default_message_cleanup_settings_v1")
+
+    if not has_migration("ai_provider_names_match_labels_v1"):
+        provider_rows = conn.exec_driver_sql("SELECT id, name, label FROM ai_providers").fetchall()
+        original_names = {name for _, name, _ in provider_rows}
+        label_counts: dict[str, int] = {}
+        for _, _, label in provider_rows:
+            if label:
+                label_counts[label] = label_counts.get(label, 0) + 1
+        eligible_renames = [
+            (identity, name, label)
+            for identity, name, label in provider_rows
+            if label and name != label and label not in original_names and label_counts[label] == 1
+        ]
+        for identity, name, label in eligible_renames:
+            conn.exec_driver_sql(
+                "UPDATE ai_events SET provider = ? WHERE provider = ?", (label, name)
+            )
+            conn.exec_driver_sql("UPDATE ai_providers SET name = ? WHERE id = ?", (label, identity))
+        mark_migration("ai_provider_names_match_labels_v1")
+
+    if not has_migration("ai_provider_names_match_labels_v2"):
+        conn.exec_driver_sql(
+            "UPDATE ai_providers SET label = name "
+            "WHERE label != name AND EXISTS ("
+            "SELECT 1 FROM ai_providers other "
+            "WHERE other.name = ai_providers.label AND other.id != ai_providers.id"
+            ")"
+        )
+        mark_migration("ai_provider_names_match_labels_v2")
+
+    if not has_migration("ai_provider_names_match_labels_v3"):
+        conn.exec_driver_sql("UPDATE ai_providers SET label = name WHERE label != name")
+        mark_migration("ai_provider_names_match_labels_v3")
 
     if not has_migration("auction_public_codes_v1"):
         conn.exec_driver_sql(
@@ -197,32 +240,29 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
     )
 
     conn.exec_driver_sql(
-        "CREATE INDEX IF NOT EXISTS ix_ai_providers_owner_user_id "
-        "ON ai_providers (owner_user_id)"
+        "CREATE INDEX IF NOT EXISTS ix_ai_providers_owner_user_id ON ai_providers (owner_user_id)"
     )
     conn.exec_driver_sql(
         "CREATE INDEX IF NOT EXISTS ix_global_blacklist_owner_user_id "
         "ON global_blacklist (owner_user_id)"
     )
     for index_statement in (
-        "CREATE INDEX IF NOT EXISTS ix_keyword_hits_created_at "
-        "ON keyword_hits (created_at)",
+        "CREATE INDEX IF NOT EXISTS ix_keyword_hits_created_at ON keyword_hits (created_at)",
         "CREATE INDEX IF NOT EXISTS ix_payment_orders_status_expires "
         "ON payment_orders (status, expires_at)",
         "CREATE INDEX IF NOT EXISTS ix_verifications_status_created "
         "ON verifications (status, created_at)",
-        "CREATE INDEX IF NOT EXISTS ix_members_muted_until "
-        "ON members (is_muted, muted_until)",
-        "CREATE INDEX IF NOT EXISTS ix_lotteries_group_status "
-        "ON lotteries (group_id, status)",
+        "CREATE INDEX IF NOT EXISTS ix_members_muted_until ON members (is_muted, muted_until)",
+        "CREATE INDEX IF NOT EXISTS ix_lotteries_group_status ON lotteries (group_id, status)",
         "CREATE INDEX IF NOT EXISTS ix_lotteries_creator_hidden_id "
         "ON lotteries (creator_id, hidden_at, id)",
+        "CREATE INDEX IF NOT EXISTS ix_auctions_status_ends ON auctions (status, ends_at)",
+        "CREATE INDEX IF NOT EXISTS ix_red_packets_status_expires ON red_packets (status, expires_at)",
     ):
         conn.exec_driver_sql(index_statement)
 
     console_columns = {
-        str(row[1])
-        for row in conn.exec_driver_sql("PRAGMA table_info(console_users)").fetchall()
+        str(row[1]) for row in conn.exec_driver_sql("PRAGMA table_info(console_users)").fetchall()
     }
     if "console_path" in console_columns:
         conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
@@ -232,12 +272,25 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
             "display_name VARCHAR(255), token_hash VARCHAR(64) NOT NULL, "
             "token_value VARCHAR(128), token_expires_at DATETIME, role VARCHAR(24), "
             "is_active BOOLEAN, balance_cents INTEGER NOT NULL DEFAULT 0, "
+            "ai_text_daily_quota INTEGER, "
+            "ai_image_daily_quota INTEGER, "
             "created_at DATETIME, last_login_at DATETIME)"
         )
         kept_columns = [
-            "id", "telegram_id", "username", "display_name", "token_hash",
-            "token_value", "token_expires_at", "role", "is_active",
-            "balance_cents", "created_at", "last_login_at",
+            "id",
+            "telegram_id",
+            "username",
+            "display_name",
+            "token_hash",
+            "token_value",
+            "token_expires_at",
+            "role",
+            "is_active",
+            "balance_cents",
+            "ai_text_daily_quota",
+            "ai_image_daily_quota",
+            "created_at",
+            "last_login_at",
         ]
         names = ", ".join(kept_columns)
         conn.exec_driver_sql(
@@ -261,34 +314,32 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
             "CREATE INDEX IF NOT EXISTS ix_console_users_role ON console_users (role)"
         )
         conn.exec_driver_sql(
-            "CREATE INDEX IF NOT EXISTS ix_console_users_is_active "
-            "ON console_users (is_active)"
+            "CREATE INDEX IF NOT EXISTS ix_console_users_is_active ON console_users (is_active)"
         )
         conn.exec_driver_sql("PRAGMA foreign_keys=ON")
 
     # Backfill the new warning metadata for records created before the columns
     # existed. This is additive and safe to run on every startup.
     warning_columns = {
-        str(row[1])
-        for row in conn.exec_driver_sql("PRAGMA table_info(warnings)").fetchall()
+        str(row[1]) for row in conn.exec_driver_sql("PRAGMA table_info(warnings)").fetchall()
     }
     keyword_columns = {
-        str(row[1])
-        for row in conn.exec_driver_sql("PRAGMA table_info(keyword_hits)").fetchall()
+        str(row[1]) for row in conn.exec_driver_sql("PRAGMA table_info(keyword_hits)").fetchall()
     }
-    if not {
-        "code",
-        "source",
-        "content",
-        "review_status",
-        "created_at",
-        "group_id",
-        "user_id",
-    } <= warning_columns:
+    if (
+        not {
+            "code",
+            "source",
+            "content",
+            "review_status",
+            "created_at",
+            "group_id",
+            "user_id",
+        }
+        <= warning_columns
+    ):
         return
-    conn.exec_driver_sql(
-        "CREATE INDEX IF NOT EXISTS ix_warnings_code ON warnings (code)"
-    )
+    conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS ix_warnings_code ON warnings (code)")
     if has_migration("warnings_metadata_backfill_v1"):
         return
     conn.exec_driver_sql(
@@ -354,22 +405,26 @@ async def init_db() -> None:
         # made in the web panel. The DB is the source of truth after first start.
         cfg = get_config()
         async with session_scope() as session:
-            existing = {p.name for p in (await session.scalars(select(AIProvider))).all()}
+            existing = (await session.scalars(select(AIProvider))).all()
             for seed in cfg.ai.providers:
-                if seed.name in existing:
+                if any(
+                    provider.name in {seed.name, seed.label}
+                    or (seed.builtin and provider.builtin and provider.base_url == seed.base_url)
+                    for provider in existing
+                ):
                     continue
-                session.add(
-                    AIProvider(
-                        name=seed.name,
-                        label=seed.label or seed.name,
-                        base_url=seed.base_url,
-                        api_key=seed.api_key,
-                        model=seed.model,
-                        priority=seed.priority,
-                        enabled=seed.enabled,
-                        builtin=seed.builtin,
-                    )
+                provider = AIProvider(
+                    name=seed.label or seed.name,
+                    label=seed.label or seed.name,
+                    base_url=seed.base_url,
+                    api_key=seed.api_key,
+                    model=seed.model,
+                    priority=seed.priority,
+                    enabled=seed.enabled,
+                    builtin=seed.builtin,
                 )
+                session.add(provider)
+                existing.append(provider)
 
             # Seed the default subscription plan once. Plans are managed by the
             # superadmin and define group limits plus AI/sample quotas.
@@ -379,9 +434,7 @@ async def init_db() -> None:
                     SubscriptionPlan(
                         name="pro",
                         label="订阅版",
-                        features=json.dumps(
-                            sorted(ADVANCED_FEATURES), ensure_ascii=False
-                        ),
+                        features=json.dumps(sorted(ADVANCED_FEATURES), ensure_ascii=False),
                         group_limit=5,
                         ai_daily_quota=200,
                         sample_daily_quota=500,

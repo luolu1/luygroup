@@ -3,7 +3,7 @@ VENV := .venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
 
-.PHONY: help venv install init-config run run-bot run-web check lint format smoke smoke-ai-client smoke-permissions smoke-entitlement-queries smoke-captcha smoke-rejoin smoke-scheduler smoke-scheduler-queries smoke-scheduler-idempotency smoke-bot-recovery smoke-subscription-purchase smoke-payments smoke-commands smoke-games-race smoke-economy-claims docker-build docker-up docker-down docker-logs clean
+.PHONY: help venv install init-config run run-bot run-web check lint format smoke smoke-ai-client smoke-permissions smoke-entitlement-queries smoke-captcha smoke-rejoin smoke-scheduler smoke-scheduler-queries smoke-scheduler-idempotency smoke-bot-recovery smoke-subscription-purchase smoke-payments smoke-commands smoke-games-race smoke-economy-claims smoke-auction-dispatcher smoke-auction-reminders docker-build docker-up docker-down docker-logs clean
 
 help:
 	@echo "luygroup 常用命令："
@@ -14,6 +14,8 @@ help:
 	@echo "  make run-web       仅启动 Web 控制台"
 	@echo "  make check         编译检查全部 Python 文件"
 	@echo "  make lint          Ruff 检查生产代码与测试脚本"
+	@echo "  make verify        编译、Ruff、全部离线回归及部署脚本沙箱检查"
+	@echo "  make smoke-offline 运行全部隔离回归；OFFLINE_ARGS 可指定并发和日志目录"
 	@echo "  make format        Ruff 格式化 Python 文件"
 	@echo "  make smoke         运行 Web 面板冒烟测试"
 	@echo "  make smoke-permissions 运行角色、群组与接口隔离回归测试"
@@ -28,6 +30,8 @@ help:
 	@echo "  make smoke-commands 运行命令菜单、学习分目录、功能门槛与自助命令测试"
 	@echo "  make smoke-games-race 运行竞拍/红包并发资金安全回归测试"
 	@echo "  make smoke-economy-claims 运行签到/商城/抽奖并发资金与库存回归测试"
+	@echo "  make smoke-auction-dispatcher 运行竞拍 Bot 调度器离线回归测试"
+	@echo "  make smoke-auction-reminders 运行竞拍提醒与投递幂等回归测试"
 	@echo "  make docker-build  构建 Docker 镜像"
 	@echo "  make docker-up     启动 Docker Compose"
 	@echo "  make docker-down   停止 Docker Compose"
@@ -61,7 +65,7 @@ run-web: $(PYTHON)
 	$(PYTHON) run_web.py
 
 check: $(PYTHON)
-	$(PYTHON) -m compileall -q app run_bot.py run_web.py
+	$(PYTHON) -m compileall -q app scripts run_bot.py run_web.py
 	@echo "编译检查通过。"
 
 lint: $(PYTHON)
@@ -72,6 +76,18 @@ format: $(PYTHON)
 
 smoke: $(PYTHON)
 	$(PYTHON) scripts/smoke_web.py
+
+.PHONY: verify smoke-offline smoke-guards smoke-install-paths
+verify: check lint smoke-offline smoke-guards smoke-install-paths
+
+smoke-offline: $(PYTHON)
+	$(PYTHON) -B scripts/run_offline_smokes.py $(OFFLINE_ARGS)
+
+smoke-guards: $(PYTHON)
+	$(PYTHON) -B scripts/smoke_offline_guards.py
+
+smoke-install-paths: $(PYTHON)
+	$(PYTHON) -B scripts/smoke_install_paths.py
 
 smoke-ai-client: $(PYTHON)
 	$(PYTHON) scripts/smoke_ai_client.py
@@ -114,6 +130,12 @@ smoke-games-race: $(PYTHON)
 
 smoke-economy-claims: $(PYTHON)
 	$(PYTHON) scripts/smoke_economy_claims.py
+
+smoke-auction-dispatcher: $(PYTHON)
+	$(PYTHON) scripts/smoke_auction_dispatcher.py
+
+smoke-auction-reminders: $(PYTHON)
+	$(PYTHON) scripts/smoke_auction_reminders.py
 
 docker-build:
 	docker compose build

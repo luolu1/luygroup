@@ -1,26 +1,39 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import os
 import sys
 import tempfile
+from contextlib import ExitStack
 from datetime import timedelta
 from pathlib import Path
+from typing import Final
+from unittest.mock import patch
 
 from sqlalchemy import event, func, select
 
 ROOT = Path(__file__).resolve().parents[1]
-TMP = Path(tempfile.mkdtemp(prefix="groupguard-scheduler-query-smoke-"))
+RUNTIME: Final = ExitStack()
+atexit.register(RUNTIME.close)
+TMP = Path(RUNTIME.enter_context(tempfile.TemporaryDirectory(
+    prefix="groupguard-scheduler-query-smoke-", dir="/tmp/opencode",
+)))
 TMP_CONFIG = TMP / "config.json"
 config = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
-config["bot"]["token"] = "123456:smoke-token"
+config["bot"] = {"token": "123456:smoke-token", "admin_ids": [], "proxy": ""}
 config["web"]["secret_key"] = "scheduler-query-smoke-secret"
+config["web"]["base_url"] = "https://example.test"
 config["database"]["url"] = f"sqlite+aiosqlite:///{TMP / 'scheduler.db'}"
+config["ai"]["learning_dir"] = str(TMP / "learning")
+config["ai"]["providers"] = []
+config["payments"]["enabled"] = False
 TMP_CONFIG.write_text(json.dumps(config), encoding="utf-8")
-os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
+RUNTIME.enter_context(patch.dict(os.environ, {"GROUPGUARD_CONFIG": str(TMP_CONFIG)}))
 sys.path.insert(0, str(ROOT))
 
+from app.config import get_config
 from app.db import dispose_db, get_engine, init_db, session_scope  # noqa: E402
 from app.models import (  # noqa: E402
     AdminLog,
@@ -37,6 +50,8 @@ from app.services.scheduler import (
     draw_lotteries,
     expire_verifications,
 )  # noqa: E402
+
+RUNTIME.callback(get_config.cache_clear)
 
 
 class FakeBot:
@@ -194,13 +209,11 @@ async def main() -> None:
         f"({statement_count} statements, {lottery_count_queries} count query)"
     )
     event.remove(get_engine().sync_engine, "before_cursor_execute", count_statement)
-    await dispose_db()
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    finally:
-        import shutil
-
-        shutil.rmtree(TMP, ignore_errors=True)
+    with RUNTIME, asyncio.Runner() as runner:
+        try:
+            runner.run(main())
+        finally:
+            runner.run(dispose_db())

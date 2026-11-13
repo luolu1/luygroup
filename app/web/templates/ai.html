@@ -85,7 +85,7 @@
       <thead><tr><th>接口</th><th class="num">调用事件</th><th class="num">命中</th></tr></thead>
       <tbody>
       {% for provider, calls, hits in provider_usage %}
-      <tr><td class="mono small">{{ provider or '未标记' }}</td><td class="num">{{ calls }}</td><td class="num">{{ hits }}</td></tr>
+      <tr><td class="mono small">{{ provider_labels.get(provider, provider) or '未标记' }}</td><td class="num">{{ calls }}</td><td class="num">{{ hits }}</td></tr>
       {% endfor %}
       </tbody>
     </table>
@@ -98,11 +98,11 @@
 <div class="card">
   <div class="spread">
     <h2>今日 AI 用量</h2>
-    <span class="faint small">{{ ai_summary.day }} · 仅统计已绑定群组</span>
+    <span class="faint small">{{ ai_summary.day }} · 系统内置接口 · 按用户所有群合计</span>
   </div>
     <div class="grid cols-3">
-    <div class="stat"><div class="stat-label">套餐每日请求额度</div><div class="stat-value">已用 {{ ai_summary.requests }}{% if ai_summary.request_limit is not none %} <span class="muted small">/ 总额 {{ ai_summary.request_limit }}</span>{% endif %}</div></div>
-    <div class="stat"><div class="stat-label">抽样样本</div><div class="stat-value">{{ ai_summary.samples }}{% if ai_summary.sample_limit is not none %} <span class="muted small">/ {{ ai_summary.sample_limit }}</span>{% endif %}</div></div>
+    <div class="stat"><div class="stat-label">文本请求</div><div class="stat-value">已用 {{ ai_summary.text_requests }}{% if ai_summary.request_limit is not none %} <span class="muted small">/ {{ ai_summary.request_limit }}</span>{% endif %}</div></div>
+    <div class="stat"><div class="stat-label">图片请求</div><div class="stat-value">已用 {{ ai_summary.image_requests }}{% if ai_summary.sample_limit is not none %} <span class="muted small">/ {{ ai_summary.sample_limit }}</span>{% endif %}</div></div>
     <div class="stat"><div class="stat-label">命中</div><div class="stat-value">{{ ai_summary.hits }}</div></div>
   </div>
   <div class="hint">这里统计当前账户绑定群组的调用情况。套餐额度按请求尝试次数计量；供应商 token 用量目前不在系统内统计。</div>
@@ -228,7 +228,7 @@
             <td class="faint nowrap">{{ e.created_at|dt }}</td>
             <td class="small">{{ g.title if g else e.group_id }}</td>
             <td><span class="badge info">{{ e.kind }}</span></td>
-            <td class="mono small">{{ e.provider or '—' }}</td>
+            <td class="mono small">{{ provider_labels.get(e.provider, e.provider) or '—' }}</td>
             <td>{% if e.hit %}<span class="badge bad">是</span>{% else %}<span class="badge">否</span>{% endif %}</td>
           </tr>
         {% endfor %}

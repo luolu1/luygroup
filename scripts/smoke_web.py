@@ -5,40 +5,40 @@
 
     .venv/bin/python scripts/smoke_web.py
 """
+
 from __future__ import annotations
 
+import atexit
 import json
 import os
-import shutil
 import sqlite3
 import sys
 import tempfile
+from contextlib import ExitStack, closing
 from pathlib import Path
+from unittest.mock import patch
 
 from sqlalchemy import create_engine
 
 ROOT = Path(__file__).resolve().parents[1]
-TMP = Path(tempfile.mkdtemp(prefix="groupguard-smoke-"))
+CLEANUP = ExitStack()
+_ = atexit.register(CLEANUP.close)
+TMP = Path(CLEANUP.enter_context(tempfile.TemporaryDirectory(
+    prefix="groupguard-smoke-", dir="/tmp/opencode"
+)))
 DB = TMP / "smoke.db"
 TMP_CONFIG = TMP / "config.json"
-
-config_path = ROOT / "config.json"
-if not config_path.exists():
-    print("未找到 config.json，请先复制 config.example.json 并填写。")
-    sys.exit(2)
-
-cfg = json.loads(config_path.read_text(encoding="utf-8"))
-admin_ids = [int(item) for item in cfg.get("bot", {}).get("admin_ids", [])]
-if not admin_ids:
-    print("config.json 的 bot.admin_ids 为空，无法执行登录测试。")
-    sys.exit(2)
-ADMIN_ID = admin_ids[0]
-
-cfg["database"]["url"] = f"sqlite+aiosqlite:///{DB}"
-cfg.setdefault("web", {})["base_url"] = "http://testserver"
-cfg.setdefault("ai", {})["learning_dir"] = str(TMP / "learning")
+ADMIN_ID = 891000001
+cfg = {
+    "bot": {"token": "123456789:WEB_SMOKE_SYNTHETIC_TOKEN", "admin_ids": [ADMIN_ID],
+            "username": "web_smoke_bot", "proxy": ""},
+    "web": {"secret_key": "web-smoke-synthetic-secret", "base_url": "http://testserver"},
+    "database": {"url": f"sqlite+aiosqlite:///{DB}"},
+    "ai": {"learning_dir": str(TMP / "learning"), "providers": []},
+    "payments": {"enabled": False},
+}
 TMP_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
+_ = CLEANUP.enter_context(patch.dict(os.environ, {"GROUPGUARD_CONFIG": str(TMP_CONFIG)}, clear=True))
 sys.path.insert(0, str(ROOT))
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -67,10 +67,11 @@ def check(name: str, cond: bool, extra: str = "") -> None:
     else:
         failures.append(name)
         print(f"FAIL {name} {extra}")
+        raise AssertionError(name)
 
 
 def connect() -> sqlite3.Connection:
-    return sqlite3.connect(DB)
+    return CLEANUP.enter_context(closing(sqlite3.connect(DB)))
 
 
 try:
@@ -90,13 +91,18 @@ try:
             "INSERT OR REPLACE INTO console_users "
             "(telegram_id, display_name, username, token_hash, token_expires_at, role, is_active, balance_cents) "
             "VALUES (?, ?, ?, ?, datetime('now', '+15 minutes'), 'user', 1, 800)",
-            (ADMIN_ID + 10000, "Balance User", "balance_user", hash_console_token("balance-user-token")),
+            (
+                ADMIN_ID + 10000,
+                "Balance User",
+                "balance_user",
+                hash_console_token("balance-user-token"),
+            ),
         )
         con.commit()
-        con.close()
 
         legacy_db = TMP / "legacy-console.db"
         legacy_engine = create_engine(f"sqlite:///{legacy_db}")
+        _ = CLEANUP.callback(legacy_engine.dispose)
         with legacy_engine.begin() as connection:
             from app.models import Base
             from app.db import _upgrade_sqlite_schema
@@ -111,13 +117,11 @@ try:
             )
             _upgrade_sqlite_schema(connection)
             columns = {
-                row[1]
-                for row in connection.exec_driver_sql("PRAGMA table_info(console_users)")
+                row[1] for row in connection.exec_driver_sql("PRAGMA table_info(console_users)")
             }
             legacy_user = connection.exec_driver_sql(
                 "SELECT telegram_id, display_name FROM console_users WHERE telegram_id=123"
             ).one()
-        legacy_engine.dispose()
         check(
             "legacy console path migration preserves account",
             "console_path" not in columns and legacy_user == (123, "Legacy"),
@@ -128,6 +132,7 @@ try:
         check("login page", r.status_code == 200 and "luygroup 控制台" in r.text, r.text[:200])
 
         anonymous = TestClient(app)
+        _ = CLEANUP.callback(anonymous.close)
         r = anonymous.get("/groups", follow_redirects=False)
         check(
             "anonymous redirect",
@@ -161,20 +166,30 @@ try:
         )
 
         r = client.get(f"/console?token={token}", follow_redirects=False)
-        check("direct console token login", r.status_code == 303 and r.headers["location"] == "/", str(r.headers))
+        check(
+            "direct console token login",
+            r.status_code == 303 and r.headers["location"] == "/",
+            str(r.headers),
+        )
         check(
             "random path login route removed",
-            client.get("/console/some-random-path?token=" + token, follow_redirects=False).status_code == 404,
+            client.get(
+                "/console/some-random-path?token=" + token, follow_redirects=False
+            ).status_code
+            == 404,
         )
 
         r = client.get(f"/console?token={token}", follow_redirects=False)
-        check("login code one-time", r.status_code == 200 and "无效、已过期或已被使用" in r.text, r.text[:200])
+        check(
+            "login code one-time",
+            r.status_code == 200 and "无效、已过期或已被使用" in r.text,
+            r.text[:200],
+        )
 
         con = connect()
         balance_row = con.execute(
             "SELECT id, balance_cents FROM console_users WHERE telegram_id=?", (ADMIN_ID + 10000,)
         ).fetchone()
-        con.close()
         admin_db_id, initial_balance = balance_row
         r = client.post(
             f"/users/{admin_db_id}/balance",
@@ -185,8 +200,11 @@ try:
         balance = con.execute(
             "SELECT balance_cents FROM console_users WHERE telegram_id=?", (ADMIN_ID + 10000,)
         ).fetchone()[0]
-        con.close()
-        check("admin can update account balance", r.status_code == 303 and balance == 1234, f"{r.status_code} {balance}")
+        check(
+            "admin can update account balance",
+            r.status_code == 303 and balance == 1234,
+            f"{r.status_code} {balance}",
+        )
         r = client.post(
             f"/users/{admin_db_id}/balance",
             data={"balance": "12.345"},
@@ -196,11 +214,19 @@ try:
         unchanged = con.execute(
             "SELECT balance_cents FROM console_users WHERE telegram_id=?", (ADMIN_ID + 10000,)
         ).fetchone()[0]
-        con.close()
         check(
             "invalid balance keeps stored value",
             r.status_code == 303 and unchanged == 1234 and "err=" in r.headers.get("location", ""),
             f"{r.status_code} {unchanged} {r.headers.get('location')}",
+        )
+        ledger_entries = con.execute(
+            "SELECT kind, amount_cents, balance_after_cents FROM account_ledger_entries WHERE user_id=? ORDER BY id",
+            (admin_db_id,)
+        ).fetchall()
+        check(
+            "balance adjustment creates ledger entry",
+            len(ledger_entries) == 1 and ledger_entries[0] == ("adjustment", 1234 - initial_balance, 1234),
+            str(ledger_entries),
         )
 
         r = client.get("/")
@@ -210,7 +236,16 @@ try:
             r.text[:300],
         )
 
-        for path in ["/", "/groups", "/users", "/ai", "/ai/add", "/blacklist", "/reports", "/stats"]:
+        for path in [
+            "/",
+            "/groups",
+            "/users",
+            "/ai",
+            "/ai/add",
+            "/blacklist",
+            "/reports",
+            "/stats",
+        ]:
             r = client.get(path)
             check(f"GET {path}", r.status_code == 200, f"{r.status_code} {r.text[:300]}")
 
@@ -244,9 +279,11 @@ try:
             (ADMIN_ID + 10000,),
         )
         con.commit()
-        con.close()
         r = client.get("/console?token=balance-user-token", follow_redirects=False)
-        check("balance user can open account page", r.status_code == 303 and r.headers.get("location") == "/")
+        check(
+            "balance user can open account page",
+            r.status_code == 303 and r.headers.get("location") == "/",
+        )
         con = connect()
         con.execute(
             "INSERT INTO groups (id, title, chat_type, is_active) VALUES (?, ?, ?, 1)",
@@ -271,7 +308,6 @@ try:
             (lottery_id, ADMIN_ID + 10001),
         )
         con.commit()
-        con.close()
         r = client.get("/account")
         check(
             "unsubscribed account shows one open action and balance choice",
@@ -282,8 +318,12 @@ try:
             and "余额抵扣" in r.text
             and "在线支付续费 · ¥8.00" not in r.text
             and 'trigger.addEventListener("click"' in r.text
-            and "账单记录" in r.text,
+            and "余额流水" in r.text,
             r.text[:500],
+        )
+        check(
+            "account lists manual balance adjustment",
+            "余额调整" in r.text,
         )
         check(
             "account shows my lottery records",
@@ -305,10 +345,12 @@ try:
             "SELECT status, expires_at FROM subscriptions WHERE user_id=(SELECT id FROM console_users WHERE telegram_id=?)",
             (ADMIN_ID + 10000,),
         ).fetchone()
-        con.close()
         check(
             "account purchase charges eight CNY and activates subscription",
-            r.status_code == 303 and account_balance == 0 and subscription and subscription[0] == "active",
+            r.status_code == 303
+            and account_balance == 0
+            and subscription
+            and subscription[0] == "active",
             f"{r.status_code} {account_balance} {subscription}",
         )
         r = client.get("/account")
@@ -328,14 +370,12 @@ try:
             (hash_console_token("balance-user-low-token"), ADMIN_ID + 10000),
         )
         con.commit()
-        con.close()
         client.get("/console?token=balance-user-low-token", follow_redirects=False)
         r = client.post("/account/subscribe", follow_redirects=False)
         con = connect()
         unchanged = con.execute(
             "SELECT balance_cents FROM console_users WHERE telegram_id=?", (ADMIN_ID + 10000,)
         ).fetchone()[0]
-        con.close()
         check(
             "account purchase rejects insufficient funds",
             r.status_code == 303 and unchanged == 799 and "err=" in r.headers.get("location", ""),
@@ -349,7 +389,6 @@ try:
             (hash_console_token(admin_token), ADMIN_ID),
         )
         con.commit()
-        con.close()
         client.get(f"/console?token={admin_token}", follow_redirects=False)
 
         con = connect()
@@ -395,7 +434,6 @@ try:
             "VALUES (987654321, '私聊用户不应显示', 'private_chat_user', 'private', 1)"
         )
         con.commit()
-        con.close()
 
         tabs = [
             "settings",
@@ -424,6 +462,73 @@ try:
                     and 'name="flood_action"' in r.text,
                     r.text[:600],
                 )
+            if tab == "ai":
+                check(
+                    "group ai tab offers an interface selector",
+                    'name="ai_provider_id"' in r.text
+                    and 'id="ai_provider_id"' in r.text
+                    and "自动（按优先级选择）" in r.text,
+                    r.text[:600],
+                )
+
+        con = connect()
+        provider_row = con.execute(
+            "INSERT INTO ai_providers (name, label, base_url, api_key, model, vision_model, priority, enabled, builtin)"
+            " VALUES ('bind-one', '绑定接口', 'https://bind.example/v1', 'sk-bind', 'bind-text', 'bind-vision', 5, 1, 0)"
+        )
+        bind_provider_id = provider_row.lastrowid
+        con.commit()
+        r = client.post(
+            "/groups/-1001234567890/settings",
+            data={"_scope": "ai", "ai_provider_id": str(bind_provider_id)},
+            follow_redirects=False,
+        )
+        con = connect()
+        stored = con.execute(
+            "SELECT ai_provider_id FROM groups WHERE id = -1001234567890"
+        ).fetchone()
+        check(
+            "group ai binding saves the chosen interface",
+            stored is not None and stored[0] == bind_provider_id,
+            str(stored),
+        )
+        r = client.get("/groups/-1001234567890?tab=ai")
+        check(
+            "group ai tab marks the bound interface as selected",
+            f'<option value="{bind_provider_id}" selected>' in r.text,
+            r.text[:600],
+        )
+        check(
+            "group ai provider options show names without model suffixes",
+            "绑定接口" in r.text and "bind-text" not in r.text,
+            r.text[:600],
+        )
+        con = connect()
+        con.execute(
+            "INSERT INTO ai_events (group_id, user_id, kind, provider, prompt, result, hit, latency_ms, created_at)"
+            " VALUES (-1001234567890, 111, 'moderation', 'bind-one', 'p', 'r', 0, 5, '2026-11-03 00:00:00.000000')"
+        )
+        con.commit()
+        r = client.get("/groups/-1001234567890?tab=ai")
+        check(
+            "ai events show the panel label instead of the internal name",
+            "绑定接口" in r.text and ">bind-one<" not in r.text,
+            r.text[:600],
+        )
+        r = client.post(
+            "/groups/-1001234567890/settings",
+            data={"_scope": "ai", "ai_provider_id": ""},
+            follow_redirects=False,
+        )
+        con = connect()
+        cleared = con.execute(
+            "SELECT ai_provider_id FROM groups WHERE id = -1001234567890"
+        ).fetchone()
+        check(
+            "group ai binding can be cleared back to priority order",
+            cleared is not None and cleared[0] is None,
+            str(cleared),
+        )
 
         r = client.get("/ai")
         check(
@@ -439,22 +544,22 @@ try:
             r.text[:600],
         )
 
-        provider_id = connect().execute(
-            "SELECT id FROM ai_providers WHERE name='smoke-ai'"
-        ).fetchone()[0]
+        provider_id = (
+            connect().execute("SELECT id FROM ai_providers WHERE name='smoke-ai'").fetchone()[0]
+        )
         check(
             "ai provider card header actions",
             all(
                 marker in r.text
                 for marker in (
-                     'class="provider-tools"',
-                     ">测试连通</button>",
-                     ">删除</button>",
-                     'href="/ai/providers/',
-                     'class="provider-switch"',
-                     ">优先级 1</span>",
-                     "文本模型",
-                     "图像模型",
+                    'class="provider-tools"',
+                    ">测试连通</button>",
+                    ">删除</button>",
+                    'href="/ai/providers/',
+                    'class="provider-switch"',
+                    ">优先级 1</span>",
+                    "文本模型",
+                    "图像模型",
                 )
             )
             and "编辑 / 切换供应商与模型" not in r.text
@@ -464,7 +569,7 @@ try:
         check(
             "ai provider quick model dropdown",
             'href="/ai/providers/' in r.text
-            and 'data-edit-toggle=' not in r.text
+            and "data-edit-toggle=" not in r.text
             and "文本模型" in r.text
             and "图像模型" in r.text
             and "provider-edit-panel" not in r.text,
@@ -478,9 +583,9 @@ try:
             and 'action="/ai/providers/' in edit_page.text
             and 'name="model"' in edit_page.text
             and 'name="vision_model"' in edit_page.text
-            and 'data-model-select' in edit_page.text
-            and 'data-vision-model-select' in edit_page.text
-            and 'data-fetch-vision-models' in edit_page.text
+            and "data-model-select" in edit_page.text
+            and "data-vision-model-select" in edit_page.text
+            and "data-fetch-vision-models" in edit_page.text
             and "保存修改" in edit_page.text,
             edit_page.text[:600],
         )
@@ -495,11 +600,9 @@ try:
             "SELECT base_url, model, enabled FROM ai_providers WHERE id=?",
             (provider_id,),
         ).fetchone()
-        con.close()
         check(
             "ai quick supplier change keeps other fields",
-            r.status_code == 303
-            and row == ("https://api.moonshot.cn/v1", "deepseek-chat", 1),
+            r.status_code == 303 and row == ("https://api.moonshot.cn/v1", "deepseek-chat", 1),
             f"{r.status_code} {row}",
         )
 
@@ -513,11 +616,9 @@ try:
             "SELECT base_url, model, enabled FROM ai_providers WHERE id=?",
             (provider_id,),
         ).fetchone()
-        con.close()
         check(
             "ai quick model change keeps other fields",
-            r.status_code == 303
-            and row == ("https://api.moonshot.cn/v1", "deepseek-reasoner", 1),
+            r.status_code == 303 and row == ("https://api.moonshot.cn/v1", "deepseek-reasoner", 1),
             f"{r.status_code} {row}",
         )
 
@@ -531,11 +632,29 @@ try:
             "SELECT vision_model FROM ai_providers WHERE id=?",
             (provider_id,),
         ).fetchone()
-        con.close()
         check(
             "ai provider saves vision model",
             r.status_code == 303 and row == ("vision-smoke",),
             f"{r.status_code} {row}",
+        )
+        r = client.post(
+            f"/ai/providers/{provider_id}/update",
+            data={"name": "renamed-smoke-ai", "enabled": "on"},
+            follow_redirects=False,
+        )
+        con = connect()
+        renamed = con.execute(
+            "SELECT name, label FROM ai_providers WHERE id=?", (provider_id,)
+        ).fetchone()
+        check(
+            "ai provider name and display label stay identical",
+            r.status_code == 303 and renamed == ("renamed-smoke-ai", "renamed-smoke-ai"),
+            str(renamed),
+        )
+        client.post(
+            f"/ai/providers/{provider_id}/update",
+            data={"name": "smoke-ai", "enabled": "on"},
+            follow_redirects=False,
         )
 
         # Restore the fixture provider for the remaining AI checks.
@@ -555,10 +674,10 @@ try:
             "ai add page",
             r.status_code == 200
             and 'action="/ai/providers/add"' in r.text
-            and 'data-fetch-models' in r.text
-            and 'data-fetch-vision-models' in r.text
-            and 'data-model-select' in r.text
-            and 'data-vision-model-select' in r.text,
+            and "data-fetch-models" in r.text
+            and "data-fetch-vision-models" in r.text
+            and "data-model-select" in r.text
+            and "data-vision-model-select" in r.text,
             r.text[:500],
         )
 
@@ -581,8 +700,8 @@ try:
         check(
             "ai js model dropdown auto-fetch",
             "setupModelSelect" in ai_js
-            and 'data-model-select' in ai_js
-            and 'data-vision-model-select' in ai_js
+            and "data-model-select" in ai_js
+            and "data-vision-model-select" in ai_js
             and 'kind: "vision"' in ai_js
             and 'kind === "vision"' in ai_js
             and 'fetch("/ai/models"' in ai_js
@@ -655,7 +774,6 @@ try:
             "SELECT review_status, active, review_note, content FROM warnings WHERE id=?",
             (ai_warning_id,),
         ).fetchone()
-        con.close()
         check(
             "ai false positive db",
             reviewed == ("false_positive", 0, "冒烟误杀", "冒烟测试广告原文"),
@@ -690,7 +808,6 @@ try:
             "SELECT review_status, active, review_note FROM warnings WHERE id=?",
             (ai_warning_id,),
         ).fetchone()
-        con.close()
         check(
             "ai confirmed db",
             confirmed_row == ("confirmed", 1, "冒烟确认违规"),
@@ -767,18 +884,19 @@ try:
         check("ai provider add without scheme", r.status_code == 303, r.text[:300])
         con = connect()
         saved_base = con.execute(
-            "SELECT base_url FROM ai_providers WHERE name='smoke-noscheme'"
+            "SELECT name, label, base_url FROM ai_providers WHERE name='smoke-noscheme'"
         ).fetchone()
-        con.close()
         check(
             "ai provider normalized in db",
-            saved_base == ("https://vyceai.com/v1",),
+            saved_base == ("smoke-noscheme", "smoke-noscheme", "https://vyceai.com/v1"),
             str(saved_base),
         )
 
         model_calls: list[tuple[str, str]] = []
 
-        async def fake_fetch_models(base_url: str, api_key: str, *, kind: str = "text") -> list[str]:
+        async def fake_fetch_models(
+            base_url: str, api_key: str, *, kind: str = "text"
+        ) -> list[str]:
             model_calls.append((base_url, api_key, kind))
             if kind == "vision":
                 return ["gpt-4o-mini", "qwen2.5-vl-32b-instruct"]
@@ -791,16 +909,22 @@ try:
         )
         check(
             "ai models fetch",
-            r.status_code == 200 and r.json().get("models") == ["deepseek-chat", "deepseek-reasoner"],
+            r.status_code == 200
+            and r.json().get("models") == ["deepseek-chat", "deepseek-reasoner"],
             r.text[:300],
         )
         r = client.post(
             "/ai/models",
-            json={"base_url": "https://api.deepseek.com/v1", "api_key": "sk-smoke", "kind": "vision"},
+            json={
+                "base_url": "https://api.deepseek.com/v1",
+                "api_key": "sk-smoke",
+                "kind": "vision",
+            },
         )
         check(
             "ai vision models fetch",
-            r.status_code == 200 and r.json().get("models") == ["gpt-4o-mini", "qwen2.5-vl-32b-instruct"],
+            r.status_code == 200
+            and r.json().get("models") == ["gpt-4o-mini", "qwen2.5-vl-32b-instruct"],
             r.text[:300],
         )
         r = client.post("/ai/models", json={"provider_id": provider_id})
@@ -836,13 +960,12 @@ try:
         check(
             "member unmute",
             r.status_code == 303 and calls and calls[-1][0] == "restrictChatMember",
-            f"{r.status_code} {r.headers.get('location')} {calls[-1:] }",
+            f"{r.status_code} {r.headers.get('location')} {calls[-1:]}",
         )
         con = connect()
         muted = con.execute(
             "SELECT is_muted FROM members WHERE group_id=-1001234567890 AND user_id=111"
         ).fetchone()[0]
-        con.close()
         check("member unmute db", muted == 0, str(muted))
 
         r = client.post(
@@ -853,16 +976,17 @@ try:
         check(
             "member ban",
             r.status_code == 303 and calls and calls[-1][0] == "banChatMember",
-            f"{r.status_code} {r.headers.get('location')} {calls[-1:] }",
+            f"{r.status_code} {r.headers.get('location')} {calls[-1:]}",
         )
         con = connect()
         banned = con.execute(
             "SELECT is_banned FROM members WHERE group_id=-1001234567890 AND user_id=111"
         ).fetchone()[0]
-        con.close()
         check("member ban db", banned == 1, str(banned))
 
         original_call = web_pages._telegram_call
+
+        sync_lock_errors: list[str] = []
 
         async def fake_telegram_call(method: str, params: dict, *, timeout: float = 15):
             if method == "getChatAdministrators":
@@ -879,6 +1003,14 @@ try:
             if method == "getChatMemberCount":
                 return 61
             if method == "getChatMember":
+                probe = sqlite3.connect(DB, timeout=0)
+                try:
+                    probe.execute("BEGIN IMMEDIATE")
+                    probe.execute("ROLLBACK")
+                except sqlite3.OperationalError as exc:
+                    sync_lock_errors.append(str(exc))
+                finally:
+                    probe.close()
                 uid = int(params.get("user_id") or 0)
                 if uid in {222, 333}:
                     return {"status": "left"}
@@ -911,7 +1043,11 @@ try:
         group_count = con.execute(
             "SELECT member_count FROM groups WHERE id=-1001234567890"
         ).fetchone()[0]
-        con.close()
+        check(
+            "member sync releases write lock during Telegram calls",
+            not sync_lock_errors,
+            str(sync_lock_errors[:1]),
+        )
         check(
             "member sync corrects left member",
             sync_rows.get(333) == (0, 0),
@@ -969,7 +1105,6 @@ try:
             "SELECT ai_ad_enabled, ai_daily_quota, sample_daily_quota, rules_text "
             "FROM groups WHERE id=-1001234567890"
         ).fetchone()
-        con.close()
         check("ai scope applied", row[0] == 1 and row[1] == 77 and row[2] == 88, str(row))
         check("ai scope keeps rules", row[3] == "旧群规", str(row))
 
@@ -992,7 +1127,6 @@ try:
             "SELECT delete_command_messages, auto_delete_messages, welcome_enabled "
             "FROM groups WHERE id=-1001234567890"
         ).fetchone()
-        con.close()
         check(
             "group settings can turn cleanup switches off",
             r.status_code == 303 and settings == (0, 0, 0),
@@ -1057,7 +1191,6 @@ try:
             "VALUES (-100999, '联动群', 'supergroup', 1)"
         )
         con.commit()
-        con.close()
         r = client.post(
             "/groups/-1001234567890/crosslinks/add",
             data={"other_group_id": "-100999"},
@@ -1098,7 +1231,6 @@ try:
         pts = con.execute(
             "SELECT points FROM members WHERE group_id=-1001234567890 AND user_id=111"
         ).fetchone()[0]
-        con.close()
         check("points updated", pts == 32, str(pts))
 
         r = client.post(
@@ -1111,7 +1243,6 @@ try:
         row = con.execute(
             "SELECT warn_limit, ai_daily_quota, is_active FROM groups WHERE id=-1001234567890"
         ).fetchone()
-        con.close()
         check("moderation scope isolated", row == (5, 77, 1), str(row))
 
         r = client.get("/groups?q=测试")
@@ -1162,7 +1293,6 @@ try:
             "SELECT telegram_id FROM console_users cu JOIN console_group_access ga ON ga.user_id=cu.id "
             "WHERE ga.group_id=-100777 AND ga.role='owner'"
         ).fetchone()
-        con.close()
         check(
             "added group is owned by current console user",
             added_owner is not None and int(added_owner[0]) == ADMIN_ID,
@@ -1208,7 +1338,8 @@ try:
             str(r.headers),
         )
 finally:
-    shutil.rmtree(TMP, ignore_errors=True)
+    atexit.unregister(CLEANUP.close)
+    CLEANUP.close()
 
 print("\nFAILURES:", failures if failures else "none")
 sys.exit(1 if failures else 0)

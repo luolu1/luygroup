@@ -1,4 +1,5 @@
 """FastAPI application that serves the luygroup control panel."""
+
 from __future__ import annotations
 
 import logging
@@ -17,7 +18,8 @@ from ..config import get_config
 from ..db import dispose_db, init_db, session_scope
 from ..entitlements import EMPTY_ENTITLEMENTS, build_for_user
 from ..models import ConsoleUser
-from . import pages
+from ..services import ai_http
+from . import pages, payment_admin, payment_callbacks
 from .auth import LoginRequired, current_admin_id
 
 log = logging.getLogger(__name__)
@@ -45,9 +47,7 @@ class ConsoleContextMiddleware(BaseHTTPMiddleware):
                         user = await session.get(ConsoleUser, int(user_id))
                         if user is not None and user.is_active:
                             request.state.console_user = user
-                            request.state.entitlements = await build_for_user(
-                                session, user
-                            )
+                            request.state.entitlements = await build_for_user(session, user)
                             # Keep the session marker in sync for legacy checks.
                             request.session["console_role"] = user.role
                 except Exception:  # never let a context lookup break the panel
@@ -59,9 +59,7 @@ UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
 class CSRFOriginMiddleware(BaseHTTPMiddleware):
-    EXEMPT_PATHS: ClassVar[frozenset[str]] = frozenset(
-        {"/healthz", "/payments/epay/notify"}
-    )
+    EXEMPT_PATHS: ClassVar[frozenset[str]] = frozenset({"/healthz", "/payments/epay/notify"})
 
     async def dispatch(self, request: Request, call_next):  # type: ignore[no-untyped-def]
         path = request.url.path
@@ -94,6 +92,7 @@ async def lifespan(_app: FastAPI):
     cfg = get_config()
     log.info("luygroup panel ready on %s", cfg.web.base_url)
     yield
+    await ai_http.close_client()
     await dispose_db()
 
 
@@ -133,7 +132,9 @@ def create_app() -> FastAPI:
     async def healthz() -> dict[str, bool]:
         return {"ok": True}
 
+    app.include_router(payment_callbacks.public_router)
     app.include_router(pages.public_router)
+    app.include_router(payment_admin.router)
     app.include_router(pages.router)
     app.add_middleware(CSRFOriginMiddleware)
     return app

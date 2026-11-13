@@ -4,6 +4,7 @@
 
     .venv/bin/python scripts/smoke_commands.py
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -12,57 +13,18 @@ import json
 import os
 import re
 import sys
-import tempfile
+import time
 from datetime import timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import patch
+
+from sqlalchemy import select
+from aiogram.types import ChatMemberAdministrator, User
 
 ROOT = Path(__file__).resolve().parents[1]
-TMP = Path(tempfile.mkdtemp(prefix="groupguard-commands-"))
-DB = TMP / "commands.db"
-TMP_CONFIG = TMP / "config.json"
-
-config_path = ROOT / "config.json"
-if not config_path.exists():
-    print("未找到 config.json，请先复制 config.example.json 并填写。")
-    sys.exit(2)
-
-cfg = json.loads(config_path.read_text(encoding="utf-8"))
-cfg["database"]["url"] = f"sqlite+aiosqlite:///{DB}"
-cfg.setdefault("ai", {})["learning_dir"] = str(TMP / "learning")
-TMP_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
 sys.path.insert(0, str(ROOT))
-
-from sqlalchemy import select  # noqa: E402
-from aiogram.types import ChatMemberAdministrator, User  # noqa: E402
-
-from app.bot.handlers import (
-    admin as admin_handlers,
-    commands,
-    moderation,
-    report as report_handlers,
-)  # noqa: E402
-from app.bot import helpers  # noqa: E402
-from app.bot.helpers import has_permission  # noqa: E402
-from app.bot.keyboards import console_login_kb, main_menu  # noqa: E402
-from app.bot.main import GROUP_COMMANDS, PRIVATE_COMMANDS  # noqa: E402
-from app.db import init_db, session_scope  # noqa: E402
-from app.entitlements import group_feature_allowed  # noqa: E402
-from app.models import (  # noqa: E402
-    AdminLog,
-    AIEvent,
-    ConsoleGroupAccess,
-    ConsoleUser,
-    Group,
-    Member,
-    MemberDailyStat,
-    Report,
-    Warning,
-    UserNotificationPreference,
-    utcnow,
-)
-from app.services import ai_learning, repo  # noqa: E402
 
 PRIVATE_EXPECTED = [
     "start",
@@ -92,6 +54,8 @@ GROUP_EXPECTED = [
     "report",
     "cj",
     "jp",
+    "bidinfo",
+    "bid",
 ]
 
 failures: list[str] = []
@@ -169,13 +133,15 @@ class FakeBot:
         self.unbanned.append((int(chat_id), int(user_id)))
 
     async def restrict_chat_member(self, chat_id, user_id, permissions=None, **kwargs) -> None:
-        self.calls.append("restrict")
+        until = kwargs.get("until_date")
+        self.calls.append(f"restrict:until={until}")
         self.restricted.append((int(chat_id), int(user_id)))
 
     async def ban_chat_member(self, chat_id, user_id, **kwargs) -> None:
         revoke = bool(kwargs.get("revoke_messages"))
         if revoke and getattr(self, "fail_revoke", False):
             from aiogram.exceptions import TelegramAPIError
+
             raise TelegramAPIError(method="banChatMember", message="cannot delete messages")
         self.calls.append(f"ban:{chat_id}:{user_id}:revoke={int(revoke)}")
 
@@ -222,6 +188,7 @@ class FakeBot:
             destination.write(b"fake-image")
         return SimpleNamespace()
 
+
 def command_names_from_menu(text: str) -> set[str]:
     return set(re.findall(r"^/([a-z]+)\b", text, flags=re.MULTILINE))
 
@@ -263,9 +230,7 @@ async def get_console_user(telegram_id: int) -> ConsoleUser | None:
 
 async def bind_group(user_id: int, group_id: int) -> None:
     async with session_scope() as session:
-        session.add(
-            ConsoleGroupAccess(user_id=int(user_id), group_id=int(group_id), role="owner")
-        )
+        session.add(ConsoleGroupAccess(user_id=int(user_id), group_id=int(group_id), role="owner"))
 
 
 async def create_member(group_id: int, user_id: int, **kwargs) -> None:
@@ -283,18 +248,14 @@ async def create_member(group_id: int, user_id: int, **kwargs) -> None:
 async def get_member(group_id: int, user_id: int) -> Member | None:
     async with session_scope() as session:
         return await session.scalar(
-            select(Member).where(
-                Member.group_id == int(group_id), Member.user_id == int(user_id)
-            )
+            select(Member).where(Member.group_id == int(group_id), Member.user_id == int(user_id))
         )
 
 
 async def set_member(group_id: int, user_id: int, **fields) -> None:
     async with session_scope() as session:
         member = await session.scalar(
-            select(Member).where(
-                Member.group_id == int(group_id), Member.user_id == int(user_id)
-            )
+            select(Member).where(Member.group_id == int(group_id), Member.user_id == int(user_id))
         )
         if member is None:
             raise AssertionError("member missing")
@@ -322,18 +283,45 @@ async def add_log(
 
 
 async def run_tests() -> None:
+    mute_group_id = -100914000
+    mute_user_id = 914000
+    await create_group(mute_group_id, "Permanent mute")
+    await create_member(mute_group_id, mute_user_id)
+    mute_bot = FakeBot()
+    async with session_scope() as session:
+        group = await session.get(Group, mute_group_id)
+        assert group is not None
+        await helpers.mute_user(
+            mute_bot,
+            session,
+            group,
+            helpers.Target(mute_user_id, "Target", "target"),
+            0,
+        )
+    muted = await get_member(mute_group_id, mute_user_id)
+    check(
+        "zero minute mute is permanent",
+        mute_bot.calls == ["restrict:until=None"]
+        and muted is not None
+        and muted.is_muted
+        and muted.muted_until is None,
+        f"calls={mute_bot.calls}, muted_until={muted.muted_until if muted else None}",
+    )
+
     # ------------------------------------------------------------------
     # Exact command catalogs and menu text
     # ------------------------------------------------------------------
     private_names = [item.command for item in PRIVATE_COMMANDS]
     group_names = [item.command for item in GROUP_COMMANDS]
     check("private command catalog exact", private_names == PRIVATE_EXPECTED, str(private_names))
+    check("default command alias remains the private catalog", BOT_COMMANDS is PRIVATE_COMMANDS)
     check("group command catalog exact", group_names == GROUP_EXPECTED, str(group_names))
 
     private_menu = command_names_from_menu(commands.PRIVATE_MENU_TEXT)
     group_menu = command_names_from_menu(commands.GROUP_MENU_TEXT)
     check("private menu exact", private_menu == set(PRIVATE_EXPECTED), str(private_menu))
     check("group menu exact", group_menu == set(GROUP_EXPECTED), str(group_menu))
+    check("group menu exposes auction query and bid", {"bidinfo", "bid"} <= group_menu)
     check(
         "group help menu exposes member report command",
         "/report —— 回复消息举报" in commands.GROUP_MENU_TEXT,
@@ -409,7 +397,9 @@ async def run_tests() -> None:
     ban2_bot.membership_by_user[915199] = "member"
     ban2_bot.fail_revoke = True
     ban2_msg = FakeMessage(
-        user_id=ban2_user_id, chat_id=ban2_group_id, text="/ban",
+        user_id=ban2_user_id,
+        chat_id=ban2_group_id,
+        text="/ban",
     )
     ban2_msg.reply_to_message = SimpleNamespace(
         message_id=7002,
@@ -441,8 +431,7 @@ async def run_tests() -> None:
     )
     check(
         "token summary includes binding and one-time expiry",
-        "绑定上限: 5，当前已绑定 2" in token_text
-        and "15 分钟内有效，只能使用一次" in token_text,
+        "绑定上限: 5，当前已绑定 2" in token_text and "15 分钟内有效，只能使用一次" in token_text,
         token_text,
     )
     sub_msg = FakeMessage(
@@ -616,9 +605,7 @@ async def run_tests() -> None:
     await create_group(report_group_id, "Report learning")
     report_owner_id = await create_console_user(920010, "user")
     await bind_group(report_owner_id, report_group_id)
-    reporter = FakeMessage(
-        user_id=920011, chat_id=report_group_id, text="/report 诈骗广告"
-    )
+    reporter = FakeMessage(user_id=920011, chat_id=report_group_id, text="/report 诈骗广告")
     reporter.reply_to_message = SimpleNamespace(
         from_user=FakeUser(920012, "Target"),
         chat=reporter.chat,
@@ -684,13 +671,18 @@ async def run_tests() -> None:
 
     async def image_check_ad(session, text, group_title, group_id, **kwargs):
         captured.update(kwargs)
-        return True, "图片广告", SimpleNamespace(
-            ok=True,
-            text="广告",
-            provider="vision-smoke",
-            attempts=1,
-            latency_ms=5,
-            error="",
+        return (
+            True,
+            "图片广告",
+            SimpleNamespace(
+                ok=True,
+                text="广告",
+                provider="vision-smoke",
+                attempts=1,
+                system_attempts=1,
+                latency_ms=5,
+                error="",
+            ),
         )
 
     moderation.ai.check_ad = image_check_ad
@@ -708,6 +700,23 @@ async def run_tests() -> None:
         "ai image moderation passes data URL",
         captured.get("image_data_url", "").startswith("data:image/jpeg;base64,")
         and "owner_user_id" in captured,
+        str(captured),
+    )
+
+    captured.clear()
+    moderation.ai.check_ad = image_check_ad
+    silent_image = FakeMessage(
+        user_id=ai_image_user,
+        chat_id=ai_image_group,
+        text="",
+    )
+    silent_image.caption = ""
+    silent_image.photo = [SimpleNamespace(file_id="photo-silent")]
+    await moderation.on_group_message(silent_image, FakeBot())
+    moderation.ai.check_ad = original_check_ad
+    check(
+        "captionless image still reaches vision moderation",
+        captured.get("image_data_url", "").startswith("data:image/jpeg;base64,"),
         str(captured),
     )
     async with session_scope() as session:
@@ -743,6 +752,96 @@ async def run_tests() -> None:
             str((warning, failure_log)),
         )
 
+    mention_group = -100925001
+    mention_user = 925001
+    await create_group(mention_group, "Mention bypass test")
+    async with session_scope() as session:
+        from app.models import Keyword
+        session.add(Keyword(group_id=mention_group, pattern="spam", is_regex=False, action="delete"))
+        group = await session.get(Group, mention_group)
+        group.auto_delete_messages = True
+        await repo.ensure_member(session, mention_group, mention_user, username="mentionuser", first_name="Mention")
+    mention_bot = FakeBot()
+    mention_msg = FakeMessage(
+        user_id=mention_user,
+        chat_id=mention_group,
+        text="@smokebot this is spam content",
+    )
+    mention_msg.chat.title = "Mention bypass test"
+    await moderation.on_group_message(mention_msg, mention_bot)
+    check(
+        "mention with keyword triggers deletion",
+        any(call.startswith("delete_message:") for call in mention_bot.calls),
+        str(mention_bot.calls),
+    )
+
+    from app.services import detect
+
+    started = time.monotonic()
+    runaway = detect.check_keywords("a" * 32 + "!", [("(a|aa)+$", True, "delete")])
+    elapsed = time.monotonic() - started
+    check(
+        "runaway keyword regex times out without matching",
+        not runaway.hit and elapsed < 2.0,
+        f"hit={runaway.hit} elapsed={elapsed:.2f}s",
+    )
+    check(
+        "ordinary keyword regex still matches",
+        detect.check_keywords("buy SPAM now", [("sp[a]m", True, "delete")]).hit,
+    )
+
+    punish_group = -100926001
+    punish_user = 926001
+    await create_group(punish_group, "Punish lock test")
+    async with session_scope() as session:
+        from app.models import Keyword
+        session.add(Keyword(group_id=punish_group, pattern="badword", is_regex=False, action="warn"))
+        group = await session.get(Group, punish_group)
+        group.warn_limit = 1
+        group.warn_action = "mute"
+        group.auto_delete_messages = True
+        await repo.ensure_member(session, punish_group, punish_user, username="punish", first_name="Punish")
+
+    class LockProbeBot(FakeBot):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lock_errors: list[str] = []
+
+        def probe(self, where: str) -> None:
+            import sqlite3
+
+            conn = sqlite3.connect(DB, timeout=0)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("ROLLBACK")
+            except sqlite3.OperationalError as exc:
+                self.lock_errors.append(f"{where}: {exc}")
+            finally:
+                conn.close()
+
+        async def restrict_chat_member(self, chat_id, user_id, permissions=None, **kwargs):
+            self.probe("restrict")
+            return await super().restrict_chat_member(chat_id, user_id, permissions, **kwargs)
+
+        async def send_message(self, *args, **kwargs):
+            self.probe("send_message")
+            return await super().send_message(*args, **kwargs)
+
+    punish_bot = LockProbeBot()
+    punish_msg = FakeMessage(user_id=punish_user, chat_id=punish_group, text="this has badword")
+    punish_msg.chat.title = "Punish lock test"
+    await moderation.on_group_message(punish_msg, punish_bot)
+    check(
+        "warn escalation reaches mute",
+        any(call.startswith("restrict:") for call in punish_bot.calls),
+        str(punish_bot.calls),
+    )
+    check(
+        "moderation releases write lock during Telegram calls",
+        not punish_bot.lock_errors,
+        str(punish_bot.lock_errors[:2]),
+    )
+
     # Atomic daily counter keeps concurrent messages from colliding.
     daily_group = -100920003
     daily_user = 920003
@@ -767,9 +866,7 @@ async def run_tests() -> None:
     # ------------------------------------------------------------------
     # Notification toggles are private and autonomous
     # ------------------------------------------------------------------
-    notify_msg = FakeMessage(
-        user_id=930001, chat_id=930001, chat_type="private", text="/cjtz on"
-    )
+    notify_msg = FakeMessage(user_id=930001, chat_id=930001, chat_type="private", text="/cjtz on")
     await commands.cmd_cjtz(notify_msg)
     async with session_scope() as session:
         pref = await session.scalar(
@@ -782,13 +879,9 @@ async def run_tests() -> None:
             pref is not None and pref.lottery_enabled and not pref.auction_enabled,
             str(pref),
         )
-    off_msg = FakeMessage(
-        user_id=930001, chat_id=930001, chat_type="private", text="/cjtz off"
-    )
+    off_msg = FakeMessage(user_id=930001, chat_id=930001, chat_type="private", text="/cjtz off")
     await commands.cmd_cjtz(off_msg)
-    auction_msg = FakeMessage(
-        user_id=930001, chat_id=930001, chat_type="private", text="/jptz on"
-    )
+    auction_msg = FakeMessage(user_id=930001, chat_id=930001, chat_type="private", text="/jptz on")
     await commands.cmd_jptz(auction_msg)
     async with session_scope() as session:
         pref = await session.scalar(
@@ -798,9 +891,7 @@ async def run_tests() -> None:
         )
         check(
             "notification toggles persist independently",
-            pref is not None
-            and not pref.lottery_enabled
-            and pref.auction_enabled,
+            pref is not None and not pref.lottery_enabled and pref.auction_enabled,
             str(pref),
         )
     group_toggle = FakeMessage(
@@ -809,8 +900,7 @@ async def run_tests() -> None:
     await commands.cmd_jptz(group_toggle)
     check(
         "notification toggle refuses group chat",
-        group_toggle.replies
-        and "请在私聊" in group_toggle.replies[-1],
+        group_toggle.replies and "请在私聊" in group_toggle.replies[-1],
         str(group_toggle.replies),
     )
 
@@ -883,9 +973,7 @@ async def run_tests() -> None:
     auto_group = -100950001
     auto_user = 950001
     await create_group(auto_group, "Auto ban")
-    await create_member(
-        auto_group, auto_user, is_banned=True, is_member=False, mute_on_rejoin=True
-    )
+    await create_member(auto_group, auto_user, is_banned=True, is_member=False, mute_on_rejoin=True)
     await add_log(auto_group, auto_user, "ban", None, "自动反广告")
     bot = FakeBot()
     unban_msg = FakeMessage(
@@ -967,6 +1055,43 @@ async def run_tests() -> None:
     )
 
     # ------------------------------------------------------------------
+    # Self-unmute blocks verification-restricted and web-muted members
+    # ------------------------------------------------------------------
+    verify_group = -100965001
+    verify_user = 965001
+    await create_group(verify_group, "Verification restriction")
+    await create_member(verify_group, verify_user, is_muted=True, verification_restricted=True)
+    await add_log(verify_group, verify_user, "verify_failed_restrict", None, "连续答错 3 次")
+    verify_msg = FakeMessage(
+        user_id=verify_user, chat_id=verify_user, chat_type="private", text="/unmuteme"
+    )
+    await commands.cmd_unmuteme(verify_msg, FakeBot())
+    verify_member = await get_member(verify_group, verify_user)
+    check("self-unmute blocks verification restriction", bool(verify_member and verify_member.is_muted))
+    check(
+        "self-unmute explains verification block",
+        any("验证失败" in item or "人工审核" in item for item in verify_msg.replies),
+        str(verify_msg.replies),
+    )
+
+    web_group = -100966001
+    web_user = 966001
+    await create_group(web_group, "Web mute")
+    await create_member(web_group, web_user, is_muted=True)
+    await add_log(web_group, web_user, "web_member_mute", None, "网页管理面板禁言")
+    web_msg = FakeMessage(
+        user_id=web_user, chat_id=web_user, chat_type="private", text="/unmuteme"
+    )
+    await commands.cmd_unmuteme(web_msg, FakeBot())
+    web_member = await get_member(web_group, web_user)
+    check("self-unmute blocks web mute", bool(web_member and web_member.is_muted))
+    check(
+        "self-unmute explains manual restriction",
+        any("手动" in item or "管理员" in item or "人工" in item for item in web_msg.replies),
+        str(web_msg.replies),
+    )
+
+    # ------------------------------------------------------------------
     # /iunban: superadmin acts across all groups, and empty groups are skipped
     # ------------------------------------------------------------------
     current_group = -100970001
@@ -997,25 +1122,71 @@ async def run_tests() -> None:
     member = await get_member(other_group, iunban_user)
     check(
         "/iunban clears restriction flags",
-        bool(
-            member
-            and not member.is_banned
-            and not member.is_muted
-            and not member.mute_on_rejoin
-        ),
+        bool(member and not member.is_banned and not member.is_muted and not member.mute_on_rejoin),
     )
 
 
 async def main() -> None:
-    await init_db()
     try:
+        await init_db()
         await run_tests()
     finally:
-        if failures:
-            print("FAILURES:", failures)
-            raise SystemExit(1)
-        print("FAILURES: none")
+        tasks = tuple(helpers._background_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await dispose_db()
+    if failures:
+        print("FAILURES:", failures)
+        raise SystemExit(1)
+    print("FAILURES: none")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    with TemporaryDirectory(prefix="groupguard-commands-", dir="/tmp/opencode") as directory:
+        TMP = Path(directory)
+        DB = TMP / "commands.db"
+        TMP_CONFIG = TMP / "config.json"
+        config_path = ROOT / "config.example.json"
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        cfg["bot"] = {"token": "123456789:AUCTION_SMOKE_SYNTHETIC_TOKEN", "admin_ids": [7122485076], "username": "smokebot", "proxy": ""}
+        cfg["web"]["secret_key"] = "auction-smoke-synthetic-secret"
+        cfg["web"]["base_url"] = "https://example.test"
+        cfg["database"]["url"] = f"sqlite+aiosqlite:///{DB}"
+        cfg.setdefault("ai", {})["learning_dir"] = str(TMP / "learning")
+        cfg["ai"]["providers"] = []
+        TMP_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        with patch.dict(os.environ, {"GROUPGUARD_CONFIG": str(TMP_CONFIG)}):
+            from app.config import get_config
+
+            try:
+                from app.bot.handlers import (
+                    admin as admin_handlers,
+                    commands,
+                    moderation,
+                    report as report_handlers,
+                )
+                from app.bot import helpers
+                from app.bot.helpers import has_permission
+                from app.bot.keyboards import console_login_kb, main_menu
+                from app.bot.main import BOT_COMMANDS, GROUP_COMMANDS, PRIVATE_COMMANDS
+                from app.db import dispose_db, init_db, session_scope
+                from app.entitlements import group_feature_allowed
+                from app.models import (
+                    AdminLog,
+                    AIEvent,
+                    ConsoleGroupAccess,
+                    ConsoleUser,
+                    Group,
+                    Member,
+                    MemberDailyStat,
+                    Report,
+                    Warning,
+                    UserNotificationPreference,
+                    utcnow,
+                )
+                from app.services import ai_learning, repo
+
+                asyncio.run(main())
+            finally:
+                get_config.cache_clear()

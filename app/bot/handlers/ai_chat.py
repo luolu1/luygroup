@@ -1,4 +1,5 @@
 """AI assistant commands."""
+
 from __future__ import annotations
 
 from aiogram import Bot, Router
@@ -7,7 +8,7 @@ from aiogram.types import Message
 
 from ...config import is_global_admin
 from ...db import session_scope
-from ...entitlements import group_feature_allowed, group_owner_user_id
+from ...entitlements import GroupAccessCache, group_feature_allowed, group_owner_user_id
 from ...models import AIEvent
 from ...services import ai, quota, repo
 from .. import helpers
@@ -44,17 +45,27 @@ async def cmd_ask(message: Message, bot: Bot) -> None:
             if not (group.ai_assistant_enabled or group.ai_chat_enabled):
                 await message.reply("🤖 本群未开启 AI 助手。")
                 return
-            if not await group_feature_allowed(session, group.id, "ai"):
+            group_access = GroupAccessCache(session, group.id)
+            access = await group_access.resolve()
+            if not await group_feature_allowed(session, group.id, "ai", access=access):
                 await message.reply("🤖 AI 助手属于订阅版功能，请群组所有者先开通订阅。")
                 return
-            if not await quota.allow_request(session, group):
+            if not await quota.reserve_quota(
+                session,
+                group,
+                access=access,
+                provider_id=group.ai_provider_id,
+                image=False,
+            ):
                 await message.reply("🤖 本群今日 AI 额度已用完。")
                 return
+            chat_reserved = True
             group_title = group.title
             rules = group.rules_text
             history = helpers.history(group.id)
-            owner_user_id = await group_owner_user_id(session, group.id)
+            owner_user_id = await group_owner_user_id(session, group.id, access=access)
 
+        provider_id = group.ai_provider_id if group else None
         if group and group.ai_assistant_enabled:
             result = await ai.assistant_reply(
                 session,
@@ -64,6 +75,7 @@ async def cmd_ask(message: Message, bot: Bot) -> None:
                 history=history,
                 group_id=group.id if group else message.chat.id,
                 owner_user_id=owner_user_id,
+                provider_id=provider_id,
             )
             kind = "assistant"
         else:
@@ -74,11 +86,20 @@ async def cmd_ask(message: Message, bot: Bot) -> None:
                 history=history,
                 group_id=group.id if group else message.chat.id,
                 owner_user_id=owner_user_id,
+                provider_id=provider_id,
             )
             kind = "chat"
 
-        if group and result.attempts:
-            await quota.note(session, group, requests=result.attempts)
+        if group and result.system_attempts:
+            await quota.note(
+                session,
+                group,
+                requests=result.system_attempts,
+                image=False,
+            )
+
+        if group and not result.ok and chat_reserved:
+            await quota.release_quota(session, group, image=False)
 
         if result.ok:
             helpers.remember(message.chat.id, "user", question)

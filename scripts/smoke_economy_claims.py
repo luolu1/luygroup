@@ -8,35 +8,42 @@ Telegram。重点验证「先原子占位，后扣费」语义与失败分支必
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import os
-import shutil
 import sys
 import tempfile
+from contextlib import ExitStack
 from datetime import timedelta
 from pathlib import Path
+from typing import Final
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-TMP = Path(tempfile.mkdtemp(prefix="groupguard-economy-claims-"))
+RUNTIME: Final = ExitStack()
+atexit.register(RUNTIME.close)
+TMP = Path(RUNTIME.enter_context(tempfile.TemporaryDirectory(
+    prefix="groupguard-economy-claims-", dir="/tmp/opencode",
+)))
 DB = TMP / "economy-claims.db"
 TMP_CONFIG = TMP / "config.json"
 
-config_path = ROOT / "config.json"
-if not config_path.exists():
-    print("未找到 config.json，请先复制 config.example.json 并填写。")
-    sys.exit(2)
-
-cfg = json.loads(config_path.read_text(encoding="utf-8"))
-cfg["database"]["url"] = f"sqlite+aiosqlite:///{DB}"
-cfg.setdefault("ai", {})["learning_dir"] = str(TMP / "learning")
+cfg = {
+    "bot": {"token": "123456:offline-economy", "admin_ids": [], "proxy": ""},
+    "web": {"secret_key": "economy-smoke-secret", "base_url": "https://example.test"},
+    "database": {"url": f"sqlite+aiosqlite:///{DB}"},
+    "ai": {"learning_dir": str(TMP / "learning"), "providers": []},
+    "payments": {"enabled": False},
+}
 TMP_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
+RUNTIME.enter_context(patch.dict(os.environ, {"GROUPGUARD_CONFIG": str(TMP_CONFIG)}))
 sys.path.insert(0, str(ROOT))
 
 from sqlalchemy import func, select  # noqa: E402
 from sqlalchemy.exc import OperationalError  # noqa: E402
 
 from app.bot.handlers import games  # noqa: E402
+from app.config import get_config
 from app.db import dispose_db, init_db, session_scope  # noqa: E402
 from app.models import (  # noqa: E402
     DailyCheckin,
@@ -49,6 +56,8 @@ from app.models import (  # noqa: E402
     ShopOrder,
     utcnow,
 )
+
+RUNTIME.callback(get_config.cache_clear)
 
 failures: list[str] = []
 
@@ -486,8 +495,8 @@ async def run_tests() -> None:
 
 
 async def main() -> None:
-    await init_db()
     try:
+        await init_db()
         await run_tests()
     finally:
         await dispose_db()
@@ -498,7 +507,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
+    with RUNTIME:
         asyncio.run(main())
-    finally:
-        shutil.rmtree(TMP, ignore_errors=True)

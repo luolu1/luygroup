@@ -1,41 +1,55 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import os
 import sys
 import tempfile
-from datetime import timedelta
+from contextlib import ExitStack
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import parse_qsl
+
+import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
-TMP = Path(tempfile.mkdtemp(prefix="luygroup-payments-"))
+CLEANUP = ExitStack()
+_ = atexit.register(CLEANUP.close)
+TMP = Path(CLEANUP.enter_context(tempfile.TemporaryDirectory(
+    prefix="luygroup-payments-", dir="/tmp/opencode"
+)))
 DB = TMP / "payments.db"
 TMP_CONFIG = TMP / "config.json"
-config = json.loads((ROOT / "config.example.json").read_text(encoding="utf-8"))
-config["bot"]["token"] = "123456:smoke-token"
-config["web"]["secret_key"] = "smoke-secret-key"
-config["web"]["base_url"] = "http://127.0.0.1:8090"
-config["database"]["url"] = f"sqlite+aiosqlite:///{DB}"
-config["payments"]["enabled"] = True
-config["payments"]["epay"].update(
-    {"base_url": "https://pay.example.test", "pid": "10001", "key": "smoke-key"}
-)
+config = {
+    "bot": {"token": "123456789:PAYMENTS_SMOKE_SYNTHETIC_TOKEN", "admin_ids": [891000006],
+            "username": "payments_smoke_bot", "proxy": ""},
+    "web": {"secret_key": "smoke-secret-key", "base_url": "http://testserver"},
+    "database": {"url": f"sqlite+aiosqlite:///{DB}"},
+    "ai": {"learning_dir": str(TMP / "learning"), "providers": []},
+    "payments": {"enabled": True, "epay": {
+        "base_url": "https://pay.example.test", "pid": "10001", "key": "smoke-key", "type": "alipay",
+    }},
+}
 TMP_CONFIG.write_text(json.dumps(config), encoding="utf-8")
-os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
+_ = CLEANUP.enter_context(patch.dict(os.environ, {"GROUPGUARD_CONFIG": str(TMP_CONFIG)}, clear=True))
 sys.path.insert(0, str(ROOT))
 
 from sqlalchemy import select, update  # noqa: E402
+from sqlalchemy.sql.dml import Update  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.config import get_config  # noqa: E402
 from app.db import dispose_db, get_sessionmaker, init_db  # noqa: E402
 from app.models import (
+    AccountLedgerEntry,
     ConsoleUser,
     PaymentChannel,
     PaymentOrder,
     Subscription,
+    SubscriptionPlan,
     utcnow,
 )  # noqa: E402
 from app.services.payments.base import PaymentCallback, PaymentCreation  # noqa: E402
@@ -50,7 +64,7 @@ from app.services.payments.service import (  # noqa: E402
     settle_payment,
     start_checkout,
 )
-from app.services.subscriptions import purchase_month  # noqa: E402
+from app.services.subscriptions import add_calendar_month, purchase_month  # noqa: E402
 from app.web.main import create_app  # noqa: E402
 from app.web import pages as web_pages  # noqa: E402
 
@@ -61,9 +75,25 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         raise AssertionError(name)
 
 
-async def main() -> None:
+async def run_tests() -> None:
+    checkout_requests: list[httpx.Request] = []
+
+    async def fake_epay_request(
+        _transport: httpx.AsyncHTTPTransport, request: httpx.Request
+    ) -> httpx.Response:
+        _ = await request.aread()
+        checkout_requests.append(request)
+        return httpx.Response(200, json={"code": 0, "msg": "synthetic checkout rejected"})
+
+    _ = CLEANUP.enter_context(patch.object(httpx.AsyncHTTPTransport, "handle_async_request", fake_epay_request))
     get_config.cache_clear()
     await init_db()
+    for purpose in ("recharge", "subscription"):
+        for expired in (False, True):
+            await late_notification(purpose, expired)
+    for existing in (False, True):
+        await concurrent_subscriptions(existing)
+    await rejected_order_states()
     async with get_sessionmaker()() as session:
         user = ConsoleUser(
             telegram_id=900001,
@@ -143,6 +173,13 @@ async def main() -> None:
             order_no = order.order_no
             creation, error = await start_checkout(provider, order, "127.0.0.1")
             assert creation is None and error
+            request, = checkout_requests
+            assert request.method == "POST" and str(request.url) == "https://pay.example.test/mapi.php"
+            payload = dict(parse_qsl(request.content.decode("utf-8"), keep_blank_values=True))
+            assert payload["sign_type"] == "MD5" and payload["sign"] == sign_fields(payload, "smoke-key")
+            assert (payload["pid"], payload["money"], payload["out_trade_no"]) == ("10001", "12.34", order_no)
+            assert error == "synthetic checkout rejected"
+            print("PASS Epay V2 signed payload and failure response parsing")
         order_row = await session.get(PaymentOrder, order.id)
         check("checkout failure remains queryable without credit", order_row.status == "pending")
         balance = await session.scalar(
@@ -486,8 +523,10 @@ async def main() -> None:
                 "trade_status": "TRADE_SUCCESS",
             }
             params["sign"] = sign_fields(params, "smoke-key")
+            await session.flush()
+            await expire_pending_orders(session, user_id)
             status, _ = await handle_notification(session, provider, params)
-            check("expired callback does not settle order", status == "order_expired")
+            check("expired callback with wrong amount does not settle order", status == "amount_mismatch")
         expired_order = await session.scalar(
             select(PaymentOrder).where(PaymentOrder.order_no == expired_no)
         )
@@ -525,8 +564,132 @@ async def main() -> None:
             async with session.begin():
                 disabled_channel = await session.get(PaymentChannel, channel_id)
                 check("channel disabled state persists", not disabled_channel.enabled)
-    await dispose_db()
+
+
+async def late_notification(purpose: str, expired: bool) -> None:
+    async with get_sessionmaker()() as session, session.begin():
+        user = ConsoleUser(token_hash=f"late-{purpose}-{expired}", balance_cents=0)
+        session.add(user)
+        await session.flush()
+        order = PaymentOrder(
+            order_no=f"late-{purpose}-{expired}", user_id=user.id,
+            purpose=purpose, amount_cents=800,
+            expires_at=utcnow() - timedelta(minutes=1),
+        )
+        session.add(order)
+        await session.flush()
+        if expired:
+            await expire_pending_orders(session, user.id)
+        user_id, order_id = user.id, order.id
+    params = {
+        "pid": "10001", "trade_no": f"trade-{order.order_no}",
+        "out_trade_no": order.order_no, "money": "8.00",
+        "trade_status": "TRADE_SUCCESS", "type": "alipay",
+    }
+    params["sign"] = sign_fields(params, "smoke-key")
+    provider = EpayProvider(get_config().payments.epay)
+    statuses = []
+    for _ in range(2):
+        async with get_sessionmaker()() as session, session.begin():
+            status, _ = await handle_notification(session, provider, params)
+            statuses.append(status)
+    check(f"late {purpose} expired={expired} settles once", statuses == ["paid", "already_paid"], str(statuses))
+    async with get_sessionmaker()() as session:
+        balance = await session.scalar(select(ConsoleUser.balance_cents).where(ConsoleUser.id == user_id))
+        entries = (await session.scalars(select(AccountLedgerEntry).where(AccountLedgerEntry.order_id == order_id))).all()
+        subscriptions = (await session.scalars(select(Subscription).where(Subscription.user_id == user_id))).all()
+        if purpose == "recharge":
+            check("late recharge credits one ledger entry", balance == 800 and len(entries) == 1 and entries[0].amount_cents == 800)
+        else:
+            check("late subscription activates once without balance credit", balance == 0 and len(subscriptions) == 1 and subscriptions[0].status == "active")
+
+
+async def concurrent_subscriptions(existing: bool) -> None:
+    now = datetime(2030, 1, 15)
+    initial_expiry = datetime(2030, 2, 15)
+    async with get_sessionmaker()() as session, session.begin():
+        user = ConsoleUser(token_hash=f"race-{existing}", balance_cents=0)
+        session.add(user)
+        await session.flush()
+        user_id = user.id
+        plan_id = await session.scalar(select(SubscriptionPlan.id).where(SubscriptionPlan.name == "pro"))
+        if existing:
+            session.add(Subscription(user_id=user_id, plan_id=plan_id, status="active", expires_at=initial_expiry))
+        callbacks = []
+        for index in range(2):
+            order_no = f"race-{existing}-{index}"
+            session.add(PaymentOrder(order_no=order_no, user_id=user_id, purpose="subscription", amount_cents=800))
+            callbacks.append(PaymentCallback(order_no=order_no, trade_no=f"trade-{order_no}", merchant_id="10001", amount=Decimal("8.00"), status="paid"))
+
+    before_write = asyncio.Event()
+    competitor_committed = asyncio.Event()
+    async with get_sessionmaker()() as first:
+        original_scalar = first.scalar
+
+        async def pause_first_write(statement, *args, **kwargs):
+            if isinstance(statement, Update) and not before_write.is_set():
+                before_write.set()
+                await competitor_committed.wait()
+            return await original_scalar(statement, *args, **kwargs)
+
+        async def settle_first() -> str:
+            async with first.begin():
+                status, _ = await settle_payment(first, callbacks[0])
+                return status
+
+        async def settle_competitor() -> str:
+            await before_write.wait()
+            try:
+                async with get_sessionmaker()() as second, second.begin():
+                    status, _ = await settle_payment(second, callbacks[1])
+                return status
+            finally:
+                competitor_committed.set()
+
+        with patch.object(first, "scalar", pause_first_write), patch("app.services.payments.service.utcnow", return_value=now):
+            async with asyncio.timeout(10):
+                results = await asyncio.gather(settle_first(), settle_competitor())
+    async with get_sessionmaker()() as session:
+        rows = (await session.scalars(select(Subscription).where(Subscription.user_id == user_id, Subscription.status == "active"))).all()
+        expected = add_calendar_month(add_calendar_month(initial_expiry if existing else now))
+        check(f"concurrent subscription existing={existing} preserves both months", results == ["paid", "paid"] and len(rows) == 1 and rows[0].expires_at == expected, str([(row.id, row.expires_at) for row in rows]))
+
+
+async def rejected_order_states() -> None:
+    for state in ("cancelled", "refunded", "expired"):
+        async with get_sessionmaker()() as session, session.begin():
+            user = ConsoleUser(token_hash=f"rejected-{state}", balance_cents=0)
+            session.add(user)
+            await session.flush()
+            order = PaymentOrder(
+                order_no=f"rejected-{state}", user_id=user.id, amount_cents=800,
+                status=state, expires_at=utcnow() + timedelta(minutes=5),
+            )
+            session.add(order)
+            await session.flush()
+            user_id, order_id = user.id, order.id
+        callback = PaymentCallback(
+            order_no=order.order_no, trade_no=f"trade-{state}",
+            merchant_id="10001", amount=Decimal("8.00"), status="paid",
+        )
+        async with get_sessionmaker()() as session, session.begin():
+            status, _ = await settle_payment(session, callback)
+        async with get_sessionmaker()() as session:
+            balance = await session.scalar(select(ConsoleUser.balance_cents).where(ConsoleUser.id == user_id))
+            ledger = await session.scalar(select(AccountLedgerEntry.id).where(AccountLedgerEntry.order_id == order_id))
+        check(f"non-payable {state} order is not credited", status == "order_not_payable" and balance == 0 and ledger is None)
+
+
+async def main() -> None:
+    try:
+        await run_tests()
+    finally:
+        await dispose_db()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        atexit.unregister(CLEANUP.close)
+        CLEANUP.close()

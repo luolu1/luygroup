@@ -1,4 +1,5 @@
 """Bot-side permissions, target parsing and moderation primitives."""
+
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +12,15 @@ from collections.abc import Iterable
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramForbiddenError
-from aiogram.types import Chat, ChatMemberAdministrator, ChatMemberOwner, ChatPermissions, Message, User
+from aiogram.types import (
+    Chat,
+    ChatMemberAdministrator,
+    ChatMemberOwner,
+    ChatPermissions,
+    InlineKeyboardMarkup,
+    Message,
+    User,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -28,6 +37,28 @@ _admin_cache: dict[tuple[int, int], tuple[bool, float]] = {}
 _ADMIN_TTL = 60.0
 _background_tasks: set[asyncio.Task[None]] = set()
 NOTICE_TTL_SECONDS = 12.0
+
+
+def _task_finished(task: asyncio.Task[None]) -> None:
+    _background_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        log.error("Background task failed", exc_info=task.exception())
+
+
+def track_task(task: asyncio.Task[None]) -> None:
+    _background_tasks.add(task)
+    task.add_done_callback(_task_finished)
+
+
+async def drain_background_tasks(timeout: float = 5.0) -> None:
+    pending = tuple(_background_tasks)
+    if not pending:
+        return
+    _done, still_running = await asyncio.wait(pending, timeout=timeout)
+    for task in still_running:
+        task.cancel()
+    if still_running:
+        await asyncio.gather(*still_running, return_exceptions=True)
 
 
 async def is_telegram_admin(bot: Bot, chat_id: int, user_id: int) -> bool:
@@ -105,18 +136,13 @@ async def admin_context(
         chat_type=chat.type,
     )
     actor_id = message.from_user.id if message.from_user is not None else chat.id
-    allowed = anonymous_group or await has_permission(
-        bot, session, chat.id, actor_id, permission
-    )
+    allowed = anonymous_group or await has_permission(bot, session, chat.id, actor_id, permission)
     if not allowed:
         await message.reply("⛔ 你没有权限执行此操作。")
         return None
     if group.delete_command_messages and (message.text or "").startswith("/"):
-        task = asyncio.create_task(
-            delete_message_safe(bot, chat.id, message.message_id, delay=2)
-        )
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+        task = asyncio.create_task(delete_message_safe(bot, chat.id, message.message_id, delay=2))
+        track_task(task)
     return group, actor_id
 
 
@@ -142,15 +168,14 @@ async def telegram_admin_context(
         await message.reply("⛔ 只有群组管理员可以执行此操作。")
         return None
     if group.delete_command_messages and (message.text or "").startswith("/"):
-        task = asyncio.create_task(
-            delete_message_safe(bot, chat.id, message.message_id, delay=2)
-        )
-        _background_tasks.add(task)
-        task.add_done_callback(_background_tasks.discard)
+        task = asyncio.create_task(delete_message_safe(bot, chat.id, message.message_id, delay=2))
+        track_task(task)
     return group, actor_id
 
 
-async def can_moderate_target(bot: Bot, session: AsyncSession, group_id: int, target_id: int) -> tuple[bool, str]:
+async def can_moderate_target(
+    bot: Bot, session: AsyncSession, group_id: int, target_id: int
+) -> tuple[bool, str]:
     if is_global_admin(target_id) or await repo.get_admin(session, group_id, target_id):
         return False, "对方是机器人管理员，不能对其操作。"
     if await is_telegram_admin(bot, group_id, target_id):
@@ -259,9 +284,7 @@ async def restrict_permanently(bot: Bot, chat_id: int, user_id: int) -> None:
 async def delete_message_safe(
     bot: Bot, chat_id: int, message_id: int | None, *, delay: float = 0
 ) -> bool:
-    deleted, _error = await delete_message_diagnostic(
-        bot, chat_id, message_id, delay=delay
-    )
+    deleted, _error = await delete_message_diagnostic(bot, chat_id, message_id, delay=delay)
     return deleted
 
 
@@ -285,25 +308,43 @@ async def delete_message_diagnostic(
         return False, str(exc)[:500] or exc.__class__.__name__
 
 
+async def pin_message_safe(
+    bot: Bot, chat_id: int, message_id: int | None, *, disable_notification: bool = True
+) -> tuple[bool, str | None]:
+    if not message_id:
+        return False, "缺少消息 ID"
+    try:
+        await bot.pin_chat_message(
+            chat_id, message_id, disable_notification=disable_notification
+        )
+        return True, None
+    except (TelegramBadRequest, TelegramForbiddenError, TelegramAPIError) as exc:
+        log.warning(
+            "Failed to pin Telegram message chat=%s message=%s: %s",
+            chat_id,
+            message_id,
+            exc,
+        )
+        return False, str(exc)[:500] or exc.__class__.__name__
+
+
 async def send_temp_notice(
     bot: Bot,
     chat_id: int,
     text: str,
     *,
     delay: float | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
 ) -> int | None:
     try:
-        sent = await bot.send_message(chat_id, text)
+        sent = await bot.send_message(chat_id, text, reply_markup=reply_markup)
     except TelegramAPIError:
         return None
     ttl = NOTICE_TTL_SECONDS if delay is None else delay
     if ttl <= 0:
         return sent.message_id
-    task = asyncio.create_task(
-        delete_message_safe(bot, chat_id, sent.message_id, delay=ttl)
-    )
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    task = asyncio.create_task(delete_message_safe(bot, chat_id, sent.message_id, delay=ttl))
+    track_task(task)
     return sent.message_id
 
 
@@ -317,18 +358,25 @@ async def mute_user(
     reason: str = "",
     admin_id: int | None = None,
 ) -> str:
-    until = int(time.time()) + max(1, minutes) * 60
-    await bot.restrict_chat_member(group.id, target.user_id, permissions=_MUTE_DENY, until_date=until)
+    if minutes <= 0:
+        await bot.restrict_chat_member(group.id, target.user_id, permissions=_MUTE_DENY)
+        muted_until = None
+        duration = "永久"
+    else:
+        until = int(time.time()) + minutes * 60
+        await bot.restrict_chat_member(
+            group.id, target.user_id, permissions=_MUTE_DENY, until_date=until
+        )
+        muted_until = utcnow() + timedelta(minutes=minutes)
+        duration = f"{minutes} 分钟"
     member = await repo.ensure_member(
         session, group.id, target.user_id, username=target.username, first_name=target.first_name
     )
     member.is_muted = True
-    member.muted_until = utcnow() + timedelta(minutes=max(1, minutes))
-    await repo.add_log(
-        session, group.id, admin_id, "mute", target.user_id, f"{minutes} 分钟；{reason}"
-    )
+    member.muted_until = muted_until
+    await repo.add_log(session, group.id, admin_id, "mute", target.user_id, f"{duration}；{reason}")
     await repo.bump_stat(session, group.id, "warns")
-    return f"已禁言 {target.mention} {minutes} 分钟。{('原因：' + reason) if reason else ''}"
+    return f"已禁言 {target.mention} {duration}。{('原因：' + reason) if reason else ''}"
 
 
 async def unmute_user(
@@ -380,9 +428,7 @@ async def apply_rejoin_mute(
     member.is_muted = True
     member.muted_until = None
     member.mute_on_rejoin = True
-    await repo.add_log(
-        session, group.id, None, "rejoin_mute", target.user_id, reason
-    )
+    await repo.add_log(session, group.id, None, "rejoin_mute", target.user_id, reason)
     try:
         await restrict_permanently(bot, group.id, target.user_id)
         return True
@@ -480,9 +526,12 @@ async def warn_user(
     base_code = now.strftime("%Y%m%d%H%M")
     code = base_code
     suffix = 1
-    while await session.scalar(
-        select(Warning.id).where(Warning.group_id == group.id, Warning.code == code)
-    ) is not None:
+    while (
+        await session.scalar(
+            select(Warning.id).where(Warning.group_id == group.id, Warning.code == code)
+        )
+        is not None
+    ):
         suffix += 1
         code = f"{base_code}-{suffix}"
 
@@ -507,13 +556,20 @@ async def warn_user(
 
     extra = ""
     if group.warn_limit > 0 and count >= group.warn_limit:
+        await session.commit()
         action = group.warn_action or "mute"
         if action in {"kick", "ban"}:
             action = "ban_kick"
         try:
             if action == "mute":
                 extra = "\n" + await mute_user(
-                    bot, session, group, target, group.mute_minutes, reason="警告达到上限", admin_id=admin_id
+                    bot,
+                    session,
+                    group,
+                    target,
+                    group.mute_minutes,
+                    reason="警告达到上限",
+                    admin_id=admin_id,
                 )
                 warning.action = action
             elif action in {"ban", "ban_kick"}:
@@ -524,7 +580,10 @@ async def warn_user(
         except TelegramAPIError as exc:
             extra = f"\n自动处罚失败：{exc}"
 
-    return count, f"已警告 {target.mention}（{count}/{group.warn_limit or '∞'}）。原因：{reason}{extra}"
+    return (
+        count,
+        f"已警告 {target.mention}（{count}/{group.warn_limit or '∞'}）。原因：{reason}{extra}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -544,9 +603,7 @@ async def _same_tenant_scope(session: AsyncSession, group: Group) -> list:
         return [~Group.id.in_(select(ConsoleGroupAccess.group_id))]
     return [
         Group.id.in_(
-            select(ConsoleGroupAccess.group_id).where(
-                ConsoleGroupAccess.user_id == owner_id
-            )
+            select(ConsoleGroupAccess.group_id).where(ConsoleGroupAccess.user_id == owner_id)
         )
     ]
 
@@ -564,9 +621,7 @@ async def tenant_groups(
         result = await session.scalars(select(Group).where(Group.is_active.is_(True)))
         return list(result.all())
     scope = await _same_tenant_scope(session, group)
-    result = await session.scalars(
-        select(Group).where(Group.is_active.is_(True), *scope)
-    )
+    result = await session.scalars(select(Group).where(Group.is_active.is_(True), *scope))
     groups = list(result.all())
     if not any(item.id == group.id for item in groups):
         groups.insert(0, group)
@@ -638,6 +693,7 @@ async def apply_crossban(
                 f"来自群 {source.id}：{reason}",
             )
             await repo.bump_stat(session, group.id, "bans")
+            await session.commit()
             results.append(str(group.title or group.id))
         except TelegramAPIError:
             continue

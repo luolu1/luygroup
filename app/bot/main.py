@@ -18,7 +18,9 @@ from aiogram.types import (
 
 from ..config import get_config
 from ..db import dispose_db, init_db
+from ..services import ai_http
 from ..services.scheduler import run_scheduler
+from . import helpers
 from .handlers import admin, ai_chat, commands, games, join, moderation, report
 
 log = logging.getLogger(__name__)
@@ -54,6 +56,8 @@ GROUP_COMMANDS = [
     BotCommand(command="report", description="回复消息举报"),
     BotCommand(command="cj", description="私聊配置抽奖"),
     BotCommand(command="jp", description="发起竞拍"),
+    BotCommand(command="bidinfo", description="查询本群竞拍与最近出价"),
+    BotCommand(command="bid", description="竞拍出价（可指定编号或回复卡片）"),
 ]
 
 # Older code and tests import BOT_COMMANDS as the "default" list.  Keep the
@@ -197,8 +201,10 @@ async def run_bot(*, handle_signals: bool = True) -> None:
             scheduler.cancel()
             with suppress(asyncio.CancelledError):
                 await scheduler
+        await helpers.drain_background_tasks()
         if bot is not None:
             await bot.session.close()
+        await ai_http.close_client()
         await dispose_db()
 
 

@@ -5,7 +5,7 @@
 {% macro member_actions(uid, m, tab_name) %}
 <form class="actions" method="post" action="/groups/{{ gid }}/members/{{ uid }}/action">
   <input type="hidden" name="tab" value="{{ tab_name }}">
-  <input type="hidden" name="minutes" value="{{ group.mute_minutes or 60 }}">
+  <input type="hidden" name="minutes" value="{{ group.mute_minutes if group.mute_minutes is not none else 60 }}">
   {% if m and m.is_banned %}
   <button class="ghost sm" type="submit" name="action" value="unban">解封</button>
   {% else %}
@@ -260,7 +260,8 @@
       </div>
       <div class="field">
         <label for="mute_minutes">默认禁言时长（分钟）</label>
-        <input id="mute_minutes" name="mute_minutes" type="number" min="1" value="{{ group.mute_minutes or 60 }}">
+        <input id="mute_minutes" name="mute_minutes" type="number" min="0" value="{{ group.mute_minutes or 0 }}">
+        <div class="hint">0 表示永久禁言。</div>
       </div>
       <div class="field">
         <label for="flood_limit">刷屏消息数</label>
@@ -343,17 +344,44 @@
     </div>
     <div class="form-grid" style="margin-top:14px">
       <div class="field">
-        <label for="ai_daily_quota">每日 AI 请求额度</label>
+        <label for="ai_provider_id">使用的 AI 接口</label>
+        <select id="ai_provider_id" name="ai_provider_id">
+          <option value="">自动（按优先级选择）</option>
+          {% for p in ai_providers %}
+          <option value="{{ p.id }}" {% if group.ai_provider_id == p.id %}selected{% endif %}>
+            {{ p.label or p.name }}
+          </option>
+          {% endfor %}
+        </select>
+        <div class="hint">指定后该群只使用这个接口，避免优先级变化导致实际调用的接口不确定。</div>
+      </div>
+      {% if group_owner is none %}
+      <div class="field">
+        <label for="ai_daily_quota">每日文本 AI 请求额度</label>
         <input id="ai_daily_quota" name="ai_daily_quota" type="number" min="0"
                value="{{ group.ai_daily_quota or 0 }}">
-        <div class="hint">0 表示不限制，按群组每日统计。</div>
+        <div class="hint">按群组所属用户汇总计算；系统内置 AI 使用此额度，用户自有接口不受限制。</div>
       </div>
       <div class="field">
-        <label for="sample_daily_quota">每日样本拦截额度</label>
+        <label for="sample_daily_quota">每日图片 AI 请求额度</label>
         <input id="sample_daily_quota" name="sample_daily_quota" type="number" min="0"
                value="{{ group.sample_daily_quota or 0 }}">
-        <div class="hint">用于限制抽样送检消息数量。</div>
+        <div class="hint">按群组所属用户汇总计算；图片使用视觉模型，用户自有接口不受限制。</div>
       </div>
+      {% else %}
+      <div class="field">
+        <label for="ai_daily_quota">用户每日文本 AI 额度（该用户所有群共享）</label>
+        <input id="ai_daily_quota" name="ai_daily_quota" type="number" min="0"
+               value="{{ group_owner.ai_text_daily_quota if group_owner.ai_text_daily_quota is not none else (ent.ai_daily_quota or 0) }}">
+        <div class="hint">只限制系统内置接口；0 表示使用套餐额度。用户自有接口不受限制。</div>
+      </div>
+      <div class="field">
+        <label for="sample_daily_quota">用户每日图片 AI 额度（该用户所有群共享）</label>
+        <input id="sample_daily_quota" name="sample_daily_quota" type="number" min="0"
+               value="{{ group_owner.ai_image_daily_quota if group_owner.ai_image_daily_quota is not none else (ent.sample_daily_quota or 0) }}">
+        <div class="hint">图片调用视觉模型，只计入系统内置接口额度。</div>
+      </div>
+      {% endif %}
     </div>
     <div class="form-actions">
       <button type="submit">保存 AI 设置</button>
@@ -395,7 +423,7 @@
           <tr>
             <td class="faint nowrap">{{ e.created_at|dt }}</td>
             <td><span class="badge info">{{ e.kind }}</span></td>
-            <td class="mono small">{{ e.provider or '—' }}</td>
+            <td class="mono small">{{ provider_labels.get(e.provider, e.provider) or '—' }}</td>
             <td>{% if e.hit %}<span class="badge bad">命中</span>{% else %}<span class="badge">通过</span>{% endif %}</td>
             <td class="small">{{ e.result|short(46) }}</td>
           </tr>

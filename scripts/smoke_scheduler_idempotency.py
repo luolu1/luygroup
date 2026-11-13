@@ -9,33 +9,41 @@ Telegram。重点验证「扫描后 CAS 抢占」语义：多个 worker 同时�
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import os
-import shutil
 import sys
 import tempfile
+from contextlib import ExitStack
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+from typing import Final
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-TMP = Path(tempfile.mkdtemp(prefix="groupguard-scheduler-idempotency-"))
+RUNTIME: Final = ExitStack()
+atexit.register(RUNTIME.close)
+TMP = Path(RUNTIME.enter_context(tempfile.TemporaryDirectory(
+    prefix="groupguard-scheduler-idempotency-", dir="/tmp/opencode",
+)))
 DB = TMP / "scheduler-idempotency.db"
 TMP_CONFIG = TMP / "config.json"
 
-config_path = ROOT / "config.json"
-if not config_path.exists():
-    print("未找到 config.json，请先复制 config.example.json 并填写。")
-    sys.exit(2)
-
-cfg = json.loads(config_path.read_text(encoding="utf-8"))
-cfg["database"]["url"] = f"sqlite+aiosqlite:///{DB}"
-cfg.setdefault("ai", {})["learning_dir"] = str(TMP / "learning")
+cfg = {
+    "bot": {"token": "123456:offline-idempotency", "admin_ids": [], "proxy": ""},
+    "web": {"secret_key": "idempotency-smoke-secret", "base_url": "https://example.test"},
+    "database": {"url": f"sqlite+aiosqlite:///{DB}"},
+    "ai": {"learning_dir": str(TMP / "learning"), "providers": []},
+    "payments": {"enabled": False},
+}
 TMP_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
+RUNTIME.enter_context(patch.dict(os.environ, {"GROUPGUARD_CONFIG": str(TMP_CONFIG)}))
 sys.path.insert(0, str(ROOT))
 
 from sqlalchemy import func, select  # noqa: E402
 
+from app.config import get_config
 from app.db import dispose_db, init_db, session_scope  # noqa: E402
 from app.models import (  # noqa: E402
     Auction,
@@ -50,6 +58,8 @@ from app.models import (  # noqa: E402
 )
 from app.services import scheduler  # noqa: E402
 
+RUNTIME.callback(get_config.cache_clear)
+
 failures: list[str] = []
 
 
@@ -61,12 +71,27 @@ def check(name: str, cond: bool, extra: str = "") -> None:
         print(f"FAIL {name} {extra}")
 
 
+@dataclass(frozen=True, slots=True)
+class SentMessage:
+    message_id: int
+
+
 class FakeBot:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str]] = []
+        self.pins: list[tuple[int, int]] = []
 
-    async def send_message(self, chat_id: int, text: str, **kwargs) -> None:
+    async def send_message(
+        self, chat_id: int, text: str, **kwargs: str | int | bool | None
+    ) -> SentMessage:
         self.sent.append((int(chat_id), text))
+        return SentMessage(message_id=len(self.sent))
+
+    async def pin_chat_message(
+        self, chat_id: int, message_id: int, *, disable_notification: bool = True
+    ) -> bool:
+        self.pins.append((int(chat_id), message_id))
+        return True
 
 
 def messages_for(bot: FakeBot, chat_id: int, marker: str) -> list[str]:
@@ -263,13 +288,15 @@ async def run_tests() -> None:
         unsold_settled = await session.get(Auction, unsold_id)
         check(
             "auction with bidder settles exactly once",
-            len(messages_for(auction_bot, auction_group, "竞拍结束")) == 1,
-            str(messages_for(auction_bot, auction_group, "竞拍结束")),
+            won_settled is not None and won_settled.status == "finished"
+            and len(messages_for(auction_bot, auction_group, f"#{won_id}")) == 1,
+            str(messages_for(auction_bot, auction_group, f"#{won_id}")),
         )
         check(
             "auction without bidder cancels exactly once",
-            len(messages_for(auction_bot, auction_group, "已流拍")) == 1,
-            str(messages_for(auction_bot, auction_group, "已流拍")),
+            unsold_settled is not None and unsold_settled.status == "cancelled"
+            and len(messages_for(auction_bot, auction_group, f"#{unsold_id}")) == 1,
+            str(messages_for(auction_bot, auction_group, f"#{unsold_id}")),
         )
         check(
             "auction with bidder status finished",
@@ -481,8 +508,8 @@ async def run_tests() -> None:
 
 
 async def main() -> None:
-    await init_db()
     try:
+        await init_db()
         await run_tests()
     finally:
         await dispose_db()
@@ -493,7 +520,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
+    with RUNTIME:
         asyncio.run(main())
-    finally:
-        shutil.rmtree(TMP, ignore_errors=True)

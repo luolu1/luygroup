@@ -84,6 +84,12 @@ def _read_jsonl(path: Path) -> Iterator[dict[str, Any]]:
         return
 
 
+def _append_line(directory: Path, filename: str, line: str) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / filename).open("a", encoding="utf-8") as fh:
+        fh.write(line)
+
+
 class LearningStore:
     def __init__(self, directory: Path | None = None) -> None:
         if directory is None:
@@ -98,7 +104,29 @@ class LearningStore:
                 directory = cfg.project_dir / "data" / "ai_learning"
         self.directory = directory
         self._entries: dict[str, dict[str, Any]] | None = None
+        self._signature: dict[Path, tuple[int, int]] = {}
         self._lock = asyncio.Lock()
+
+    def _data_paths(self) -> list[Path]:
+        paths: list[Path] = []
+        for name in LEARNING_KINDS:
+            paths.extend(sorted((self.directory / name).glob("*.jsonl")))
+        paths.extend(sorted(self.directory.glob("*.jsonl")))
+        return paths
+
+    def _file_signature(self) -> dict[Path, tuple[int, int]]:
+        signature: dict[Path, tuple[int, int]] = {}
+        for path in self._data_paths():
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            signature[path] = (stat.st_mtime_ns, stat.st_size)
+        return signature
+
+    def _drop_cache_if_files_changed(self) -> None:
+        if self._entries is not None and self._file_signature() != self._signature:
+            self._entries = None
         # Create the layout and split any legacy root-level JSONL files early so
         # the first write does not mix the old and new structures.
         try:
@@ -238,6 +266,7 @@ class LearningStore:
 
     # ------------------------------------------------------------------ load
     def _load(self) -> dict[str, dict[str, Any]]:
+        self._drop_cache_if_files_changed()
         if self._entries is not None:
             return self._entries
         entries: dict[str, dict[str, Any]] = {}
@@ -248,7 +277,6 @@ class LearningStore:
         paths: list[Path] = []
         for name in LEARNING_KINDS:
             paths.extend(sorted((self.directory / name).glob("*.jsonl")))
-        # Fallback for a failed legacy migration: still load root-level files.
         paths.extend(sorted(self.directory.glob("*.jsonl")))
         for path in paths:
             for item in _read_jsonl(path):
@@ -256,6 +284,7 @@ class LearningStore:
                 if key:
                     entries[key] = item
         self._entries = entries
+        self._signature = self._file_signature()
         return entries
 
     # ------------------------------------------------------------------- get
@@ -308,12 +337,11 @@ class LearningStore:
                     if name not in entry:
                         entry[name] = value
             entries[key] = entry
+            target = self.directory / kind_directory(kind)
+            filename = f"group_{int(group_id)}.jsonl" if group_id else "global.jsonl"
+            line = json.dumps(entry, ensure_ascii=False) + "\n"
             try:
-                target = self.directory / kind_directory(kind)
-                target.mkdir(parents=True, exist_ok=True)
-                filename = f"group_{int(group_id)}.jsonl" if group_id else "global.jsonl"
-                with (target / filename).open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                await asyncio.to_thread(_append_line, target, filename, line)
             except OSError:
                 # A read-only/full disk must never break moderation.
                 pass

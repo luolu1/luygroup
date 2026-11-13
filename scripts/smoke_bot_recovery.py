@@ -7,17 +7,17 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import signal
 import sys
 from contextlib import ExitStack
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from app.bot import main as bot_main  # noqa: E402
 
 failures: list[str] = []
 _REAL_SLEEP = asyncio.sleep
@@ -264,4 +264,22 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    with TemporaryDirectory(prefix="groupguard-recovery-", dir="/tmp/opencode") as directory:
+        temp = Path(directory)
+        config_path = temp / "config.json"
+        config_path.write_text(json.dumps({
+            "bot": {"token": "123456789:RECOVERY_SMOKE_SYNTHETIC_TOKEN", "admin_ids": [123456789], "username": "smokebot", "proxy": ""},
+            "database": {"url": f"sqlite+aiosqlite:///{temp / 'recovery.db'}"},
+            "web": {"secret_key": "recovery-smoke-synthetic-secret", "base_url": "https://example.test"},
+            "ai": {"learning_dir": str(temp / "learning"), "providers": []},
+            "payments": {"enabled": False},
+        }), encoding="utf-8")
+        with patch.dict(os.environ, {"GROUPGUARD_CONFIG": str(config_path)}):
+            from app.config import get_config
+
+            try:
+                from app.bot import main as bot_main
+
+                asyncio.run(main())
+            finally:
+                get_config.cache_clear()

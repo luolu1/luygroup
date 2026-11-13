@@ -24,8 +24,8 @@
         <div class="hint" data-preset-hint>切换供应商会修改下方接口地址；模型可重新拉取。</div>
       </div>
       <div class="field">
-        <label>显示名称</label>
-        <input name="label" type="text" maxlength="128" value="{{ provider.label or '' }}">
+        <label>接口名称</label>
+        <input name="name" type="text" maxlength="64" value="{{ provider.name or provider.label or '' }}">
       </div>
       <div class="field span-2">
         <label>接口地址</label>

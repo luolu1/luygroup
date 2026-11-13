@@ -1,4 +1,5 @@
 """Real-time message moderation, flood control and AI mention replies."""
+
 from __future__ import annotations
 
 import base64
@@ -44,17 +45,23 @@ async def _notice(bot: Bot, chat_id: int, text: str, delay: int = 12) -> None:
     await helpers.send_temp_notice(bot, chat_id, text, delay=delay)
 
 
-async def _message_image_data(bot: Bot, message: Message) -> str | None:
+async def _message_image_data(bot: Bot, message: Message, *, max_mb: int = 10) -> str | None:
     file_id = ""
+    file_size: int | None = None
     mime = "image/jpeg"
     photo = getattr(message, "photo", None)
     document = getattr(message, "document", None)
     if photo:
         file_id = photo[-1].file_id
+        file_size = getattr(photo[-1], "file_size", None)
     elif document and str(document.mime_type or "").startswith("image/"):
         file_id = document.file_id
+        file_size = getattr(document, "file_size", None)
         mime = document.mime_type or mime
     if not file_id:
+        return None
+    if file_size and file_size > max_mb * 1024 * 1024:
+        log.warning("Image too large for AI: %d bytes (limit %dMB)", file_size, max_mb)
         return None
     try:
         file = await bot.get_file(file_id)
@@ -75,7 +82,6 @@ async def on_group_message(message: Message, bot: Bot) -> None:
         return
 
     text = message.text or message.caption or ""
-    image_data_url = await _message_image_data(bot, message)
     async with session_scope() as session:
         group = await repo.ensure_group(
             session,
@@ -102,50 +108,64 @@ async def on_group_message(message: Message, bot: Bot) -> None:
         group.message_count = (group.message_count or 0) + 1
         await repo.bump_stat(session, group.id, "messages")
         await repo.bump_member_daily(session, group.id, user.id)
-        if (
-            group.points_enabled
-            and group.points_per_message
-            and await access.can("points")
-        ):
+        if group.points_enabled and group.points_per_message and await access.can("points"):
             now = utcnow()
-            if not member.last_points_at or (now - member.last_points_at).total_seconds() >= (group.points_cooldown or 0):
+            if not member.last_points_at or (now - member.last_points_at).total_seconds() >= (
+                group.points_cooldown or 0
+            ):
                 await repo.adjust_points(
                     session, group.id, user.id, group.points_per_message, "发言奖励"
                 )
                 member.last_points_at = now
 
-        if not text:
+        document = message.document
+        has_image = bool(message.photo) or bool(
+            document and str(document.mime_type or "").startswith("image/")
+        )
+        if not text and not has_image:
             return
 
-        if not text.startswith("/"):
-            if not user.is_bot:
-                entered = await lottery_rules.record_keyword_matches(
-                    session, group.id, user.id, text
-                )
-            else:
-                entered = []
-            if entered:
-                await _notice(
-                    bot,
-                    group.id,
-                    f"🎟 关键词匹配，已自动参与：{'、'.join(entered)}。",
-                    8,
-                )
+        entered: list[str] = []
+        if text and not text.startswith("/") and not user.is_bot:
+            entered = await lottery_rules.record_keyword_matches(
+                session, group.id, user.id, text
+            )
+        # Release SQLite's write lock before any Telegram or AI network wait.
+        await session.commit()
+        if entered:
+            await _notice(
+                bot,
+                group.id,
+                f"🎟 关键词匹配，已自动参与：{'、'.join(entered)}。",
+                8,
+            )
 
         # ---- AI mention reply (works for admins too) ----
         bot_username = await helpers.get_bot_username(bot)
         mentioned = bool(bot_username) and f"@{bot_username.lower()}" in text.lower()
         if mentioned and (group.ai_assistant_enabled or group.ai_chat_enabled):
             if not await access.can("ai"):
-                await _notice(bot, group.id, "🤖 AI 助手属于订阅版功能，请群组所有者先开通订阅。", 60)
+                await _notice(
+                    bot, group.id, "🤖 AI 助手属于订阅版功能，请群组所有者先开通订阅。", 60
+                )
                 return
-            if not await quota.allow_request(session, group, access=await access.resolve()):
+            if not await quota.reserve_quota(
+                session,
+                group,
+                access=await access.resolve(),
+                provider_id=group.ai_provider_id,
+                image=False,
+            ):
                 await _notice(bot, group.id, "🤖 本群今日 AI 额度已用完，请联系管理员调整。", 10)
                 return
             owner_user_id = (await access.resolve()).owner_id
+            await session.commit()
+            ai_reserved = True
             question = text
             if bot_username:
-                question = question.replace(f"@{bot_username}", "").replace(f"@{bot_username.lower()}", "")
+                question = question.replace(f"@{bot_username}", "").replace(
+                    f"@{bot_username.lower()}", ""
+                )
             question = question.strip() or "你好"
             if group.ai_assistant_enabled:
                 result = await ai.assistant_reply(
@@ -156,6 +176,7 @@ async def on_group_message(message: Message, bot: Bot) -> None:
                     history=helpers.history(group.id),
                     group_id=group.id,
                     owner_user_id=owner_user_id,
+                    provider_id=group.ai_provider_id,
                 )
                 kind = "assistant"
             else:
@@ -166,10 +187,18 @@ async def on_group_message(message: Message, bot: Bot) -> None:
                     history=helpers.history(group.id),
                     group_id=group.id,
                     owner_user_id=owner_user_id,
+                    provider_id=group.ai_provider_id,
                 )
                 kind = "chat"
-            if result.attempts:
-                await quota.note(session, group, requests=result.attempts)
+            if result.system_attempts:
+                await quota.note(
+                    session,
+                    group,
+                    requests=result.system_attempts,
+                    image=False,
+                )
+            if not result.ok and ai_reserved:
+                await quota.release_quota(session, group, image=False)
             if result.ok:
                 helpers.remember(group.id, "user", question)
                 helpers.remember(group.id, "assistant", result.text)
@@ -184,6 +213,7 @@ async def on_group_message(message: Message, bot: Bot) -> None:
                         latency_ms=result.latency_ms,
                     )
                 )
+                await session.commit()
                 try:
                     await message.reply(result.text[:4000], parse_mode=None)
                 except TelegramAPIError:
@@ -200,9 +230,9 @@ async def on_group_message(message: Message, bot: Bot) -> None:
                         latency_ms=result.latency_ms,
                     )
                 )
+                await session.commit()
                 if group.ai_assistant_enabled:
                     await _notice(bot, group.id, f"🤖 AI 暂时不可用：{result.error[:120]}", 10)
-            return
 
         if text.startswith("/"):
             return
@@ -255,15 +285,28 @@ async def on_group_message(message: Message, bot: Bot) -> None:
                 )
 
         # ---- AI ad detection ----
+        image_data_url = (
+            await _message_image_data(bot, message)
+            if group.ai_ad_enabled and not detection.hit
+            else None
+        )
         if (
             not detection.hit
             and group.ai_ad_enabled
             and (len(text) >= 4 or image_data_url is not None)
             and await access.can("ai")
-            and await quota.allow_sample(session, group, access=await access.resolve())
-            and await quota.allow_request(session, group, access=await access.resolve())
+            and await quota.reserve_quota(
+                session,
+                group,
+                access=await access.resolve(),
+                provider_id=group.ai_provider_id,
+                image=image_data_url is not None,
+            )
         ):
             owner_user_id = (await access.resolve()).owner_id
+            await session.commit()
+            ad_reserved = True
+            ad_image = image_data_url is not None
             try:
                 is_ad, reason, result = await ai.check_ad(
                     session,
@@ -272,6 +315,7 @@ async def on_group_message(message: Message, bot: Bot) -> None:
                     group.id,
                     owner_user_id=owner_user_id,
                     image_data_url=image_data_url,
+                    provider_id=group.ai_provider_id,
                 )
             except Exception:
                 log.exception(
@@ -279,7 +323,13 @@ async def on_group_message(message: Message, bot: Bot) -> None:
                     group.id,
                     user.id,
                 )
-                await quota.note(session, group, requests=1, samples=1)
+                if ad_reserved:
+                    await quota.release_quota(session, group, image=ad_image)
+                await quota.note(
+                    session,
+                    group,
+                    samples=1,
+                )
                 session.add(
                     AIEvent(
                         group_id=group.id,
@@ -291,6 +341,7 @@ async def on_group_message(message: Message, bot: Bot) -> None:
                         hit=False,
                     )
                 )
+                await session.commit()
                 await _notice(
                     bot,
                     group.id,
@@ -301,7 +352,8 @@ async def on_group_message(message: Message, bot: Bot) -> None:
                 await quota.note(
                     session,
                     group,
-                    requests=max(1, result.attempts) if result.attempts else 0,
+                    requests=result.system_attempts,
+                    image=image_data_url is not None,
                     samples=1,
                     hits=1 if is_ad else 0,
                 )
@@ -318,6 +370,7 @@ async def on_group_message(message: Message, bot: Bot) -> None:
                         latency_ms=result.latency_ms,
                     )
                 )
+                await session.commit()
                 if is_ad:
                     detection = detect.Detection(
                         hit=True,
@@ -365,8 +418,7 @@ async def _apply_detection(
             None,
             "auto_delete_failed",
             user.id,
-            f"[{detection.source}] message={message.message_id} "
-            f"error={delete_error or 'unknown'}",
+            f"[{detection.source}] message={message.message_id} error={delete_error or 'unknown'}",
         )
     await repo.record_hit(
         session,
@@ -385,6 +437,7 @@ async def _apply_detection(
         user.id,
         f"[{detection.source}] {detection.reason}",
     )
+    await session.commit()
 
     text = ""
     try:
@@ -420,6 +473,7 @@ async def _apply_detection(
             text = await helpers.ban_user(
                 bot, session, group, target, reason=detection.reason, admin_id=None
             )
+            await session.commit()
             if group.crossban_enabled:
                 linked = await helpers.apply_crossban(
                     bot, session, group, target, reason=detection.reason, admin_id=None
@@ -430,6 +484,7 @@ async def _apply_detection(
             await message.reply(detection.reply_text[:4000], parse_mode=None)
     except TelegramAPIError as exc:
         text = f"⚠️ 自动处理失败：{exc}"
+    await session.commit()
 
     if text:
         await _notice(bot, group.id, text, 15)

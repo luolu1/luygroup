@@ -4,38 +4,39 @@
 
     .venv/bin/python scripts/smoke_permissions.py
 """
+
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import sqlite3
 import sys
 import tempfile
 import asyncio
+from contextlib import ExitStack, closing
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-TMP = Path(tempfile.mkdtemp(prefix="groupguard-perm-"))
+CLEANUP = ExitStack()
+_ = atexit.register(CLEANUP.close)
+TMP = Path(CLEANUP.enter_context(tempfile.TemporaryDirectory(
+    prefix="groupguard-perm-", dir="/tmp/opencode"
+)))
 DB = TMP / "permissions.db"
 TMP_CONFIG = TMP / "config.json"
-
-config_path = ROOT / "config.json"
-if not config_path.exists():
-    print("未找到 config.json，请先复制 config.example.json 并填写。")
-    sys.exit(2)
-
-cfg = json.loads(config_path.read_text(encoding="utf-8"))
-admin_ids = [int(item) for item in cfg.get("bot", {}).get("admin_ids", [])]
-if not admin_ids:
-    print("config.json 的 bot.admin_ids 为空，无法初始化超级管理员。")
-    sys.exit(2)
-
-cfg["database"]["url"] = f"sqlite+aiosqlite:///{DB}"
-cfg.setdefault("web", {})["base_url"] = "http://testserver"
-cfg.setdefault("ai", {})["learning_dir"] = str(TMP / "learning")
+cfg = {
+    "bot": {"token": "123456789:PERMISSIONS_SMOKE_SYNTHETIC_TOKEN", "admin_ids": [891000003],
+            "username": "permissions_smoke_bot", "proxy": ""},
+    "web": {"secret_key": "permissions-smoke-secret", "base_url": "http://testserver"},
+    "database": {"url": f"sqlite+aiosqlite:///{DB}"},
+    "ai": {"learning_dir": str(TMP / "learning"), "providers": []},
+    "payments": {"enabled": False},
+}
 TMP_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
+_ = CLEANUP.enter_context(patch.dict(os.environ, {"GROUPGUARD_CONFIG": str(TMP_CONFIG)}, clear=True))
 sys.path.insert(0, str(ROOT))
 
 from fastapi.testclient import TestClient  # noqa: E402
@@ -85,10 +86,11 @@ def check(name: str, cond: bool, extra: str = "") -> None:
     else:
         failures.append(name)
         print(f"FAIL {name} {extra}")
+        raise AssertionError(name)
 
 
 def connect() -> sqlite3.Connection:
-    return sqlite3.connect(DB)
+    return CLEANUP.enter_context(closing(sqlite3.connect(DB)))
 
 
 def login(client: TestClient, token: str) -> bool:
@@ -231,7 +233,6 @@ try:
             )
             provider_ids[name] = int(cur.lastrowid)
         con.commit()
-        con.close()
 
         # ----------------------------------------------------------- basic user
         check("basic login", login(client, tokens["basic"]))
@@ -289,7 +290,6 @@ try:
             "SELECT rules_text, welcome_enabled, welcome_text, crossban_enabled, points_enabled "
             "FROM groups WHERE id=-1001111111111"
         ).fetchone()
-        con.close()
         check(
             "basic cannot change advanced fields",
             row[0] == "基础用户可改群规"
@@ -299,9 +299,7 @@ try:
             and not row[4],
             repr(row),
         )
-        r = client.post(
-            "/groups/add", data={"chat": "@shouldnotadd"}, follow_redirects=False
-        )
+        r = client.post("/groups/add", data={"chat": "@shouldnotadd"}, follow_redirects=False)
         check(
             "non-admin cannot claim an unbound group",
             r.status_code == 303 and "err=" in r.headers.get("location", ""),
@@ -309,12 +307,9 @@ try:
         )
         con = connect()
         stray = con.execute("SELECT COUNT(*) FROM groups WHERE id=-1009999999999").fetchone()[0]
-        con.close()
         check("non-admin group claim creates no group record", stray == 0, str(stray))
         group_admin_status[9001] = "administrator"
-        r = client.post(
-            "/groups/add", data={"chat": "@shouldnotadd"}, follow_redirects=False
-        )
+        r = client.post("/groups/add", data={"chat": "@shouldnotadd"}, follow_redirects=False)
         check(
             "group admin can bind an unbound group",
             r.status_code == 303 and "msg=" in r.headers.get("location", ""),
@@ -322,8 +317,8 @@ try:
         )
         con = connect()
         stray = con.execute("SELECT COUNT(*) FROM groups WHERE id=-1009999999999").fetchone()[0]
-        con.close()
         check("admin binding creates group record", stray == 1, str(stray))
+
         async def third_group(_ref: str) -> dict:
             return {
                 "id": -1009999999998,
@@ -333,9 +328,7 @@ try:
             }
 
         web_pages._fetch_telegram_group = third_group
-        r = client.post(
-            "/groups/add", data={"chat": "@thirdgroup"}, follow_redirects=False
-        )
+        r = client.post("/groups/add", data={"chat": "@thirdgroup"}, follow_redirects=False)
         check(
             "basic third group is rejected",
             r.status_code == 303 and "err=" in r.headers.get("location", ""),
@@ -343,7 +336,6 @@ try:
         )
         con = connect()
         third = con.execute("SELECT COUNT(*) FROM groups WHERE id=-1009999999998").fetchone()[0]
-        con.close()
         check("basic third group was not created", third == 0, str(third))
         client.get("/logout")
 
@@ -360,7 +352,10 @@ try:
             f"limit={custom_limit} features={sorted(custom_features)}",
         )
         r = client.get("/account")
-        check("subscriber can access account and renewal page", r.status_code == 200 and "续费一个月" in r.text and "¥8.00" in r.text)
+        check(
+            "subscriber can access account and renewal page",
+            r.status_code == 200 and "续费一个月" in r.text and "¥8.00" in r.text,
+        )
         for path in ("/ai", "/blacklist", "/reports", "/stats"):
             r = client.get(path)
             check(f"subscriber allowed {path}", r.status_code == 200, str(r.status_code))
@@ -381,15 +376,15 @@ try:
         con = connect()
         today = datetime.utcnow().strftime("%Y-%m-%d")
         con.execute(
-            "INSERT INTO ai_usage (group_id, day, requests, samples, hits) VALUES (?, ?, ?, ?, ?)",
-            (-1002222222222, today, 7, 3, 2),
+            "INSERT INTO ai_usage (group_id, day, requests, text_requests, samples, hits) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (-1002222222222, today, 7, 7, 3, 2),
         )
         con.commit()
-        con.close()
         r = client.get("/ai")
         check(
             "subscriber AI summary scopes bound groups",
-            r.status_code == 200 and "已用 7" in r.text and "总额 200" in r.text,
+            r.status_code == 200 and "已用 7" in r.text,
             r.text[:800],
         )
 
@@ -429,7 +424,6 @@ try:
         other_entry = con.execute(
             "SELECT owner_user_id, reason FROM global_blacklist WHERE user_id=8000003"
         ).fetchone()
-        con.close()
         check(
             "added blacklist entry belongs to subscriber",
             added is not None and int(added[0]) == sub_id,
@@ -443,15 +437,12 @@ try:
             repr(other_entry),
         )
         for key, label in (("platform", "platform"), ("other", "other user")):
-            r = client.post(
-                f"/blacklist/{blacklist_ids[key]}/delete", follow_redirects=False
-            )
+            r = client.post(f"/blacklist/{blacklist_ids[key]}/delete", follow_redirects=False)
             con = connect()
             still_there = con.execute(
                 "SELECT COUNT(*) FROM global_blacklist WHERE id=?",
                 (blacklist_ids[key],),
             ).fetchone()[0]
-            con.close()
             check(
                 f"subscriber cannot delete {label} blacklist entry",
                 r.status_code == 303
@@ -459,20 +450,15 @@ try:
                 and still_there == 1,
                 f"{r.status_code} {r.headers} {still_there}",
             )
-        r = client.post(
-            f"/blacklist/{blacklist_ids['sub']}/delete", follow_redirects=False
-        )
+        r = client.post(f"/blacklist/{blacklist_ids['sub']}/delete", follow_redirects=False)
         con = connect()
         own_gone = con.execute(
             "SELECT COUNT(*) FROM global_blacklist WHERE id=?",
             (blacklist_ids["sub"],),
         ).fetchone()[0]
-        con.close()
         check(
             "subscriber can delete own blacklist entry",
-            r.status_code == 303
-            and "msg=" in r.headers.get("location", "")
-            and own_gone == 0,
+            r.status_code == 303 and "msg=" in r.headers.get("location", "") and own_gone == 0,
             f"{r.status_code} {r.headers} {own_gone}",
         )
 
@@ -483,12 +469,9 @@ try:
         )
         con = connect()
         cross_count = con.execute("SELECT COUNT(*) FROM cross_links").fetchone()[0]
-        con.close()
         check(
             "crosslink target restricted to accessible groups",
-            r.status_code == 303
-            and "err=" in r.headers.get("location", "")
-            and cross_count == 0,
+            r.status_code == 303 and "err=" in r.headers.get("location", "") and cross_count == 0,
             f"{r.status_code} {r.headers} {cross_count}",
         )
         r = client.post(
@@ -501,7 +484,6 @@ try:
         receive = con.execute(
             "SELECT report_receive FROM groups WHERE id=-1001111111111"
         ).fetchone()[0]
-        con.close()
         check(
             "reportlink target restricted to accessible groups",
             r.status_code == 303
@@ -566,8 +548,68 @@ try:
         owner = con.execute(
             "SELECT owner_user_id FROM ai_providers WHERE name='sub-added'"
         ).fetchone()
-        con.close()
-        check("added provider belongs to subscriber", owner and int(owner[0]) == sub_id, repr(owner))
+        check(
+            "added provider belongs to subscriber", owner and int(owner[0]) == sub_id, repr(owner)
+        )
+
+        r = client.post(
+            "/groups/-1002222222222/settings",
+            data={
+                "_scope": "ai",
+                "ai_provider_id": str(provider_ids["other-provider"]),
+            },
+            follow_redirects=False,
+        )
+        con = connect()
+        bound = con.execute(
+            "SELECT ai_provider_id FROM groups WHERE id = -1002222222222"
+        ).fetchone()
+        check(
+            "group cannot bind another user's private interface",
+            bound is not None and bound[0] is None,
+            repr(bound),
+        )
+
+        r = client.post(
+            "/groups/-1002222222222/settings",
+            data={
+                "_scope": "ai",
+                "ai_provider_id": str(provider_ids["sub-provider"]),
+            },
+            follow_redirects=False,
+        )
+        con = connect()
+        bound = con.execute(
+            "SELECT ai_provider_id FROM groups WHERE id = -1002222222222"
+        ).fetchone()
+        check(
+            "group can bind its own interface",
+            bound is not None and int(bound[0] or 0) == provider_ids["sub-provider"],
+            repr(bound),
+        )
+
+        r = client.post(
+            "/groups/-1002222222222/settings",
+            data={
+                "_scope": "ai",
+                "ai_daily_quota": "31",
+                "sample_daily_quota": "47",
+            },
+            follow_redirects=False,
+        )
+        con = connect()
+        stored_quota = con.execute(
+            "SELECT ai_text_daily_quota, ai_image_daily_quota FROM console_users WHERE id=?",
+            (sub_id,),
+        ).fetchone()
+        group_quota = con.execute(
+            "SELECT ai_daily_quota, sample_daily_quota FROM groups WHERE id=-1002222222222"
+        ).fetchone()
+        check(
+            "subscriber AI quotas are shared on the console user",
+            stored_quota == (31, 47) and group_quota == (None, None),
+            f"user={stored_quota} group={group_quota}",
+        )
         client.get("/logout")
 
         # -------------------------------------------------- subscription by user
@@ -589,6 +631,9 @@ except Exception as exc:  # noqa: BLE001
     import traceback
 
     traceback.print_exc()
+finally:
+    atexit.unregister(CLEANUP.close)
+    CLEANUP.close()
 
 if failures:
     print(f"\nFAILURES: {len(failures)}")

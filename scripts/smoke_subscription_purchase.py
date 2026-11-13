@@ -7,25 +7,36 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import os
 import sys
 import tempfile
+from contextlib import ExitStack
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 from sqlalchemy import select
 
 ROOT = Path(__file__).resolve().parents[1]
-TMP = Path(tempfile.mkdtemp(prefix="groupguard-subscription-"))
+CLEANUP = ExitStack()
+_ = atexit.register(CLEANUP.close)
+TMP = Path(CLEANUP.enter_context(tempfile.TemporaryDirectory(
+    prefix="groupguard-subscription-", dir="/tmp/opencode"
+)))
 DB = TMP / "subscription.db"
 TMP_CONFIG = TMP / "config.json"
-
-config = json.loads((ROOT / "config.json").read_text(encoding="utf-8"))
-config["database"]["url"] = f"sqlite+aiosqlite:///{DB}"
-config.setdefault("ai", {})["learning_dir"] = str(TMP / "learning")
+config = {
+    "bot": {"token": "123456789:SUBSCRIPTION_SMOKE_SYNTHETIC_TOKEN", "admin_ids": [891000005],
+            "username": "subscription_smoke_bot", "proxy": ""},
+    "web": {"secret_key": "subscription-smoke-secret", "base_url": "http://testserver"},
+    "database": {"url": f"sqlite+aiosqlite:///{DB}"},
+    "ai": {"learning_dir": str(TMP / "learning"), "providers": []},
+    "payments": {"enabled": False},
+}
 TMP_CONFIG.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
-os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
+_ = CLEANUP.enter_context(patch.dict(os.environ, {"GROUPGUARD_CONFIG": str(TMP_CONFIG)}, clear=True))
 sys.path.insert(0, str(ROOT))
 
 from app.db import dispose_db, get_sessionmaker, init_db  # noqa: E402
@@ -77,7 +88,7 @@ def check(name: str, condition: bool, detail: str = "") -> None:
         raise AssertionError(name)
 
 
-async def main() -> None:
+async def run_tests() -> None:
     await init_db()
     async with get_sessionmaker()() as session:
         plan = await session.scalar(
@@ -152,8 +163,16 @@ async def main() -> None:
     print("FAILURES: none")
 
 
+async def main() -> None:
+    try:
+        await run_tests()
+    finally:
+        await dispose_db()
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     finally:
-        asyncio.run(dispose_db())
+        atexit.unregister(CLEANUP.close)
+        CLEANUP.close()

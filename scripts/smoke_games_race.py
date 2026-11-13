@@ -5,41 +5,53 @@ Telegram。重点验证 CAS 抢占顺序与「抢占失败必须回滚」语义�
 
     .venv/bin/python scripts/smoke_games_race.py
 """
+
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import os
-import shutil
 import sys
 import tempfile
+from contextlib import ExitStack
 from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Final
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-TMP = Path(tempfile.mkdtemp(prefix="groupguard-games-race-"))
+RUNTIME: Final = ExitStack()
+atexit.register(RUNTIME.close)
+TMP = Path(RUNTIME.enter_context(tempfile.TemporaryDirectory(
+    prefix="groupguard-games-race-", dir="/tmp/opencode",
+)))
 DB = TMP / "games-race.db"
 TMP_CONFIG = TMP / "config.json"
 
-config_path = ROOT / "config.json"
-if not config_path.exists():
-    print("未找到 config.json，请先复制 config.example.json 并填写。")
-    sys.exit(2)
-
+config_path = ROOT / "config.example.json"
 cfg = json.loads(config_path.read_text(encoding="utf-8"))
+cfg["bot"] = {"token": "123456789:AUCTION_SMOKE_SYNTHETIC_TOKEN", "admin_ids": [], "username": "smokebot", "proxy": ""}
+cfg["web"]["secret_key"] = "auction-smoke-synthetic-secret"
+cfg["web"]["base_url"] = "https://example.test"
 cfg["database"]["url"] = f"sqlite+aiosqlite:///{DB}"
 cfg.setdefault("ai", {})["learning_dir"] = str(TMP / "learning")
+cfg["ai"]["providers"] = []
+cfg["payments"]["enabled"] = False
 TMP_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
-os.environ["GROUPGUARD_CONFIG"] = str(TMP_CONFIG)
+RUNTIME.enter_context(patch.dict(os.environ, {"GROUPGUARD_CONFIG": str(TMP_CONFIG)}))
 sys.path.insert(0, str(ROOT))
 
 from sqlalchemy import func, select  # noqa: E402
 from sqlalchemy.exc import OperationalError  # noqa: E402
+from aiogram.methods import EditMessageText, SendMessage  # noqa: E402
+from aiogram.types import InlineKeyboardMarkup  # noqa: E402
 
 from app.bot import helpers  # noqa: E402
 from app.bot.handlers import games, moderation  # noqa: E402
+from app.config import get_config
 from app.db import dispose_db, init_db, session_scope  # noqa: E402
 from app.models import (  # noqa: E402
     Auction,
@@ -54,6 +66,8 @@ from app.models import (  # noqa: E402
     utcnow,
 )
 from app.services import repo, scheduler  # noqa: E402
+
+RUNTIME.callback(get_config.cache_clear)
 
 failures: list[str] = []
 
@@ -83,7 +97,13 @@ async def with_retry(factory):
 
 class FakeBot:
     def __init__(self) -> None:
+        self.id = 123456789
         self.sent: list[tuple[int, str]] = []
+        self.sent_markup: list[InlineKeyboardMarkup | None] = []
+        self.pinned: list[tuple[int, int]] = []
+        self.deleted: list[tuple[int, int]] = []
+        self.edited: list[tuple[int, int, str]] = []
+        self.edited_markup: list[InlineKeyboardMarkup | None] = []
         self.membership: dict[tuple[int, int], str] = {}
         self.next_message_id = 700
         self.hold_send = False
@@ -95,14 +115,38 @@ class FakeBot:
         if self.hold_send:
             self.send_started.set()
             await self.send_release.wait()
-        self.sent.append((int(chat_id), text))
+        request = SendMessage(chat_id=chat_id, text=text, **kwargs)
+        assert request.text is not None
+        assert request.reply_markup is None or isinstance(request.reply_markup, InlineKeyboardMarkup)
+        self.sent.append((int(chat_id), request.text))
+        self.sent_markup.append(request.reply_markup)
         self.next_message_id += 1
         return SimpleNamespace(message_id=self.next_message_id)
 
-    async def get_chat_member(self, chat_id: int, user_id: int):
-        return SimpleNamespace(
-            status=self.membership.get((int(chat_id), int(user_id)), "member")
+    async def edit_message_text(
+        self, text: str | None = None, business_connection_id: str | None = None,
+        chat_id: int | None = None, message_id: int | None = None,
+        *, reply_markup: InlineKeyboardMarkup | None = None, **kwargs,
+    ):
+        request = EditMessageText(
+            text=text, business_connection_id=business_connection_id,
+            chat_id=chat_id, message_id=message_id, reply_markup=reply_markup, **kwargs,
         )
+        assert isinstance(request.chat_id, int) and request.message_id is not None and request.text is not None
+        self.edited.append((request.chat_id, request.message_id, request.text))
+        self.edited_markup.append(request.reply_markup)
+        return True
+
+    async def get_chat_member(self, chat_id: int, user_id: int):
+        return SimpleNamespace(status=self.membership.get((int(chat_id), int(user_id)), "member"))
+
+    async def pin_chat_message(self, chat_id: int, message_id: int, **kwargs):
+        self.pinned.append((int(chat_id), int(message_id)))
+        return True
+
+    async def delete_message(self, chat_id: int, message_id: int):
+        self.deleted.append((int(chat_id), int(message_id)))
+        return True
 
     async def me(self):
         return SimpleNamespace(username="smokebot")
@@ -125,14 +169,19 @@ class FakeChat:
 
 
 class FakeMessage:
-    def __init__(self, *, user_id: int, chat_id: int, text: str = "") -> None:
+    def __init__(
+        self, *, user_id: int, chat_id: int, text: str = "", message_id: int = 900
+    ) -> None:
         self.from_user = FakeUser(user_id)
         self.chat = FakeChat(chat_id)
         self.sender_chat = None
         self.forward_from_chat = None
+        self.photo = None
+        self.document = None
         if chat_id > 0:
             self.chat.type = "private"
         self.text = text
+        self.message_id = message_id
         self.reply_to_message = None
         self.replies: list[str] = []
         self.markup = None
@@ -147,8 +196,9 @@ class FakeMessage:
 
 
 class FakeCallbackMessage:
-    def __init__(self, chat_id: int) -> None:
+    def __init__(self, chat_id: int, message_id: int = 900) -> None:
         self.chat = FakeChat(chat_id)
+        self.message_id = message_id
         if chat_id > 0:
             self.chat.type = "private"
         self.markup_calls: list[object] = []
@@ -170,7 +220,9 @@ class FakeCallback:
     def __init__(self, *, data: str, user_id: int, chat_id: int) -> None:
         self.data = data
         self.from_user = FakeUser(user_id)
-        self.message = FakeCallbackMessage(chat_id)
+        draft = games._auction_drafts.get(user_id)
+        prompt_id = draft.prompt_message_id if draft is not None and draft.prompt_message_id is not None else 900
+        self.message = FakeCallbackMessage(chat_id, prompt_id)
         self.answers: list[str] = []
 
     async def answer(self, text: str = "", show_alert: bool = False) -> None:
@@ -192,9 +244,7 @@ async def test_lottery_private_setup() -> None:
     assert "第 1/6 步 · 标题" in bot.sent[0][1]
     assert "例如：周末抽奖" in bot.sent[0][1]
     async with session_scope() as session:
-        assert await session.scalar(
-            select(Lottery.id).where(Lottery.group_id == group_id)
-        ) is None
+        assert await session.scalar(select(Lottery.id).where(Lottery.group_id == group_id)) is None
 
     await games.lottery_private_config(
         FakeMessage(user_id=user_id, chat_id=user_id, text="周末抽奖"),
@@ -207,9 +257,7 @@ async def test_lottery_private_setup() -> None:
         FakeCallback(data="lotsetup:condition:none", user_id=user_id, chat_id=user_id),
         bot,
     )
-    await games.lottery_private_config(
-        FakeMessage(user_id=user_id, chat_id=user_id, text="2"), bot
-    )
+    await games.lottery_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="2"), bot)
     await games.lottery_setup_callback(
         FakeCallback(data="lotsetup:draw:time", user_id=user_id, chat_id=user_id),
         bot,
@@ -225,9 +273,7 @@ async def test_lottery_private_setup() -> None:
     callback = FakeCallback(data="lotsetup:create", user_id=user_id, chat_id=user_id)
     await games.lottery_setup_callback(callback, bot)
     async with session_scope() as session:
-        lottery = await session.scalar(
-            select(Lottery).where(Lottery.group_id == group_id)
-        )
+        lottery = await session.scalar(select(Lottery).where(Lottery.group_id == group_id))
         assert lottery is not None
         assert lottery.title == "周末抽奖"
         assert lottery.winners_count == 2
@@ -257,12 +303,8 @@ async def test_lottery_private_setup() -> None:
     bot.hold_send = True
     bot.send_release.clear()
     sent_before = len(bot.sent)
-    first_confirm = FakeCallback(
-        data="lotsetup:create", user_id=user_id, chat_id=user_id
-    )
-    second_confirm = FakeCallback(
-        data="lotsetup:create", user_id=user_id, chat_id=user_id
-    )
+    first_confirm = FakeCallback(data="lotsetup:create", user_id=user_id, chat_id=user_id)
+    second_confirm = FakeCallback(data="lotsetup:create", user_id=user_id, chat_id=user_id)
     first_task = asyncio.create_task(games.lottery_setup_callback(first_confirm, bot))
     await bot.send_started.wait()
     second_task = asyncio.create_task(games.lottery_setup_callback(second_confirm, bot))
@@ -309,9 +351,7 @@ async def test_lottery_private_setup() -> None:
         FakeMessage(user_id=revoked_user_id, chat_id=revoked_user_id, text="1"), bot
     )
     await games.lottery_setup_callback(
-        FakeCallback(
-            data="lotsetup:draw:time", user_id=revoked_user_id, chat_id=revoked_user_id
-        ),
+        FakeCallback(data="lotsetup:draw:time", user_id=revoked_user_id, chat_id=revoked_user_id),
         bot,
     )
     await games.lottery_private_config(
@@ -335,9 +375,10 @@ async def test_lottery_private_setup() -> None:
         bot,
     )
     async with session_scope() as session:
-        assert await session.scalar(
-            select(Lottery.id).where(Lottery.group_id == revoked_group_id)
-        ) is None
+        assert (
+            await session.scalar(select(Lottery.id).where(Lottery.group_id == revoked_group_id))
+            is None
+        )
     print("PASS revoked admin cannot confirm lottery")
 
 
@@ -347,16 +388,12 @@ async def test_lottery_wizard_back_and_expiry() -> None:
     await create_group(group_id, "Lottery edit")
     bot = FakeBot()
     bot.membership[(group_id, user_id)] = "administrator"
-    await games.cmd_lottery(
-        FakeMessage(user_id=user_id, chat_id=group_id, text="/cj"), bot
-    )
+    await games.cmd_lottery(FakeMessage(user_id=user_id, chat_id=group_id, text="/cj"), bot)
     started = games._lottery_drafts[user_id].created_at
     await games.lottery_private_config(
         FakeMessage(user_id=user_id, chat_id=user_id, text="Original title"), bot
     )
-    back = FakeCallback(
-        data="lotsetup:back:title", user_id=user_id, chat_id=user_id
-    )
+    back = FakeCallback(data="lotsetup:back:title", user_id=user_id, chat_id=user_id)
     await games.lottery_setup_callback(back, bot)
     assert games._lottery_drafts[user_id].step == "title"
     assert games._lottery_drafts[user_id].created_at == started
@@ -395,9 +432,10 @@ async def test_lottery_wizard_back_and_expiry() -> None:
         bot,
     )
     async with session_scope() as session:
-        assert await session.scalar(
-            select(Lottery.id).where(Lottery.group_id == confirm_group)
-        ) is None
+        assert (
+            await session.scalar(select(Lottery.id).where(Lottery.group_id == confirm_group))
+            is None
+        )
     print("PASS expired lottery draft cannot be confirmed")
 
 
@@ -408,9 +446,7 @@ async def test_lottery_participation_rules() -> None:
     await create_group(group_id, "Lottery rules")
     bot = FakeBot()
     bot.membership[(group_id, admin_id)] = "administrator"
-    await games.cmd_lottery(
-        FakeMessage(user_id=admin_id, chat_id=group_id, text="/cj"), bot
-    )
+    await games.cmd_lottery(FakeMessage(user_id=admin_id, chat_id=group_id, text="/cj"), bot)
     await games.lottery_private_config(
         FakeMessage(user_id=admin_id, chat_id=admin_id, text="关键词抽奖"), bot
     )
@@ -439,17 +475,20 @@ async def test_lottery_participation_rules() -> None:
     await games.lottery_setup_callback(
         FakeCallback(data="lotsetup:create", user_id=admin_id, chat_id=admin_id), bot
     )
+    lottery_post = bot.sent[-1][1]
+    assert "🏆 <b>奖品</b>" in lottery_post
+    assert "👥 <b>参与条件</b>" in lottery_post
+    assert "⏰ <b>开奖时间</b>" in lottery_post
+    assert "在群内发送「抽奖」即可自动报名" in lottery_post
+    assert "首尾空格不影响" in lottery_post
+    assert "📩 <b>领奖联系</b>" in lottery_post
     async with session_scope() as session:
-        keyword_lottery = await session.scalar(
-            select(Lottery).where(Lottery.group_id == group_id)
-        )
+        keyword_lottery = await session.scalar(select(Lottery).where(Lottery.group_id == group_id))
         assert keyword_lottery is not None
         assert keyword_lottery.participation_type == "keyword"
         keyword_lottery_id = int(keyword_lottery.id)
 
-    denied = FakeCallback(
-        data=f"lot:{keyword_lottery_id}", user_id=member_id, chat_id=group_id
-    )
+    denied = FakeCallback(data=f"lot:{keyword_lottery_id}", user_id=member_id, chat_id=group_id)
     await games.on_lottery_join(denied)
     assert any("需要先在群内发送" in answer for answer in denied.answers), denied.answers
     print("PASS keyword lottery rejects member without qualifying message")
@@ -458,35 +497,37 @@ async def test_lottery_participation_rules() -> None:
     auto_message.chat.title = "Lottery rules"
     await moderation.on_group_message(auto_message, bot)
     async with session_scope() as session:
-        entry_count = int(await session.scalar(
-            select(func.count(LotteryEntry.id)).where(
-                LotteryEntry.lottery_id == keyword_lottery_id,
-                LotteryEntry.user_id == member_id,
+        entry_count = int(
+            await session.scalar(
+                select(func.count(LotteryEntry.id)).where(
+                    LotteryEntry.lottery_id == keyword_lottery_id,
+                    LotteryEntry.user_id == member_id,
+                )
             )
-        ) or 0)
+            or 0
+        )
         assert entry_count == 0
     exact_message = FakeMessage(user_id=member_id, chat_id=group_id, text="抽奖")
     exact_message.chat.title = "Lottery rules"
     await moderation.on_group_message(exact_message, bot)
     async with session_scope() as session:
-        entry_count = int(await session.scalar(
-            select(func.count(LotteryEntry.id)).where(
-                LotteryEntry.lottery_id == keyword_lottery_id,
-                LotteryEntry.user_id == member_id,
+        entry_count = int(
+            await session.scalar(
+                select(func.count(LotteryEntry.id)).where(
+                    LotteryEntry.lottery_id == keyword_lottery_id,
+                    LotteryEntry.user_id == member_id,
+                )
             )
-        ) or 0)
+            or 0
+        )
         assert entry_count == 1
     history = FakeMessage(user_id=admin_id, chat_id=admin_id, text="/cjhistory")
     await games.lottery_history(history)
     assert any("我创建的抽奖" in text for text, _markup in history.sent_answers)
-    list_markup = next(
-        markup for _text, markup in history.sent_answers if markup is not None
-    )
+    list_markup = next(markup for _text, markup in history.sent_answers if markup is not None)
     assert any("关键词抽奖" in button.text for row in list_markup.inline_keyboard for button in row)
     print("PASS keyword message automatically enters member and appears in history")
-    allowed = FakeCallback(
-        data=f"lot:{keyword_lottery_id}", user_id=member_id, chat_id=group_id
-    )
+    allowed = FakeCallback(data=f"lot:{keyword_lottery_id}", user_id=member_id, chat_id=group_id)
     await games.on_lottery_join(allowed)
     assert any("你已经参与过了" in answer for answer in allowed.answers), allowed.answers
     print("PASS keyword lottery button recognizes automatic entry")
@@ -541,9 +582,7 @@ async def test_lottery_participation_rules() -> None:
 
     async with session_scope() as session:
         member = await session.scalar(
-            select(Member).where(
-                Member.group_id == points_group, Member.user_id == points_member
-            )
+            select(Member).where(Member.group_id == points_group, Member.user_id == points_member)
         )
         assert member is not None
         member.points = 200
@@ -620,9 +659,7 @@ async def test_lottery_creator_management() -> None:
         creator_lottery = await session.scalar(
             select(Lottery).where(Lottery.creator_id == creator_id)
         )
-        other_lottery = await session.scalar(
-            select(Lottery).where(Lottery.creator_id == other_id)
-        )
+        other_lottery = await session.scalar(select(Lottery).where(Lottery.creator_id == other_id))
         assert creator_lottery is not None and other_lottery is not None
         creator_lottery_id = int(creator_lottery.id)
     history = FakeMessage(user_id=creator_id, chat_id=creator_id, text="/cjhistory")
@@ -684,17 +721,13 @@ async def test_lottery_creator_management() -> None:
     async with session_scope() as session:
         cancelled = await session.get(Lottery, creator_lottery_id)
         assert cancelled is not None and cancelled.status == "cancelled"
-    cancelled_history = FakeMessage(
-        user_id=creator_id, chat_id=creator_id, text="/cjhistory"
-    )
+    cancelled_history = FakeMessage(user_id=creator_id, chat_id=creator_id, text="/cjhistory")
     await games.lottery_history(cancelled_history)
     assert len(cancelled_history.sent_answers) == 1
     assert "已取消" in cancelled_history.sent_answers[0][1].inline_keyboard[0][0].text
     print("PASS creator can list, view, edit and cancel with management buttons")
 
-    denied = FakeMessage(
-        user_id=other_id, chat_id=other_id, text=f"/cjcancel {creator_lottery_id}"
-    )
+    denied = FakeMessage(user_id=other_id, chat_id=other_id, text=f"/cjcancel {creator_lottery_id}")
     await games.lottery_cancel_created(denied)
     assert "找不到" in denied.replies[-1]
     print("PASS other creator cannot cancel lottery")
@@ -747,18 +780,15 @@ async def test_anonymous_admin_context() -> None:
             text="/ban",
             message_id=701,
         )
+
         async def fake_reply(_text: str) -> None:
             return None
 
         anonymous_message.reply = fake_reply
-        result = await helpers.admin_context(
-            FakeBot(), session, anonymous_message, "ban"
-        )
+        result = await helpers.admin_context(FakeBot(), session, anonymous_message, "ban")
         assert result is not None and result[1] == group_id
         anonymous_message.sender_chat = FakeChat(-100820095)
-        denied = await helpers.admin_context(
-            FakeBot(), session, anonymous_message, "ban"
-        )
+        denied = await helpers.admin_context(FakeBot(), session, anonymous_message, "ban")
         assert denied is None
     print("PASS same-group anonymous admin is recognized by admin context")
 
@@ -777,7 +807,7 @@ async def test_auction_private_setup() -> None:
     await games.cmd_auction(start, bot)
     assert bot.sent[-1][0] == user_id
     assert "竞拍将在群组" in bot.sent[-1][1]
-    assert "第 1/4 步 · 拍品" in bot.sent[-1][1]
+    assert "第 1/7 步 · 拍品" in bot.sent[-1][1]
     check("auction group start only sends confirmation", "私聊" in start.replies[-1])
     async with session_scope() as session:
         assert await session.scalar(select(Auction.id).where(Auction.group_id == group_id)) is None
@@ -786,37 +816,81 @@ async def test_auction_private_setup() -> None:
         FakeMessage(user_id=user_id, chat_id=user_id, text="稀有头像框"), bot
     )
     await games.game_private_config(
-        FakeMessage(user_id=user_id, chat_id=user_id, text="100"), bot
+        FakeMessage(user_id=user_id, chat_id=user_id, text="稀有动画头像框，限量发行"), bot
     )
-    await games.game_private_config(
-        FakeMessage(user_id=user_id, chat_id=user_id, text="10"), bot
+    await games.auction_setup_callback(
+        FakeCallback(data="aucsetup:type:points", user_id=user_id, chat_id=user_id), bot
     )
-    confirm_message = FakeMessage(user_id=user_id, chat_id=user_id, text="30")
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="100"), bot)
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="10"), bot)
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="30"), bot)
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="2"), bot)
+    confirm_message = FakeMessage(user_id=user_id, chat_id=user_id, text="2")
     await games.game_private_config(confirm_message, bot)
     assert "确认竞拍配置" in confirm_message.replies[-1]
+    assert "仅最后 6 分钟内有效出价后至少保留 3 分钟" in confirm_message.replies[-1]
+    assert "落锤间隔：每 2 分钟提醒" in confirm_message.replies[-1]
     assert bot.sent[-1][0] == user_id
 
     callback = FakeCallback(data="aucsetup:create", user_id=user_id, chat_id=user_id)
     await games.auction_setup_callback(callback, bot)
     async with session_scope() as session:
-        auction = await session.scalar(
-            select(Auction).where(Auction.group_id == group_id)
-        )
+        auction = await session.scalar(select(Auction).where(Auction.group_id == group_id))
         assert auction is not None
         assert auction.item == "稀有头像框"
+        assert auction.description == "稀有动画头像框，限量发行"
+        assert auction.auction_type == "points"
         assert auction.start_price == 100
         assert auction.step == 10
+        assert auction.extend_minutes == 2
         assert auction.current_price == 100
         assert auction.current_bidder is None
         assert auction.status == "open"
         assert auction.message_id is not None
         assert auction.code and len(auction.code) == 8
     assert bot.sent[-1][0] == group_id
-    assert f"竞拍编号：<code>{auction.code}</code>" in bot.sent[-1][1]
-    assert "每次出价会重新延长" in bot.sent[-1][1]
+    assert bot.pinned and bot.pinned[-1][0] == group_id
+    auction_post = bot.sent[-1][1]
+    assert f"🔖 <b>编号</b>　{auction.code}" in auction_post
+    assert "📦 <b>拍品</b>　稀有头像框" in auction_post
+    assert "📄 <b>拍品描述</b>　稀有动画头像框，限量发行" in auction_post
+    assert "💰 <b>起拍价</b>　100 积分" in auction_post
+    assert "➕ <b>最低加价</b>　10 积分" in auction_post
+    assert "⏰ <b>截止时间</b>" in auction_post
+    assert "（北京时间）" in auction_post
+    assert "📈 <b>延时规则</b>" in auction_post
+    assert "仅最后 6 分钟内有效出价延时，截止时间至少为出价后 3 分钟" in auction_post
+    assert "点击下方按钮出价" in auction_post
+    assert f"/bid {auction.code} 金额" in auction_post
     assert user_id not in games._auction_drafts
     check("auction private setup creates auction", True)
     print("PASS auction private setup creates auction")
+
+    await games.cmd_auction(FakeMessage(user_id=user_id, chat_id=group_id, text="/jp"), bot)
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="零加价拍品"), bot)
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="测试描述"), bot)
+    await games.auction_setup_callback(
+        FakeCallback(data="aucsetup:type:points", user_id=user_id, chat_id=user_id), bot
+    )
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="100"), bot)
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="0"), bot)
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="30"), bot)
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="1"), bot)
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="1"), bot)
+    await games.auction_setup_callback(
+        FakeCallback(data="aucsetup:create", user_id=user_id, chat_id=user_id), bot
+    )
+    async with session_scope() as session:
+        zero_step_auction = await session.scalar(
+            select(Auction).where(Auction.group_id == group_id, Auction.item == "零加价拍品")
+        )
+        assert zero_step_auction is not None
+        assert zero_step_auction.step == 0
+        assert zero_step_auction.extend_minutes == 1
+    zero_step_post = bot.sent[-1][1]
+    assert "➕ <b>最低加价</b>　1 积分" in zero_step_post
+    assert "仅最后 3 分钟内有效出价延时，截止时间至少为出价后 3 分钟" in zero_step_post
+    print("PASS zero-step auction announces the effective one-point minimum")
 
 
 async def test_auction_private_cancel_and_idempotent() -> None:
@@ -840,10 +914,16 @@ async def test_auction_private_cancel_and_idempotent() -> None:
     check("auction private cancel clears draft", "已取消当前创建流程" in cancel.replies[-1])
 
     await games.cmd_auction(start, bot)
-    for text in ("测试拍品", "50", "5", "15"):
-        await games.game_private_config(
-            FakeMessage(user_id=user_id, chat_id=user_id, text=text), bot
-        )
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="测试拍品"), bot)
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="测试描述"), bot)
+    await games.auction_setup_callback(
+        FakeCallback(data="aucsetup:type:points", user_id=user_id, chat_id=user_id), bot
+    )
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="50"), bot)
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="5"), bot)
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="15"), bot)
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="1"), bot)
+    await games.game_private_config(FakeMessage(user_id=user_id, chat_id=user_id, text="1"), bot)
     callback1 = FakeCallback(data="aucsetup:create", user_id=user_id, chat_id=user_id)
     callback2 = FakeCallback(data="aucsetup:create", user_id=user_id, chat_id=user_id)
     await asyncio.gather(
@@ -852,9 +932,8 @@ async def test_auction_private_cancel_and_idempotent() -> None:
     )
     async with session_scope() as session:
         count = int(
-            await session.scalar(
-                select(func.count(Auction.id)).where(Auction.group_id == group_id)
-            ) or 0
+            await session.scalar(select(func.count(Auction.id)).where(Auction.group_id == group_id))
+            or 0
         )
         assert count == 1
     assert "竞拍已发布" in callback1.answers[-1] or "竞拍已发布" in callback2.answers[-1]
@@ -904,9 +983,7 @@ async def set_points(group_id: int, user_id: int, points: int) -> None:
 async def get_points(group_id: int, user_id: int) -> int:
     async with session_scope() as session:
         member = await session.scalar(
-            select(Member).where(
-                Member.group_id == int(group_id), Member.user_id == int(user_id)
-            )
+            select(Member).where(Member.group_id == int(group_id), Member.user_id == int(user_id))
         )
         return int(member.points or 0) if member else 0
 
@@ -919,6 +996,10 @@ async def create_auction(
     step: int,
     current_price: int,
     current_bidder: int | None,
+    description: str = "",
+    auction_type: str = "points",
+    entry_fee: int = 0,
+    extend_minutes: int = 1,
 ) -> int:
     async with session_scope() as session:
         auction = Auction(
@@ -926,8 +1007,12 @@ async def create_auction(
             group_id=int(group_id),
             creator_id=900000,
             item=item,
+            description=description,
+            auction_type=auction_type,
+            entry_fee=entry_fee,
             start_price=int(start_price),
             step=int(step),
+            extend_minutes=extend_minutes,
             current_price=int(current_price),
             current_bidder=current_bidder,
             status="open",
@@ -988,21 +1073,19 @@ async def run_tests() -> None:
         current_price=100,
         current_bidder=None,
     )
+    bid_bot = FakeBot()
     bid_msg = FakeMessage(user_id=820101, chat_id=group1, text="/bid 150")
-    await games.cmd_bid(bid_msg, SimpleNamespace())
+    bid_msg.message_id = 915
+    await games.cmd_bid(bid_msg, bid_bot)
 
     async with session_scope() as session:
         auction = await session.get(Auction, auction1)
         member = await session.scalar(
-            select(Member).where(
-                Member.group_id == group1, Member.user_id == 820101
-            )
+            select(Member).where(Member.group_id == group1, Member.user_id == 820101)
         )
         bid_rows = int(
             await session.scalar(
-                select(func.count(AuctionBid.id)).where(
-                    AuctionBid.auction_id == auction1
-                )
+                select(func.count(AuctionBid.id)).where(AuctionBid.auction_id == auction1)
             )
             or 0
         )
@@ -1021,8 +1104,14 @@ async def run_tests() -> None:
         check("bid happy path writes one bid row", bid_rows == 1, str(bid_rows))
     check(
         "bid happy path replies success",
-        len(bid_msg.replies) == 1 and "出价成功" in bid_msg.replies[0],
-        str(bid_msg.replies),
+        (len(bid_msg.replies) == 1 and "出价成功" in bid_msg.replies[0])
+        or any("出价成功" in text for _chat, text in bid_bot.sent),
+        str({"replies": bid_msg.replies, "sent": bid_bot.sent}),
+    )
+    check(
+        "bid command message deleted on success",
+        (group1, 915) in bid_bot.deleted,
+        str(bid_bot.deleted),
     )
 
     # ------------------------------------------------------------------
@@ -1044,20 +1133,20 @@ async def run_tests() -> None:
         current_price=100,
         current_bidder=current_bidder,
     )
-    msg_b = FakeMessage(user_id=bidder_b, chat_id=group2, text="/bid 110")
-    msg_c = FakeMessage(user_id=bidder_c, chat_id=group2, text="/bid 110")
+    bot_b = FakeBot()
+    bot_c = FakeBot()
+    msg_b = FakeMessage(user_id=bidder_b, chat_id=group2, text="/bid 110", message_id=911)
+    msg_c = FakeMessage(user_id=bidder_c, chat_id=group2, text="/bid 110", message_id=912)
     await asyncio.gather(
-        games.cmd_bid(msg_b, SimpleNamespace()),
-        games.cmd_bid(msg_c, SimpleNamespace()),
+        games.cmd_bid(msg_b, bot_b),
+        games.cmd_bid(msg_c, bot_c),
     )
 
     async with session_scope() as session:
         auction = await session.get(Auction, auction2)
         bid_rows = int(
             await session.scalar(
-                select(func.count(AuctionBid.id)).where(
-                    AuctionBid.auction_id == auction2
-                )
+                select(func.count(AuctionBid.id)).where(AuctionBid.auction_id == auction2)
             )
             or 0
         )
@@ -1074,11 +1163,7 @@ async def run_tests() -> None:
         )
         members = {
             int(m.user_id): int(m.points or 0)
-            for m in (
-                await session.scalars(
-                    select(Member).where(Member.group_id == group2)
-                )
-            ).all()
+            for m in (await session.scalars(select(Member).where(Member.group_id == group2))).all()
         }
         total = sum(members.values())
         check(
@@ -1102,7 +1187,12 @@ async def run_tests() -> None:
             total == 990,
             str(members),
         )
-    replies = msg_b.replies + msg_c.replies
+    replies = (
+        msg_b.replies
+        + msg_c.replies
+        + [text for _chat, text in bot_b.sent]
+        + [text for _chat, text in bot_c.sent]
+    )
     check(
         "concurrent bids report one success and one rejection",
         sum(1 for text in replies if "出价成功" in text) == 1,
@@ -1110,12 +1200,7 @@ async def run_tests() -> None:
     )
     check(
         "concurrent bid loser gets a race or minimum message",
-        sum(
-            1
-            for text in replies
-            if "抢先" in text or "出价太低" in text
-        )
-        == 1,
+        sum(1 for text in replies if "抢先" in text or "出价太低" in text) == 1,
         str(replies),
     )
 
@@ -1132,23 +1217,64 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
         group.points_enabled = True
     await set_points(group_id, bidder_id, 500)
     auction_id = await create_auction(
-        group_id, item="延拍测试", start_price=100, step=10,
-        current_price=100, current_bidder=None,
+        group_id,
+        item="延拍测试",
+        start_price=100,
+        step=10,
+        current_price=100,
+        current_bidder=None,
     )
     async with session_scope() as session:
         auction = await session.get(Auction, auction_id)
         auction.code = "T600001"
         auction.creator_id = creator_id
+        auction.message_id = 999
         auction.ends_at = utcnow() + timedelta(minutes=1)
         initial_end = auction.ends_at
-    bid = FakeMessage(user_id=bidder_id, chat_id=group_id, text="/bid T600001 120")
-    await games.cmd_bid(bid, FakeBot())
-    assert "出价成功" in bid.replies[-1]
+    bid_bot = FakeBot()
+    bid = FakeMessage(user_id=bidder_id, chat_id=group_id, text="/bid T600001 120", message_id=913)
+    await games.cmd_bid(bid, bid_bot)
+    success_texts = list(bid.replies) + [text for _chat, text in bid_bot.sent]
+    assert any("出价成功" in text for text in success_texts), success_texts
     async with session_scope() as session:
         auction = await session.get(Auction, auction_id)
         assert auction.ends_at > initial_end
         assert int(auction.current_price) == 120 and auction.current_bidder == bidder_id
-    check("bid updates auction deadline", "新的截止时间" in bid.replies[-1])
+    check(
+        "bid updates auction deadline",
+        any("新的截止时间" in text or "截止" in text for text in success_texts),
+        str(success_texts),
+    )
+    check(
+        "bid updates auction message with latest bid",
+        any("竞拍开始" in text and "120 积分" in text for _chat, _msg, text in bid_bot.edited),
+        str(bid_bot.edited),
+    )
+    markup = bid_bot.edited_markup[-1]
+    check(
+        "bid refreshes current minimum and read-only query control",
+        markup is not None and {f"bid:{auction_id}:130", f"aucquery:{auction_id}"} <= {
+            button.callback_data for row in markup.inline_keyboard for button in row
+        },
+        str(markup),
+    )
+    check(
+        "bid sends a new latest-bid auction card",
+        sum("<b>拍品最新出价</b>" in text for chat_id, text in bid_bot.sent if chat_id == group_id) == 1,
+        str(bid_bot.sent),
+    )
+
+    info_msg = FakeMessage(user_id=creator_id, chat_id=group_id, text="/bidinfo T600001")
+    info_start = len(bid_bot.sent)
+    await games.cmd_bid_info(info_msg, bid_bot)
+    info_text = "\n".join(
+        text for chat_id, text in bid_bot.sent[info_start:] if chat_id == group_id
+    )
+    check(
+        "bidinfo shows current bid status",
+        "竞拍出价情况" in info_text and "当前出价" in info_text,
+        info_text,
+    )
 
     history = FakeMessage(user_id=creator_id, chat_id=creator_id, text="/jphistory")
     await games.auction_history(history)
@@ -1173,7 +1299,6 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
         assert bidder is not None and bidder.points == 500
     print("PASS auction deadline, code bid, history and cancel")
 
-
     # 3. _claim_auction_slot 互斥
     # ------------------------------------------------------------------
     group3 = -100820003
@@ -1188,13 +1313,9 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
     )
     now = utcnow()
     async with session_scope() as session:
-        won = await games._claim_auction_slot(
-            session, auction3, 100, None, 820301, 120, now
-        )
+        won = await games._claim_auction_slot(session, auction3, 100, None, 820301, 120, now)
     async with session_scope() as session:
-        lost = await games._claim_auction_slot(
-            session, auction3, 100, None, 820302, 120, now
-        )
+        lost = await games._claim_auction_slot(session, auction3, 100, None, 820302, 120, now)
     async with session_scope() as session:
         auction = await session.get(Auction, auction3)
         check("auction slot A wins", won, str(won))
@@ -1216,9 +1337,7 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
     claimer2 = 820402
     await set_points(group4, claimer1, 0)
     await set_points(group4, claimer2, 0)
-    packet4 = await create_packet(
-        group4, sender_id=820400, total=30, count=3, expires_in=3600
-    )
+    packet4 = await create_packet(group4, sender_id=820400, total=30, count=3, expires_in=3600)
     cb1 = FakeCallback(data=f"rp:{packet4}", user_id=claimer1, chat_id=group4)
     cb2 = FakeCallback(data=f"rp:{packet4}", user_id=claimer2, chat_id=group4)
     await asyncio.gather(
@@ -1230,9 +1349,7 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
         packet = await session.get(RedPacket, packet4)
         claim_rows = int(
             await session.scalar(
-                select(func.count(RedPacketClaim.id)).where(
-                    RedPacketClaim.red_packet_id == packet4
-                )
+                select(func.count(RedPacketClaim.id)).where(RedPacketClaim.red_packet_id == packet4)
             )
             or 0
         )
@@ -1251,17 +1368,13 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
         }
         points1 = int(
             await session.scalar(
-                select(Member.points).where(
-                    Member.group_id == group4, Member.user_id == claimer1
-                )
+                select(Member.points).where(Member.group_id == group4, Member.user_id == claimer1)
             )
             or 0
         )
         points2 = int(
             await session.scalar(
-                select(Member.points).where(
-                    Member.group_id == group4, Member.user_id == claimer2
-                )
+                select(Member.points).where(Member.group_id == group4, Member.user_id == claimer2)
             )
             or 0
         )
@@ -1269,8 +1382,7 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
         remaining_count = int(packet.remaining_count or 0) if packet else -1
         check(
             "concurrent packet claims never overdraw",
-            remaining_amount >= 0
-            and points1 + points2 + remaining_amount == 30,
+            remaining_amount >= 0 and points1 + points2 + remaining_amount == 30,
             f"points={points1 + points2} remaining={remaining_amount}",
         )
         check(
@@ -1304,9 +1416,7 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
     async with session_scope() as session:
         claims = int(
             await session.scalar(
-                select(func.count(RedPacketClaim.id)).where(
-                    RedPacketClaim.red_packet_id == packet5
-                )
+                select(func.count(RedPacketClaim.id)).where(RedPacketClaim.red_packet_id == packet5)
             )
             or 0
         )
@@ -1314,8 +1424,7 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
     check("expired packet writes no claim row", claims == 0, str(claims))
     check(
         "expired packet answers expired or finished",
-        len(cb5.answers) == 1
-        and ("过期" in cb5.answers[0] or "领完" in cb5.answers[0]),
+        len(cb5.answers) == 1 and ("过期" in cb5.answers[0] or "领完" in cb5.answers[0]),
         str(cb5.answers),
     )
 
@@ -1324,9 +1433,7 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
     # ------------------------------------------------------------------
     group6 = -100820006
     await create_group(group6, "Packet slot CAS")
-    packet6 = await create_packet(
-        group6, sender_id=820600, total=30, count=3, expires_in=3600
-    )
+    packet6 = await create_packet(group6, sender_id=820600, total=30, count=3, expires_in=3600)
     now = utcnow()
     async with session_scope() as session:
         won = await games._claim_packet_slot(session, packet6, 3, 30, 10, now)
@@ -1350,9 +1457,7 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
     group7 = -100820007
     await create_group(group7, "Duplicate claim")
     await set_points(group7, 820701, 0)
-    packet7 = await create_packet(
-        group7, sender_id=820700, total=30, count=3, expires_in=3600
-    )
+    packet7 = await create_packet(group7, sender_id=820700, total=30, count=3, expires_in=3600)
     first_cb = FakeCallback(data=f"rp:{packet7}", user_id=820701, chat_id=group7)
     await games.on_claim_packet(first_cb)
     balance_after_first = await get_points(group7, 820701)
@@ -1390,9 +1495,7 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
     claimer8 = 820801
     await set_points(group8, sender8, 0)
     await set_points(group8, claimer8, 0)
-    packet8 = await create_packet(
-        group8, sender_id=sender8, total=42, count=2, expires_in=-60
-    )
+    packet8 = await create_packet(group8, sender_id=sender8, total=42, count=2, expires_in=-60)
     cb8 = FakeCallback(data=f"rp:{packet8}", user_id=claimer8, chat_id=group8)
     await games.on_claim_packet(cb8)
 
@@ -1400,9 +1503,7 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
         packet = await session.get(RedPacket, packet8)
         claims = int(
             await session.scalar(
-                select(func.count(RedPacketClaim.id)).where(
-                    RedPacketClaim.red_packet_id == packet8
-                )
+                select(func.count(RedPacketClaim.id)).where(RedPacketClaim.red_packet_id == packet8)
             )
             or 0
         )
@@ -1455,9 +1556,7 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
     async def add_one():
         async def run():
             async with session_scope() as session:
-                return await repo.adjust_points(
-                    session, group9, user9, 1, "并发+1"
-                )
+                return await repo.adjust_points(session, group9, user9, 1, "并发+1")
 
         return await with_retry(run)
 
@@ -1465,9 +1564,7 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
     async with session_scope() as session:
         points = int(
             await session.scalar(
-                select(Member.points).where(
-                    Member.group_id == group9, Member.user_id == user9
-                )
+                select(Member.points).where(Member.group_id == group9, Member.user_id == user9)
             )
             or 0
         )
@@ -1514,9 +1611,7 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
     async def deduct_ten():
         async def run():
             async with session_scope() as session:
-                return await repo.adjust_points(
-                    session, group10, user10, -10, "并发-10"
-                )
+                return await repo.adjust_points(session, group10, user10, -10, "并发-10")
 
         return await with_retry(run)
 
@@ -1547,9 +1642,7 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
     async def change_points(delta: int, reason: str):
         async def run():
             async with session_scope() as session:
-                return await repo.adjust_points(
-                    session, group11, user11, delta, reason
-                )
+                return await repo.adjust_points(session, group11, user11, delta, reason)
 
         return await with_retry(run)
 
@@ -1565,10 +1658,15 @@ async def test_auction_bid_updates_deadline_and_history() -> None:
 
 
 async def main() -> None:
-    await init_db()
     try:
+        await init_db()
         await run_tests()
     finally:
+        await asyncio.gather(*tuple(games._promotion_tasks))
+        tasks = tuple(helpers._background_tasks | games._lottery_expiry_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         await dispose_db()
     if failures:
         print("FAILURES:", failures)
@@ -1577,7 +1675,5 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
+    with RUNTIME:
         asyncio.run(main())
-    finally:
-        shutil.rmtree(TMP, ignore_errors=True)

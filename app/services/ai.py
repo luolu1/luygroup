@@ -1,8 +1,10 @@
 """OpenAI-compatible AI client with priority/fallback providers."""
+
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import re
@@ -17,9 +19,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_config
 from ..models import AIProvider
+from . import ai_http
 from .ai_learning import learning_store
 
 log = logging.getLogger(__name__)
+
+# Reasoning models exhaust a small ``max_tokens`` on ``reasoning_content``
+# before emitting ``content``, so one retry uses this larger budget.
+_TRUNCATED_RETRY_TOKENS = 2000
 
 MODERATION_SYSTEM = """你是 Telegram 群组的内容安全审核员。判断用户消息是否为广告、引流或违规推广。
 只输出一个 JSON 对象，不要输出其它内容，格式：
@@ -123,10 +130,16 @@ class AIResult:
     ok: bool
     text: str = ""
     provider: str = ""
+    model: str = ""
     latency_ms: int = 0
     error: str = ""
     attempts: int = 0
     cached: bool = False
+    # Provider stopped on the token limit; the caller retries with a larger
+    # budget, since reasoning models spend it all before writing ``content``.
+    truncated: bool = False
+    system_attempts: int = 0
+    timed_out: bool = False
 
 
 def normalize_base_url(base_url: str) -> str:
@@ -143,14 +156,33 @@ def normalize_base_url(base_url: str) -> str:
         base = "https:" + base
     if "://" not in base:
         host = (urlparse("//" + base).hostname or "").lower()
-        private = host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"} or host.startswith(
-            ("192.168.", "10.")
-        ) or any(host.startswith(f"172.{index}.") for index in range(16, 32))
+        private = (
+            host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+            or host.startswith(("192.168.", "10."))
+            or any(host.startswith(f"172.{index}.") for index in range(16, 32))
+        )
         base = ("http://" if private else "https://") + base
     return base.rstrip("/")
 
 
-def validated_base_url(base_url: str) -> str:
+def _is_internal_host(hostname: str) -> bool:
+    host = hostname.strip("[]").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_unspecified
+    )
+
+
+def validated_base_url(base_url: str, *, allow_internal: bool = True) -> str:
     """Return a normalized http(s) URL or raise a Chinese ValueError."""
     base = normalize_base_url(base_url)
     if not base:
@@ -158,6 +190,8 @@ def validated_base_url(base_url: str) -> str:
     parsed = urlparse(base)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("接口地址格式不正确，请以 http:// 或 https:// 开头")
+    if not allow_internal and _is_internal_host(parsed.hostname or ""):
+        raise ValueError("只有平台管理员可以使用内网或本机地址")
     return base
 
 
@@ -207,6 +241,7 @@ async def fetch_models(
     *,
     timeout: float | None = None,
     kind: str = "text",
+    max_attempts: int = 3,
 ) -> list[str]:
     """Fetch text or vision-capable models through the OpenAI-compatible /models API."""
     endpoint = _models_endpoint(validated_base_url(base_url))
@@ -216,14 +251,14 @@ async def fetch_models(
     request_timeout = timeout or get_config().ai.timeout
     last_exc: Exception | None = None
     response: httpx.Response | None = None
-    for attempt in range(3):
+    client = ai_http.get_client()
+    for attempt in range(max_attempts):
         try:
-            async with httpx.AsyncClient(timeout=request_timeout) as client:
-                response = await client.get(endpoint, headers=headers)
+            response = await client.get(endpoint, headers=headers, timeout=request_timeout)
             break
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as exc:
             last_exc = exc
-            if attempt < 2:
+            if attempt + 1 < max_attempts:
                 await asyncio.sleep(0.6 * (attempt + 1))
                 continue
         except (httpx.HTTPError, httpx.InvalidURL) as exc:
@@ -287,33 +322,46 @@ async def fetch_models(
             raise ValueError("供应商模型列表中没有识别到支持图像的模型，请手动填写模型名")
         return sorted(vision_models)[:500]
     blocked = ("embedding", "whisper", "tts", "dall-e", "moderation", "rerank")
-    cleaned = sorted(
-        name for name in models if not any(token in name.lower() for token in blocked)
-    )
+    cleaned = sorted(name for name in models if not any(token in name.lower() for token in blocked))
     return cleaned[:500] or sorted(models)[:500]
 
 
 def _looks_like_vision_model(name: str, metadata: dict[str, Any]) -> bool:
-    capabilities = metadata.get("capabilities") or metadata.get("modalities") or metadata.get("input_modalities")
+    capabilities = (
+        metadata.get("capabilities")
+        or metadata.get("modalities")
+        or metadata.get("input_modalities")
+    )
     if isinstance(capabilities, dict):
         capabilities = list(capabilities)
-    if isinstance(capabilities, list) and any("vision" in str(item).lower() or "image" in str(item).lower() for item in capabilities):
+    if isinstance(capabilities, list) and any(
+        "vision" in str(item).lower() or "image" in str(item).lower() for item in capabilities
+    ):
         return True
     text = " ".join(
         str(metadata.get(key) or "")
         for key in ("id", "name", "model", "description", "architecture")
     ).lower()
-    return any(token in text for token in ("vision", "vl", "multimodal", "qwen2.5-vl", "gpt-4o", "gemini", "claude-3"))
+    return any(
+        token in text
+        for token in ("vision", "vl", "multimodal", "qwen2.5-vl", "gpt-4o", "gemini", "claude-3")
+    )
 
 
 async def enabled_providers(
-    session: AsyncSession, owner_user_id: int | None = None
+    session: AsyncSession,
+    owner_user_id: int | None = None,
+    *,
+    provider_id: int | None = None,
 ) -> list[AIProvider]:
     """Return providers available to a console user.
 
     Built-in/platform providers (``owner_user_id IS NULL``) are shared.  A
     user's own providers are only added when their id is supplied, which keeps
     API keys and custom endpoints isolated between console users.
+
+    ``provider_id`` pins one provider ahead of the rest so a group that names a
+    specific interface always uses it first; the others stay as fallback.
     """
     condition = AIProvider.owner_user_id.is_(None)
     if owner_user_id is not None:
@@ -323,7 +371,13 @@ async def enabled_providers(
         .where(AIProvider.enabled.is_(True), condition)
         .order_by(AIProvider.priority.asc(), AIProvider.id.asc())
     )
-    return [p for p in result.all() if p.base_url and p.model]
+    providers = [p for p in result.all() if p.base_url and p.model]
+    if provider_id is not None:
+        wanted = int(provider_id)
+        pinned = [p for p in providers if p.id == wanted]
+        if pinned:
+            return pinned
+    return providers
 
 
 async def _chat_once(
@@ -357,34 +411,50 @@ async def _chat_once(
                 ok=False,
                 error=f"{provider.name}: HTTP {response.status_code} {response.text[:200]}",
                 provider=provider.name,
+                model=model,
                 latency_ms=latency,
             )
         data = response.json()
-        text = (
-            data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        text = message.get("content", "")
         if isinstance(text, list):
             text = "".join(part.get("text", "") for part in text if isinstance(part, dict))
         if not text:
+            truncated = choice.get("finish_reason") == "length"
+            if truncated:
+                return AIResult(
+                    ok=False,
+                    error=f"{provider.name}: 输出被长度限制截断",
+                    provider=provider.name,
+                    model=model,
+                    latency_ms=latency,
+                    truncated=True,
+                )
             return AIResult(
                 ok=False,
                 error=f"{provider.name}: 空响应",
                 provider=provider.name,
+                model=model,
                 latency_ms=latency,
             )
         return AIResult(
             ok=True,
             text=text.strip(),
             provider=provider.name,
+            model=model,
             latency_ms=latency,
         )
     except Exception as exc:
+        latency = int((time.monotonic() - started) * 1000)
+        timed_out = isinstance(exc, httpx.TimeoutException)
         return AIResult(
             ok=False,
             error=f"{provider.name}: {type(exc).__name__}: {exc}",
             provider=provider.name,
+            model=model,
+            latency_ms=latency,
+            timed_out=timed_out,
         )
 
 
@@ -397,8 +467,9 @@ async def chat(
     json_mode: bool = False,
     owner_user_id: int | None = None,
     vision: bool = False,
+    provider_id: int | None = None,
 ) -> AIResult:
-    providers = await enabled_providers(session, owner_user_id)
+    providers = await enabled_providers(session, owner_user_id, provider_id=provider_id)
     if vision:
         providers = [p for p in providers if p.vision_model]
         if not providers:
@@ -408,27 +479,83 @@ async def chat(
 
     timeout = get_config().ai.timeout
     last_error = ""
+    last_provider = ""
     attempts = 0
+    system_attempts = 0
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        for provider in providers:
-            attempts += 1
-            model = provider.vision_model if vision else provider.model
-            result = await _chat_once(
-                provider,
-                client,
-                messages,
-                model=model,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                json_mode=json_mode,
+    client = ai_http.get_client()
+    for provider in providers:
+        configured_model = provider.vision_model if vision else provider.model
+
+        async def call_model(model: str, provider: AIProvider = provider) -> AIResult:
+            nonlocal attempts, system_attempts
+            retries = 0
+            current_max_tokens = max_tokens
+            while True:
+                attempts += 1
+                if provider.owner_user_id is None:
+                    system_attempts += 1
+                model_result = await _chat_once(
+                    provider,
+                    client,
+                    messages,
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=current_max_tokens,
+                    json_mode=json_mode,
+                )
+                if not model_result.ok and model_result.truncated:
+                    attempts += 1
+                    if provider.owner_user_id is None:
+                        system_attempts += 1
+                    model_result = await _chat_once(
+                        provider,
+                        client,
+                        messages,
+                        model=model,
+                        temperature=temperature,
+                        max_tokens=_TRUNCATED_RETRY_TOKENS,
+                        json_mode=json_mode,
+                    )
+                if model_result.ok or not model_result.timed_out or retries >= 3:
+                    model_result.attempts = attempts
+                    model_result.system_attempts = system_attempts
+                    return model_result
+                retries += 1
+                current_max_tokens = max_tokens
+
+        result = await call_model(configured_model)
+        if result.ok:
+            return result
+        last_error = result.error
+        last_provider = result.provider or last_provider
+        if not result.timed_out:
+            continue
+        try:
+            fetched_models = await fetch_models(
+                provider.base_url,
+                provider.api_key,
+                timeout=min(timeout, 10),
+                kind="vision" if vision else "text",
+                max_attempts=1,
             )
+        except ValueError:
+            continue
+        alternatives = [model for model in fetched_models if model != configured_model][:3]
+        for model in alternatives:
+            result = await call_model(model)
             if result.ok:
-                result.attempts = attempts
                 return result
             last_error = result.error
+            last_provider = result.provider or last_provider
 
-    return AIResult(ok=False, error=last_error or "AI 调用失败", attempts=attempts)
+    return AIResult(
+        ok=False,
+        error=last_error or "AI 调用失败",
+        provider=last_provider,
+        attempts=attempts,
+        system_attempts=system_attempts,
+    )
 
 
 def _strip_fences(text: str) -> str:
@@ -466,16 +593,26 @@ async def check_ad(
     *,
     owner_user_id: int | None = None,
     image_data_url: str | None = None,
+    provider_id: int | None = None,
 ) -> tuple[bool, str, AIResult]:
-    cached = learning_store.get("ad", group_id, text)
+    if image_data_url:
+        image_digest = hashlib.sha256(image_data_url.encode("utf-8")).hexdigest()[:16]
+        cache_text = f"[image:{image_digest}]" + (f" {text[:200]}" if text else "")
+    else:
+        cache_text = text
+    cached = learning_store.get("ad", group_id, cache_text)
     if cached is not None:
         is_ad = bool(cached.get("is_ad"))
         reason = str(cached.get("reason") or "命中本地 AI 学习数据")
-        return is_ad, reason, AIResult(
-            ok=True,
-            text=reason,
-            provider="learning-cache",
-            cached=True,
+        return (
+            is_ad,
+            reason,
+            AIResult(
+                ok=True,
+                text=reason,
+                provider="learning-cache",
+                cached=True,
+            ),
         )
 
     if image_data_url:
@@ -493,22 +630,55 @@ async def check_ad(
             session,
             messages,
             temperature=0.0,
-            max_tokens=220,
+            max_tokens=600,
             json_mode=True,
             owner_user_id=owner_user_id,
             vision=True,
+            provider_id=provider_id,
         )
         if result.ok:
             is_ad, reason, _confidence = parse_moderation(result.text)
             await learning_store.put(
                 "ad",
                 group_id,
-                text or "[image]",
+                cache_text,
                 reason or ("广告" if is_ad else "正常消息"),
                 meta={"is_ad": is_ad, "reason": reason, "provider": result.provider},
             )
             return is_ad, reason, result
+        if not text:
+            return False, "", result
+        fallback = await _text_moderation(
+            session,
+            text,
+            group_title,
+            group_id,
+            owner_user_id=owner_user_id,
+            provider_id=provider_id,
+        )
+        if not fallback[2].ok:
+            return False, "", result
+        return fallback
 
+    return await _text_moderation(
+        session,
+        text,
+        group_title,
+        group_id,
+        owner_user_id=owner_user_id,
+        provider_id=provider_id,
+    )
+
+
+async def _text_moderation(
+    session: AsyncSession,
+    text: str,
+    group_title: str,
+    group_id: int,
+    *,
+    owner_user_id: int | None,
+    provider_id: int | None,
+) -> tuple[bool, str, AIResult]:
     messages = [
         {"role": "system", "content": MODERATION_SYSTEM},
         {
@@ -520,17 +690,19 @@ async def check_ad(
         session,
         messages,
         temperature=0.0,
-        max_tokens=220,
+        max_tokens=600,
         json_mode=True,
         owner_user_id=owner_user_id,
+        provider_id=provider_id,
     )
     if not result.ok:
         result = await chat(
             session,
             messages,
             temperature=0.0,
-            max_tokens=220,
+            max_tokens=600,
             owner_user_id=owner_user_id,
+            provider_id=provider_id,
         )
     if not result.ok:
         return False, "", result
@@ -538,7 +710,7 @@ async def check_ad(
     await learning_store.put(
         "ad",
         group_id,
-        text,
+        text or "[image]",
         reason or ("广告" if is_ad else "正常消息"),
         meta={
             "is_ad": is_ad,
@@ -558,13 +730,14 @@ async def assistant_reply(
     history: list[dict[str, str]] | None = None,
     group_id: int = 0,
     owner_user_id: int | None = None,
+    provider_id: int | None = None,
 ) -> AIResult:
-    context_key = hashlib.sha1(
-        f"{group_title}\n{rules[:1500]}".encode()
-    ).hexdigest()[:16]
-    cached = learning_store.get(
-        "assistant", group_id, question, extra=context_key
-    ) if len(question.strip()) >= 4 else None
+    context_key = hashlib.sha1(f"{group_title}\n{rules[:1500]}".encode()).hexdigest()[:16]
+    cached = (
+        learning_store.get("assistant", group_id, question, extra=context_key)
+        if len(question.strip()) >= 4
+        else None
+    )
     if cached is not None and cached.get("answer"):
         return AIResult(
             ok=True,
@@ -576,7 +749,9 @@ async def assistant_reply(
     context = f"当前群组：{group_title or '未命名'}\n"
     if rules:
         context += f"群规：{rules[:1500]}\n"
-    messages: list[dict[str, str]] = [{"role": "system", "content": ASSISTANT_SYSTEM + "\n" + context}]
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": ASSISTANT_SYSTEM + "\n" + context}
+    ]
     for item in (history or [])[-get_config().ai.max_context_messages :]:
         role = item.get("role")
         content = item.get("content", "")
@@ -589,6 +764,7 @@ async def assistant_reply(
         temperature=0.5,
         max_tokens=700,
         owner_user_id=owner_user_id,
+        provider_id=provider_id,
     )
     if result.ok:
         await learning_store.put(
@@ -610,6 +786,7 @@ async def chat_reply(
     history: list[dict[str, str]] | None = None,
     group_id: int = 0,
     owner_user_id: int | None = None,
+    provider_id: int | None = None,
 ) -> AIResult:
     cached = learning_store.get("chat", group_id, text) if len(text.strip()) >= 4 else None
     if cached is not None and cached.get("answer"):
@@ -635,6 +812,7 @@ async def chat_reply(
         temperature=0.7,
         max_tokens=300,
         owner_user_id=owner_user_id,
+        provider_id=provider_id,
     )
     if result.ok:
         await learning_store.put(
@@ -662,12 +840,16 @@ async def test_provider(provider: AIProvider) -> AIResult:
         "temperature": 0,
     }
     started = time.monotonic()
+    client = ai_http.get_client()
     try:
-        async with httpx.AsyncClient(timeout=get_config().ai.timeout) as client:
-            response = await client.post(endpoint, headers=headers, json=payload)
+        response = await client.post(endpoint, headers=headers, json=payload, timeout=get_config().ai.timeout)
         latency = int((time.monotonic() - started) * 1000)
         if response.status_code >= 400:
-            return AIResult(ok=False, error=f"HTTP {response.status_code}: {response.text[:300]}", latency_ms=latency)
+            return AIResult(
+                ok=False,
+                error=f"HTTP {response.status_code}: {response.text[:300]}",
+                latency_ms=latency,
+            )
         data = response.json()
         text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         return AIResult(ok=True, text=str(text)[:200], provider=provider.name, latency_ms=latency)

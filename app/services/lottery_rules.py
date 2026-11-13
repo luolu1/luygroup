@@ -6,6 +6,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Lottery, LotteryEntry, LotteryQualification, Member, utcnow
+from ..entitlements import group_feature_allowed
 from . import repo
 
 
@@ -36,6 +37,8 @@ async def record_keyword_matches(
 ) -> list[str]:
     lotteries = await _matching_keyword_lotteries(session, group_id, text)
     if not lotteries:
+        return []
+    if not await group_feature_allowed(session, group_id, "games"):
         return []
     auto_entered: list[str] = []
     for lottery in lotteries:

@@ -43,7 +43,7 @@
     "daily_bonus": 5
   },
   "ai": {
-    "timeout": 25,
+    "timeout": 60,
     "max_context_messages": 8,
     "learning_dir": "data/ai_learning",
     "providers": [

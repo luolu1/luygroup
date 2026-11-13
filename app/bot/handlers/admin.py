@@ -1,4 +1,5 @@
 """Administrative commands."""
+
 from __future__ import annotations
 
 import json
@@ -52,7 +53,7 @@ def _duration_minutes(raw: str) -> int | None:
     amount = int(match.group(1))
     unit = (match.group(2) or "m").lower()
     if unit in {"s", "秒"}:
-        minutes = max(1, (amount + 59) // 60)
+        minutes = 0 if amount == 0 else max(1, (amount + 59) // 60)
     elif unit in {"h", "小时", "时"}:
         minutes = amount * 60
     elif unit in {"d", "天", "日"}:
@@ -61,7 +62,7 @@ def _duration_minutes(raw: str) -> int | None:
         minutes = amount * 10080
     else:
         minutes = amount
-    return max(1, min(minutes, 100000))
+    return max(0, min(minutes, 100000))
 
 
 def _admin_help() -> str:
@@ -134,9 +135,7 @@ async def cmd_ban(message: Message, bot: Bot) -> None:
         else:
             result += "\n⚠️ 机器人缺少删除消息权限，已仅执行封禁。"
         if message.reply_to_message is not None:
-            await helpers.delete_message_safe(
-                bot, group.id, message.reply_to_message.message_id
-            )
+            await helpers.delete_message_safe(bot, group.id, message.reply_to_message.message_id)
         await helpers.send_group_log(
             bot, group, f"🔨 {target.label} 被 {actor} 封禁\n原因：{reason or '-'}"
         )
@@ -186,12 +185,7 @@ async def cmd_iunban(message: Message, bot: Bot) -> None:
         for target_group in groups[:200]:
             member = await repo.get_member(session, target_group.id, target.user_id)
             restricted = bool(
-                member
-                and (
-                    member.is_banned
-                    or member.is_muted
-                    or member.mute_on_rejoin
-                )
+                member and (member.is_banned or member.is_muted or member.mute_on_rejoin)
             )
             if not restricted:
                 continue
@@ -209,9 +203,7 @@ async def cmd_iunban(message: Message, bot: Bot) -> None:
                 member.muted_until = None
                 member.mute_on_rejoin = False
             try:
-                await helpers.lift_restrictions(
-                    bot, int(target_group.id), int(target.user_id)
-                )
+                await helpers.lift_restrictions(bot, int(target_group.id), int(target.user_id))
             except TelegramAPIError:
                 pass
             await repo.add_log(
@@ -241,9 +233,7 @@ async def cmd_iunban(message: Message, bot: Bot) -> None:
         lines.append("\n⚠️ 以下群组失败（机器人权限不足）：")
         lines.extend(f"· {escape(name)}" for name in failed[:10])
     if blacklisted is not None:
-        lines.append(
-            "\n⚠️ 该用户仍在全局黑名单中，黑名单策略可能会再次限制其入群。"
-        )
+        lines.append("\n⚠️ 该用户仍在全局黑名单中，黑名单策略可能会再次限制其入群。")
     await message.reply("\n".join(lines))
 
 
@@ -271,7 +261,9 @@ async def cmd_kick(message: Message, bot: Bot) -> None:
         except TelegramAPIError as exc:
             await _reply_error(message, f"移出失败：{exc}")
             return
-        await helpers.send_group_log(bot, group, f"👢 {target.label} 被 {actor} 移出\n原因：{reason or '-'}")
+        await helpers.send_group_log(
+            bot, group, f"👢 {target.label} 被 {actor} 移出\n原因：{reason or '-'}"
+        )
         await message.reply(result)
 
 
@@ -294,7 +286,7 @@ async def cmd_mute(message: Message, bot: Bot) -> None:
         if not allowed:
             await _reply_error(message, why)
             return
-        minutes = group.mute_minutes or 60
+        minutes = group.mute_minutes if group.mute_minutes is not None else 60
         if message.reply_to_message:
             reason_parts = args
             if args:
@@ -318,7 +310,10 @@ async def cmd_mute(message: Message, bot: Bot) -> None:
             await _reply_error(message, f"禁言失败：{exc}")
             return
         await helpers.send_group_log(
-            bot, group, f"🔇 {target.label} 被 {actor} 禁言 {minutes} 分钟\n原因：{reason or '-'}"
+            bot,
+            group,
+            f"🔇 {target.label} 被 {actor} 禁言 {'永久' if minutes == 0 else f'{minutes} 分钟'}\n"
+            f"原因：{reason or '-'}",
         )
         await message.reply(result)
 
@@ -425,7 +420,14 @@ async def cmd_delete(message: Message, bot: Bot) -> None:
             return
         deleted = await helpers.delete_message_safe(bot, group.id, reply.message_id)
         if deleted:
-            await repo.add_log(session, group.id, actor, "delete", reply.from_user.id if reply.from_user else None, "删除消息")
+            await repo.add_log(
+                session,
+                group.id,
+                actor,
+                "delete",
+                reply.from_user.id if reply.from_user else None,
+                "删除消息",
+            )
             await repo.bump_stat(session, group.id, "deletes")
             try:
                 await message.delete()
@@ -463,7 +465,11 @@ async def cmd_whitelist(message: Message, bot: Bot) -> None:
             Whitelist(group_id=group.id, user_id=target.user_id, note=note[:255], added_by=actor)
         )
         await repo.ensure_member(
-            session, group.id, target.user_id, username=target.username, first_name=target.first_name
+            session,
+            group.id,
+            target.user_id,
+            username=target.username,
+            first_name=target.first_name,
         )
         await repo.add_log(session, group.id, actor, "whitelist", target.user_id, note)
         await message.reply(f"✅ 已将 {target.mention} 加入免检白名单。")
@@ -572,12 +578,8 @@ async def cmd_addreply(message: Message, bot: Bot) -> None:
                 created_by=actor,
             )
         )
-        await repo.add_log(
-            session, group.id, actor, "addkeyword", None, f"{pattern} -> reply"
-        )
-        await message.reply(
-            f"✅ 已添加自动回复关键词：<code>{escape(pattern)}</code>"
-        )
+        await repo.add_log(session, group.id, actor, "addkeyword", None, f"{pattern} -> reply")
+        await message.reply(f"✅ 已添加自动回复关键词：<code>{escape(pattern)}</code>")
 
 
 @router.message(Command("keywords", "kw"))
@@ -588,7 +590,10 @@ async def cmd_keywords(message: Message, bot: Bot) -> None:
             return
         group, _actor = ctx
         result = await session.scalars(
-            select(Keyword).where(Keyword.group_id == group.id).order_by(Keyword.id.desc()).limit(60)
+            select(Keyword)
+            .where(Keyword.group_id == group.id)
+            .order_by(Keyword.id.desc())
+            .limit(60)
         )
         keywords = list(result.all())
     if not keywords:
@@ -651,7 +656,7 @@ async def cmd_settings(message: Message, bot: Bot) -> None:
         f"跨群封禁：{'开' if group.crossban_enabled else '关'}（{group.crossban_mode}）\n"
         f"通报：{'开' if group.report_enabled else '关'} · 接收通报：{'开' if group.report_receive else '关'}\n"
         f"积分：{'开' if group.points_enabled else '关'} · 每条 +{group.points_per_message} · 冷却 {group.points_cooldown}s\n"
-        f"AI 日额度：{group.ai_daily_quota} 请求 / {group.sample_daily_quota} 样本\n\n"
+        f"AI 日额度：文本 {group.ai_daily_quota} / 图片 {group.sample_daily_quota}\n\n"
         "完整设置请使用 /console 打开 Web 控制台。"
     )
     await message.reply(text)
@@ -701,7 +706,12 @@ async def cmd_setflood(message: Message, bot: Bot) -> None:
             return
         group, actor = ctx
         args = helpers.parse_args(message.text)
-        if len(args) < 3 or not args[0].isdigit() or not args[1].isdigit() or args[2] not in WARN_ACTIONS:
+        if (
+            len(args) < 3
+            or not args[0].isdigit()
+            or not args[1].isdigit()
+            or args[2] not in WARN_ACTIONS
+        ):
             await _reply_error(message, "用法：/setflood 条数 秒数 mute|ban_kick")
             return
         group.flood_limit = max(1, int(args[0]))
@@ -724,9 +734,11 @@ async def cmd_setmute(message: Message, bot: Bot) -> None:
         if not args or not args[0].isdigit():
             await _reply_error(message, "用法：/setmute 分钟")
             return
-        group.mute_minutes = max(1, min(int(args[0]), 100000))
+        group.mute_minutes = max(0, min(int(args[0]), 100000))
         await repo.add_log(session, group.id, actor, "setmute", None, str(group.mute_minutes))
-    await message.reply(f"✅ 默认禁言时长：{group.mute_minutes} 分钟")
+    await message.reply(
+        f"✅ 默认禁言时长：{'永久' if group.mute_minutes == 0 else f'{group.mute_minutes} 分钟'}"
+    )
 
 
 @router.message(Command("setwelcome"))
@@ -741,9 +753,7 @@ async def cmd_setwelcome(message: Message, bot: Bot) -> None:
         if not text and message.reply_to_message:
             text = message.reply_to_message.text or ""
         if not text:
-            await _reply_error(
-                message, "用法：/setwelcome 欢迎语\n支持占位符 {name} {group} {id}"
-            )
+            await _reply_error(message, "用法：/setwelcome 欢迎语\n支持占位符 {name} {group} {id}")
             return
         group.welcome_text = text[:4000]
         await repo.add_log(session, group.id, actor, "setwelcome", None, text[:200])
@@ -778,7 +788,11 @@ async def cmd_setai(message: Message, bot: Bot) -> None:
             await _reply_error(message, "用法：/setai ad|assistant|chat on|off")
             return
         kind, value = args[0].lower(), args[1].lower() == "on"
-        mapping = {"ad": "ai_ad_enabled", "assistant": "ai_assistant_enabled", "chat": "ai_chat_enabled"}
+        mapping = {
+            "ad": "ai_ad_enabled",
+            "assistant": "ai_assistant_enabled",
+            "chat": "ai_chat_enabled",
+        }
         if kind not in mapping:
             await _reply_error(message, "类型必须是 ad、assistant 或 chat。")
             return
@@ -802,7 +816,7 @@ async def cmd_setquota(message: Message, bot: Bot) -> None:
         group.sample_daily_quota = max(0, int(args[1]))
         await repo.add_log(session, group.id, actor, "setquota", None, " ".join(args))
     await message.reply(
-        f"✅ 每日额度：AI 请求 {group.ai_daily_quota} · 样本 {group.sample_daily_quota}"
+        f"✅ 每日额度：文本 {group.ai_daily_quota} · 图片 {group.sample_daily_quota}"
     )
 
 
@@ -832,7 +846,11 @@ async def cmd_setcrossban(message: Message, bot: Bot) -> None:
     mode = group.crossban_mode
     await message.reply(
         f"✅ 跨群封禁已{'开启' if group.crossban_enabled else '关闭'}"
-        + (f"（{'所有已开启跨群封禁的群组' if mode == 'own' else '共享联动群'}）" if group.crossban_enabled else "")
+        + (
+            f"（{'所有已开启跨群封禁的群组' if mode == 'own' else '共享联动群'}）"
+            if group.crossban_enabled
+            else ""
+        )
     )
 
 
@@ -904,7 +922,9 @@ async def cmd_channels(message: Message, bot: Bot) -> None:
         return
     lines = ["📢 <b>必关频道</b>"]
     for ch in channels:
-        lines.append(f"· {escape(ch.title or str(ch.channel_id))} · {ch.invite_link or ('@' + ch.username if ch.username else '')}")
+        lines.append(
+            f"· {escape(ch.title or str(ch.channel_id))} · {ch.invite_link or ('@' + ch.username if ch.username else '')}"
+        )
     lines.append("\n删除：/delchannel @频道")
     await message.reply("\n".join(lines))
 
@@ -1019,9 +1039,7 @@ async def cmd_assistant(message: Message, bot: Bot) -> None:
             return
         sub = args[0].lower()
         if sub == "list":
-            admins = (
-                await session.scalars(select(Admin).where(Admin.group_id == group.id))
-            ).all()
+            admins = (await session.scalars(select(Admin).where(Admin.group_id == group.id))).all()
             if not admins:
                 await message.reply("本群暂未配置协助管理员。")
                 return
@@ -1059,10 +1077,10 @@ async def cmd_assistant(message: Message, bot: Bot) -> None:
                         added_by=actor,
                     )
                 )
-            await repo.add_log(session, group.id, actor, "assistant_add", target.user_id, perms_json)
-            await message.reply(
-                f"✅ 已添加协助管理员：{target.mention}\n权限：{','.join(perms)}"
+            await repo.add_log(
+                session, group.id, actor, "assistant_add", target.user_id, perms_json
             )
+            await message.reply(f"✅ 已添加协助管理员：{target.mention}\n权限：{','.join(perms)}")
         elif sub == "del":
             if not existing:
                 await message.reply("该用户不是协助管理员。")
@@ -1107,7 +1125,9 @@ async def cmd_crosslink(message: Message, bot: Bot) -> None:
             for link in links:
                 other = link.linked_group_id if link.group_id == group.id else link.group_id
                 target_group = await repo.get_group(session, other)
-                lines.append(f"· <code>{other}</code> {escape(target_group.title if target_group else '')}")
+                lines.append(
+                    f"· <code>{other}</code> {escape(target_group.title if target_group else '')}"
+                )
             await message.reply("\n".join(lines))
             return
         if len(args) < 2 or not args[1].lstrip("-").isdigit():
@@ -1123,7 +1143,11 @@ async def cmd_crosslink(message: Message, bot: Bot) -> None:
                 await _reply_error(message, "目标必须是 Telegram 群组，不能是私聊或频道。")
                 return
             await repo.ensure_group(
-                session, other_id, title=chat.title or "", username=chat.username or "", chat_type=chat.type
+                session,
+                other_id,
+                title=chat.title or "",
+                username=chat.username or "",
+                chat_type=chat.type,
             )
         except TelegramAPIError as exc:
             await _reply_error(message, f"无法获取群组：{exc}")
@@ -1136,7 +1160,9 @@ async def cmd_crosslink(message: Message, bot: Bot) -> None:
                 )
             )
             if not exists:
-                session.add(CrossLink(group_id=group.id, linked_group_id=other_id, created_by=actor))
+                session.add(
+                    CrossLink(group_id=group.id, linked_group_id=other_id, created_by=actor)
+                )
             await repo.add_log(session, group.id, actor, "crosslink_add", other_id, "")
             await message.reply(f"✅ 已添加共享联动群 <code>{other_id}</code>。")
         elif sub == "del":
@@ -1144,7 +1170,10 @@ async def cmd_crosslink(message: Message, bot: Bot) -> None:
                 await session.scalars(
                     select(CrossLink).where(
                         ((CrossLink.group_id == group.id) & (CrossLink.linked_group_id == other_id))
-                        | ((CrossLink.group_id == other_id) & (CrossLink.linked_group_id == group.id))
+                        | (
+                            (CrossLink.group_id == other_id)
+                            & (CrossLink.linked_group_id == group.id)
+                        )
                     )
                 )
             ).all()
@@ -1198,7 +1227,11 @@ async def cmd_reportlink(message: Message, bot: Bot) -> None:
                     await _reply_error(message, "目标必须是 Telegram 群组，不能是私聊或频道。")
                     return
                 target_group = await repo.ensure_group(
-                    session, other_id, title=chat.title or "", username=chat.username or "", chat_type=chat.type
+                    session,
+                    other_id,
+                    title=chat.title or "",
+                    username=chat.username or "",
+                    chat_type=chat.type,
                 )
                 target_group.report_receive = True
             except TelegramAPIError as exc:
@@ -1254,8 +1287,7 @@ async def cmd_gblacklist(message: Message, bot: Bot) -> None:
             for entry in entries:
                 scope = "平台" if entry.owner_user_id is None else f"用户 {entry.owner_user_id}"
                 lines.append(
-                    f"· <code>{entry.user_id}</code> [{scope}] · "
-                    f"{escape(entry.reason or '无原因')}"
+                    f"· <code>{entry.user_id}</code> [{scope}] · {escape(entry.reason or '无原因')}"
                 )
             await message.reply("\n".join(lines))
             return
@@ -1282,7 +1314,9 @@ async def cmd_gblacklist(message: Message, bot: Bot) -> None:
                         added_by=actor,
                     )
                 )
-            await repo.add_log(session, message.chat.id, actor, "gblacklist_add", target.user_id, reason)
+            await repo.add_log(
+                session, message.chat.id, actor, "gblacklist_add", target.user_id, reason
+            )
             await message.reply(f"✅ 已加入全局黑名单：{target.mention}")
         elif sub == "del":
             entry = await session.scalar(

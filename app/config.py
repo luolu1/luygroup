@@ -3,6 +3,7 @@
 The file path can be overridden with the GROUPGUARD_CONFIG environment variable.
 Relative SQLite paths are resolved against the directory containing config.json.
 """
+
 from __future__ import annotations
 
 import json
@@ -64,7 +65,7 @@ class AIProviderSeed(BaseModel):
 
 
 class AIConfig(BaseModel):
-    timeout: int = 25
+    timeout: int = 60
     max_context_messages: int = 8
     # Optional root directory for permanent AI learning JSONL files. The
     # directory stores ad_detection/, assistant/ and chat/ subdirectories.
@@ -108,7 +109,7 @@ class AppConfig(BaseModel):
         prefix = "sqlite+aiosqlite:///"
         if not url.startswith(prefix):
             return url
-        raw = url[len(prefix):]
+        raw = url[len(prefix) :]
         if raw == ":memory:" or raw.startswith("/"):
             return url
         path = (self.project_dir / raw).resolve()

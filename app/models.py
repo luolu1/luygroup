@@ -1,4 +1,5 @@
 """SQLAlchemy models for GroupGuard."""
+
 from __future__ import annotations
 
 import json
@@ -17,7 +18,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import Mapped, declarative_base, mapped_column
 
 Base = declarative_base()
 
@@ -78,6 +79,7 @@ class Group(Base):
     ai_chat_enabled = Column(Boolean, default=False)
     ai_daily_quota = Column(Integer, default=200)
     sample_daily_quota = Column(Integer, default=500)
+    ai_provider_id = Column(Integer, nullable=True)
 
     # ---- join verification ----
     verify_enabled = Column(Boolean, default=False)
@@ -129,6 +131,8 @@ class ConsoleUser(Base):
     role = Column(String(24), default="user")  # superadmin / subscriber / user
     is_active = Column(Boolean, default=True, index=True)
     balance_cents = Column(Integer, default=0, nullable=False)
+    ai_text_daily_quota = Column(Integer, nullable=True)
+    ai_image_daily_quota = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=utcnow)
     last_login_at = Column(DateTime, nullable=True)
 
@@ -270,7 +274,9 @@ class Warning(Base):
     reason = Column(String(512), default="")
     # Original message text, stored so an AI false positive can be learned.
     content = Column(Text, default="")
-    source = Column(String(16), default="manual")  # manual / keyword / builtin / ai / flood / other rules
+    source = Column(
+        String(16), default="manual"
+    )  # manual / keyword / builtin / ai / flood / other rules
     action = Column(String(16), default="warn")  # warn / mute / kick / ban
     review_status = Column(String(16), default="")  # pending / false_positive / confirmed
     review_note = Column(String(512), default="")
@@ -326,9 +332,7 @@ class MemberDailyStat(Base):
     messages = Column(Integer, default=0)
 
     __table_args__ = (
-        UniqueConstraint(
-            "group_id", "user_id", "day", name="uq_member_daily_group_user_day"
-        ),
+        UniqueConstraint("group_id", "user_id", "day", name="uq_member_daily_group_user_day"),
     )
 
 
@@ -437,6 +441,8 @@ class AIUsage(Base):
     group_id = Column(BigInteger, index=True)
     day = Column(String(10), index=True)
     requests = Column(Integer, default=0)
+    text_requests = Column(Integer, default=0)
+    image_requests = Column(Integer, default=0)
     samples = Column(Integer, default=0)
     hits = Column(Integer, default=0)
 
@@ -665,9 +671,7 @@ class LotteryQualification(Base):
     user_id = Column(BigInteger, index=True)
     created_at = Column(DateTime, default=utcnow)
 
-    __table_args__ = (
-        UniqueConstraint("lottery_id", "user_id", name="uq_lottery_qualification"),
-    )
+    __table_args__ = (UniqueConstraint("lottery_id", "user_id", name="uq_lottery_qualification"),)
 
 
 class LotteryEntry(Base):
@@ -689,27 +693,50 @@ class LotteryWinner(Base):
     user_id = Column(BigInteger, index=True)
     drawn_at = Column(DateTime, default=utcnow)
 
-    __table_args__ = (
-        UniqueConstraint("lottery_id", "user_id", name="uq_lottery_winner"),
-    )
+    __table_args__ = (UniqueConstraint("lottery_id", "user_id", name="uq_lottery_winner"),)
 
 
 class Auction(Base):
     __tablename__ = "auctions"
 
-    id = Column(Integer, primary_key=True)
-    code = Column(String(12), unique=True, index=True, nullable=True)
-    group_id = Column(BigInteger, index=True)
-    creator_id = Column(BigInteger)
-    item = Column(String(255))
-    start_price = Column(Integer, default=0)
-    step = Column(Integer, default=1)
-    current_price = Column(Integer, default=0)
-    current_bidder = Column(BigInteger, nullable=True)
-    status = Column(String(16), default="open")  # open / finished / cancelled
-    message_id = Column(BigInteger, nullable=True)
-    ends_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, default=utcnow)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    code: Mapped[str | None] = mapped_column(String(12), unique=True, index=True, nullable=True)
+    group_id: Mapped[int] = mapped_column(BigInteger, index=True)
+    creator_id: Mapped[int] = mapped_column(BigInteger)
+    item: Mapped[str] = mapped_column(String(255))
+    description: Mapped[str] = mapped_column(String(500), default="")
+    auction_type: Mapped[str] = mapped_column(String(8), default="points")  # points / currency
+    entry_fee: Mapped[int] = mapped_column(Integer, default=0)
+    start_price: Mapped[int] = mapped_column(Integer, default=0)
+    step: Mapped[int] = mapped_column(Integer, default=1)
+    extend_minutes: Mapped[int] = mapped_column(Integer, default=1)
+    hammer_interval: Mapped[int] = mapped_column(Integer, default=1)  # minutes between hammer reminders
+    current_price: Mapped[int] = mapped_column(Integer, default=0)
+    current_bidder: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="open")  # open / finished / cancelled
+    message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    ends_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class AuctionReminder(Base):
+    """Durable dispatch ownership for each auction deadline and countdown window."""
+
+    __tablename__ = "auction_reminders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    auction_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    ends_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    window: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    claimed_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, nullable=False)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    last_error: Mapped[str] = mapped_column(String(500), default="", nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("auction_id", "ends_at", "window", name="uq_auction_reminder_deadline_window"),
+    )
 
 
 class AuctionBid(Base):
@@ -740,6 +767,26 @@ class GroupDailyStat(Base):
     __table_args__ = (UniqueConstraint("group_id", "day", name="uq_daily_stat_group_day"),)
 
 
+class PendingAction(Base):
+    """Queue for retryable Telegram operations."""
+    __tablename__ = "pending_actions"
+
+    id = Column(Integer, primary_key=True)
+    action_type = Column(String(32), nullable=False, index=True)
+    group_id = Column(BigInteger, index=True, nullable=False)
+    user_id = Column(BigInteger, nullable=True)
+    target_id = Column(Integer, nullable=True)
+    payload = Column(Text, default="")
+    attempts = Column(Integer, default=0, nullable=False)
+    last_attempt_at = Column(DateTime, nullable=True)
+    last_error = Column(String(500), default="")
+    created_at = Column(DateTime, default=utcnow, nullable=False, index=True)
+
+    __table_args__ = (
+        Index("ix_pending_actions_type_attempts", "action_type", "attempts"),
+    )
+
+
 __all__ = [
     "AIEvent",
     "AIProvider",
@@ -748,6 +795,7 @@ __all__ = [
     "AdminLog",
     "Auction",
     "AuctionBid",
+    "AuctionReminder",
     "Base",
     "CrossLink",
     "DailyCheckin",
@@ -760,6 +808,7 @@ __all__ = [
     "Lottery",
     "LotteryEntry",
     "Member",
+    "PendingAction",
     "PointsTransaction",
     "RedPacket",
     "RedPacketClaim",

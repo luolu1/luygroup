@@ -9,7 +9,7 @@ from io import BytesIO
 from pathlib import Path
 from collections.abc import Mapping
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from PIL import Image, UnidentifiedImageError
 
@@ -352,13 +352,14 @@ async def settle_payment(
         return "order_not_found", None
     if order.status == "paid":
         return "already_paid", order
-    if order.status != "pending":
-        return "order_not_payable", order
     now = utcnow()
-    if order.expires_at is not None and order.expires_at <= now:
-        order.status = "expired"
-        order.updated_at = now
-        return "order_expired", order
+    locally_expired = (
+        order.status == "expired"
+        and order.expires_at is not None
+        and order.expires_at <= now
+    )
+    if order.paid_at is not None or (order.status != "pending" and not locally_expired):
+        return "order_not_payable", order
     if order.provider != provider_name:
         return "provider_mismatch", order
     if order.purpose not in {"recharge", "subscription"}:
@@ -370,7 +371,23 @@ async def settle_payment(
         return "amount_mismatch", order
     if callback.currency.upper() != order.charge_currency.upper():
         return "currency_mismatch", order
+    payable = and_(
+        PaymentOrder.paid_at.is_(None),
+        or_(
+            PaymentOrder.status == "pending",
+            and_(PaymentOrder.status == "expired", PaymentOrder.expires_at <= now),
+        ),
+    )
     if order.purpose == "subscription":
+        locked = await session.scalar(
+            update(PaymentOrder)
+            .where(PaymentOrder.id == order.id, payable)
+            .values(status=PaymentOrder.status)
+            .returning(PaymentOrder.id)
+        )
+        if locked is None:
+            await session.refresh(order)
+            return ("already_paid" if order.status == "paid" else "order_not_payable"), order
         plan = await session.scalar(
             select(SubscriptionPlan)
             .where(SubscriptionPlan.name == "pro", SubscriptionPlan.enabled.is_(True))
@@ -381,6 +398,7 @@ async def settle_payment(
                 select(Subscription)
                 .where(Subscription.user_id == order.user_id, Subscription.status == "active")
                 .order_by(Subscription.id.desc())
+                .execution_options(populate_existing=True)
             )
         ).all()
         if plan is None:
@@ -389,12 +407,13 @@ async def settle_payment(
             return "permanent_subscription", order
     claimed = await session.scalar(
         update(PaymentOrder)
-        .where(PaymentOrder.id == order.id, PaymentOrder.status == "pending")
+        .where(PaymentOrder.id == order.id, payable)
         .values(status="paid", paid_at=now, trade_no=callback.trade_no or order.trade_no)
         .returning(PaymentOrder.id)
     )
     if claimed is None:
-        return "already_paid", order
+        await session.refresh(order)
+        return ("already_paid" if order.status == "paid" else "order_not_payable"), order
     if order.purpose == "subscription":
         current = active[0] if active else None
         base = now
