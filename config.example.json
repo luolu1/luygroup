@@ -54,6 +54,8 @@
         "api_key": "",
         "model": "gpt-4o-mini",
         "api_mode": "chat",
+        "vision_model": "",
+        "vision_api_mode": "chat",
         "priority": 100,
         "enabled": false,
         "builtin": true

@@ -133,8 +133,15 @@
         </div>
         <div class="provider-tools">
           <form method="post" action="/ai/providers/{{ p.id }}/test">
-            <button class="provider-action" type="submit">测试连通</button>
+            <input type="hidden" name="kind" value="text">
+            <button class="provider-action" type="submit">测试文本</button>
           </form>
+          {% if p.vision_model %}
+          <form method="post" action="/ai/providers/{{ p.id }}/test">
+            <input type="hidden" name="kind" value="vision">
+            <button class="provider-action" type="submit">测试图像</button>
+          </form>
+          {% endif %}
           {% if provider_editable(p) %}
           <form method="post" action="/ai/providers/{{ p.id }}/delete"
                 data-confirm="确定删除接口 {{ p.name }}？">
@@ -175,14 +182,14 @@
         <div class="provider-fact">
           <span class="fact-label">文本模型</span>
           <span class="mono small">{{ p.model or '—' }}</span>
+          <span class="badge">{{ 'Responses' if (p.api_mode or 'chat') == 'responses' else 'Chat' }}</span>
         </div>
         <div class="provider-fact">
           <span class="fact-label">图像模型</span>
           <span class="mono small">{{ p.vision_model or '—' }}</span>
-        </div>
-        <div class="provider-fact">
-          <span class="fact-label">接口类型</span>
-          <span class="mono small">{{ 'Responses' if (p.api_mode or 'chat') == 'responses' else 'Chat Completions' }}</span>
+          {% if p.vision_model %}
+          <span class="badge">{{ 'Responses' if (p.vision_api_mode or 'chat') == 'responses' else 'Chat' }}</span>
+          {% endif %}
         </div>
       </div>
     </div>

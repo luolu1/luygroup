@@ -398,8 +398,8 @@ async def _chat_once(
     temperature: float,
     max_tokens: int,
     json_mode: bool,
+    api_mode: str = "chat",
 ) -> AIResult:
-    api_mode = getattr(provider, "api_mode", "chat") or "chat"
     if api_mode == "responses":
         return await _responses_once(
             provider,
@@ -419,6 +419,13 @@ async def _chat_once(
         max_tokens=max_tokens,
         json_mode=json_mode,
     )
+
+
+def provider_api_mode(provider: AIProvider, *, vision: bool = False) -> str:
+    """Return the configured schema for a provider's text or image model."""
+    field = "vision_api_mode" if vision else "api_mode"
+    mode = str(getattr(provider, field, "") or "chat").strip().lower()
+    return mode if mode in {"chat", "responses"} else "chat"
 
 
 def _responses_input(
@@ -675,6 +682,7 @@ async def chat(
     client = ai_http.get_client()
     for provider in providers:
         configured_model = provider.vision_model if vision else provider.model
+        api_mode = provider_api_mode(provider, vision=vision)
 
         async def call_model(model: str, provider: AIProvider = provider) -> AIResult:
             nonlocal attempts, system_attempts
@@ -692,6 +700,7 @@ async def chat(
                     temperature=temperature,
                     max_tokens=current_max_tokens,
                     json_mode=json_mode,
+                    api_mode=api_mode,
                 )
                 if not model_result.ok and model_result.truncated:
                     attempts += 1
@@ -705,6 +714,7 @@ async def chat(
                         temperature=temperature,
                         max_tokens=_TRUNCATED_RETRY_TOKENS,
                         json_mode=json_mode,
+                        api_mode=api_mode,
                     )
                 if model_result.ok or not model_result.timed_out or retries >= 3:
                     model_result.attempts = attempts
@@ -1014,25 +1024,29 @@ async def chat_reply(
     return result
 
 
-async def test_provider(provider: AIProvider) -> AIResult:
-    """Test a provider without touching the DB."""
-    api_mode = getattr(provider, "api_mode", "chat") or "chat"
+async def test_provider(provider: AIProvider, *, vision: bool = False) -> AIResult:
+    """Test a provider's text or image model without touching the DB."""
+    model = (provider.vision_model if vision else provider.model) or ""
+    api_mode = provider_api_mode(provider, vision=vision)
     endpoint = _endpoint(provider.base_url, api_mode)
-    if not endpoint or not provider.model:
-        return AIResult(ok=False, error="请填写 Base URL 和模型名")
+    if not endpoint or not model:
+        return AIResult(
+            ok=False,
+            error="请填写接口地址和图像模型" if vision else "请填写 Base URL 和模型名",
+        )
     headers = {"Content-Type": "application/json"}
     if provider.api_key:
         headers["Authorization"] = f"Bearer {provider.api_key}"
     if api_mode == "responses":
         payload = {
-            "model": provider.model,
+            "model": model,
             "input": [{"role": "user", "content": "回复 OK"}],
             "max_output_tokens": 16,
             "temperature": 0,
         }
     else:
         payload = {
-            "model": provider.model,
+            "model": model,
             "messages": [{"role": "user", "content": "回复 OK"}],
             "max_tokens": 10,
             "temperature": 0,
@@ -1053,6 +1067,8 @@ async def test_provider(provider: AIProvider) -> AIResult:
             text, _truncated = _responses_text(data)
         else:
             text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return AIResult(ok=True, text=str(text)[:200], provider=provider.name, latency_ms=latency)
+        result = AIResult(ok=True, text=str(text)[:200], provider=provider.name, latency_ms=latency)
+        result.model = model
+        return result
     except Exception as exc:
         return AIResult(ok=False, error=f"{type(exc).__name__}: {exc}")

@@ -34,8 +34,18 @@ def _provider_editable(ent: Entitlements, provider: AIProvider) -> bool:
     return bool(ent.user and provider.owner_user_id == ent.user.id)
 
 
-def _api_mode(form) -> str:  # type: ignore[no-untyped-def]
-    mode = _text(form, "api_mode", 16).strip().lower()
+def _api_mode(form, *, fallback: str = "chat") -> str:  # type: ignore[no-untyped-def]
+    raw = _text(form, "api_mode", 16)
+    return _mode_value(raw) if raw else _mode_value(fallback)
+
+
+def _vision_api_mode(form, *, fallback: str = "chat") -> str:  # type: ignore[no-untyped-def]
+    raw = _text(form, "vision_api_mode", 16)
+    return _mode_value(raw) if raw else _mode_value(fallback)
+
+
+def _mode_value(raw: str) -> str:
+    mode = (raw or "").strip().lower()
     return mode if mode in {"chat", "responses"} else "chat"
 
 
@@ -267,6 +277,7 @@ async def add_ai_provider(
             model=model,
             vision_model=_text(form, "vision_model", 128),
             api_mode=_api_mode(form),
+            vision_api_mode=_vision_api_mode(form),
             priority=_int(form, "priority", 100, 0, 100000),
             enabled=_bool(form, "enabled"),
             builtin=False,
@@ -317,7 +328,10 @@ async def update_ai_provider(
         provider.api_key = new_key
     provider.model = model
     provider.vision_model = vision_model
-    provider.api_mode = _api_mode(form)
+    provider.api_mode = _api_mode(form, fallback=provider.api_mode or "chat")
+    provider.vision_api_mode = _vision_api_mode(
+        form, fallback=provider.vision_api_mode or "chat"
+    )
     provider.priority = priority
     provider.enabled = enabled
     if old_name != name:
@@ -353,9 +367,13 @@ async def test_ai_provider(
     provider = await session.get(AIProvider, provider_id)
     if provider is None or not _provider_visible(ent, provider):
         return _redirect("/ai", err="接口不存在")
-    result = await ai_service.test_provider(provider)
+    form = await request.form()
+    vision = _text(form, "kind", 8).strip().lower() == "vision"
+    result = await ai_service.test_provider(provider, vision=vision)
+    label = "图像模型" if vision else "文本模型"
     if result.ok:
         return _redirect(
-            "/ai", msg=f"{provider.name} 连通正常（{result.latency_ms}ms）：{result.text[:80]}"
+            "/ai",
+            msg=f"{provider.name} {label}连通正常（{result.latency_ms}ms）：{result.text[:80]}",
         )
-    return _redirect("/ai", err=f"{provider.name} 测试失败：{result.error[:200]}")
+    return _redirect("/ai", err=f"{provider.name} {label}测试失败：{result.error[:200]}")

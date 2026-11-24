@@ -36,15 +36,7 @@
         <label for="base_url">接口地址</label>
         <input id="base_url" name="base_url" type="text" maxlength="512" required
                placeholder="https://api.deepseek.com/v1" data-base-url>
-        <div class="hint">可以省略协议：例如 <code>vyceai.com/v1</code> 会自动补全为 <code>https://vyceai.com/v1</code>。</div>
-      </div>
-      <div class="field span-2">
-        <label for="api_mode">接口类型</label>
-        <select id="api_mode" name="api_mode">
-          <option value="chat" selected>Chat Completions（/chat/completions）</option>
-          <option value="responses">Responses（/responses）</option>
-        </select>
-        <div class="hint">多数供应商使用 Chat Completions；OpenAI 新版接口与部分供应商支持 Responses。</div>
+        <div class="hint">可以省略协议：例如 <code>vyceai.com/v1</code> 会自动补全为 <code>https://vyceai.com/v1</code>。文本模型与图像模型共用该地址，可按需分别选择调用格式。</div>
       </div>
       <div class="field span-2">
         <label for="model">文本模型</label>
@@ -55,6 +47,14 @@
         </div>
         <div class="hint" data-model-status>自动获取供应商模型列表。</div>
       </div>
+      <div class="field span-2">
+        <label for="api_mode">文本模型接口类型</label>
+        <select id="api_mode" name="api_mode">
+          <option value="chat" selected>Chat Completions（/chat/completions）</option>
+          <option value="responses">Responses（/responses）</option>
+        </select>
+        <div class="hint">文本模型使用的调用格式，按供应商实际支持选择。</div>
+      </div>
        <div class="field span-2">
          <label for="vision_model">图像模型（可选）</label>
          <div class="row">
@@ -63,6 +63,14 @@
                    title="重新获取图像模型" aria-label="重新获取图像模型">刷新</button>
          </div>
          <div class="hint" data-vision-model-status>仅显示支持图像输入的模型，留空表示不启用。</div>
+       </div>
+       <div class="field span-2">
+         <label for="vision_api_mode">图像模型接口类型</label>
+         <select id="vision_api_mode" name="vision_api_mode">
+           <option value="chat" selected>Chat Completions（/chat/completions）</option>
+           <option value="responses">Responses（/responses）</option>
+         </select>
+         <div class="hint">图像模型使用的调用格式，可与文本模型不同。</div>
        </div>
        <div class="field">
          <label for="priority">优先级</label>

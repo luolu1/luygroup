@@ -60,11 +60,13 @@ class AIProviderSeed(BaseModel):
     api_key: str = ""
     model: str = ""
     api_mode: str = "chat"
+    vision_model: str = ""
+    vision_api_mode: str = "chat"
     priority: int = 100
     enabled: bool = False
     builtin: bool = True
 
-    @field_validator("api_mode")
+    @field_validator("api_mode", "vision_api_mode")
     @classmethod
     def _valid_api_mode(cls, value: str) -> str:
         mode = (value or "chat").strip().lower()

@@ -553,7 +553,7 @@ try:
                 marker in r.text
                 for marker in (
                     'class="provider-tools"',
-                    ">测试连通</button>",
+                    ">测试文本</button>",
                     ">删除</button>",
                     'href="/ai/providers/',
                     'class="provider-switch"',
@@ -712,51 +712,98 @@ try:
 
         add_page = client.get("/ai/add")
         check(
-            "ai add page offers responses api mode",
-            'name="api_mode"' in add_page.text
-            and 'value="responses"' in add_page.text
-            and 'value="chat"' in add_page.text,
+            "ai add page offers per-model api modes",
+            add_page.text.count('name="api_mode"') == 1
+            and add_page.text.count('name="vision_api_mode"') == 1
+            and add_page.text.count('value="responses"') == 2,
             add_page.text[:500],
         )
         edit_page = client.get(f"/ai/providers/{provider_id}")
         check(
-            "ai edit page offers responses api mode",
-            'name="api_mode"' in edit_page.text and 'value="responses"' in edit_page.text,
+            "ai edit page offers per-model api modes",
+            edit_page.text.count('name="api_mode"') == 1
+            and edit_page.text.count('name="vision_api_mode"') == 1
+            and edit_page.text.count('value="responses"') == 2,
             edit_page.text[:500],
         )
 
         r = client.post(
             f"/ai/providers/{provider_id}/update",
-            data={"api_mode": "responses", "enabled": "on"},
+            data={"api_mode": "responses", "vision_api_mode": "chat", "enabled": "on"},
             follow_redirects=False,
         )
         con = connect()
         mode_row = con.execute(
-            "SELECT api_mode FROM ai_providers WHERE id=?", (provider_id,)
+            "SELECT api_mode, vision_api_mode FROM ai_providers WHERE id=?", (provider_id,)
         ).fetchone()
         check(
-            "ai provider saves responses api mode",
-            r.status_code == 303 and mode_row == ("responses",),
+            "ai provider stores independent api modes",
+            r.status_code == 303 and mode_row == ("responses", "chat"),
             f"{r.status_code} {mode_row}",
+        )
+
+        r = client.post(
+            f"/ai/providers/{provider_id}/update",
+            data={"api_mode": "chat", "vision_api_mode": "responses", "enabled": "on"},
+            follow_redirects=False,
+        )
+        con = connect()
+        mode_row = con.execute(
+            "SELECT api_mode, vision_api_mode FROM ai_providers WHERE id=?", (provider_id,)
+        ).fetchone()
+        check(
+            "ai provider stores inverted api modes",
+            r.status_code == 303 and mode_row == ("chat", "responses"),
+            f"{r.status_code} {mode_row}",
+        )
+
+        client.post(
+            f"/ai/providers/{provider_id}/update",
+            data={"api_mode": "bogus", "vision_api_mode": "bogus", "enabled": "on"},
+            follow_redirects=False,
+        )
+        con = connect()
+        mode_row = con.execute(
+            "SELECT api_mode, vision_api_mode FROM ai_providers WHERE id=?", (provider_id,)
+        ).fetchone()
+        check(
+            "ai provider rejects unknown api modes",
+            mode_row == ("chat", "chat"),
+            str(mode_row),
+        )
+
+        client.post(
+            f"/ai/providers/{provider_id}/update",
+            data={"model": "deepseek-reasoner", "enabled": "on"},
+            follow_redirects=False,
+        )
+        con = connect()
+        preserved = con.execute(
+            "SELECT api_mode, vision_api_mode FROM ai_providers WHERE id=?", (provider_id,)
+        ).fetchone()
+        check(
+            "ai partial update preserves existing api modes",
+            preserved == ("chat", "chat"),
+            str(preserved),
         )
         client.post(
             f"/ai/providers/{provider_id}/update",
-            data={"api_mode": "bogus", "enabled": "on"},
+            data={"api_mode": "responses", "vision_api_mode": "responses", "enabled": "on"},
             follow_redirects=False,
-        )
-        con = connect()
-        mode_row = con.execute(
-            "SELECT api_mode FROM ai_providers WHERE id=?", (provider_id,)
-        ).fetchone()
-        check(
-            "ai provider rejects unknown api mode",
-            mode_row == ("chat",),
-            str(mode_row),
         )
         client.post(
             f"/ai/providers/{provider_id}/update",
             data={"base_url": "https://api.deepseek.com/v1", "enabled": "on"},
             follow_redirects=False,
+        )
+        con = connect()
+        preserved = con.execute(
+            "SELECT api_mode, vision_api_mode FROM ai_providers WHERE id=?", (provider_id,)
+        ).fetchone()
+        check(
+            "ai supplier-only update keeps api modes",
+            preserved == ("responses", "responses"),
+            str(preserved),
         )
 
         r = client.get("/groups/-1001234567890?tab=members")

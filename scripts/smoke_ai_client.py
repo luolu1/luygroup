@@ -392,6 +392,8 @@ async def test_responses_mode() -> None:
             base_url="https://responses.example/v1",
             model="gpt-5",
             api_mode="responses",
+            vision_model="gpt-5-vision",
+            vision_api_mode="chat",
             enabled=True,
             priority=0,
         )
@@ -453,8 +455,8 @@ async def test_responses_mode() -> None:
     vision_client.post = capturing_vision_post
     async with session_scope() as session:
         provider = await session.get(AIProvider, provider_id)
-        provider.api_mode = "responses"
         provider.vision_model = "gpt-5-vision"
+        provider.vision_api_mode = "responses"
     use_http_client(lambda **kwargs: vision_client)
     try:
         async with session_scope() as session:
@@ -511,10 +513,142 @@ async def test_responses_mode() -> None:
     print("PASS switching back to chat mode uses /chat/completions again")
 
 
+async def test_mixed_api_modes_per_model() -> None:
+    async with session_scope() as session:
+        provider = AIProvider(
+            name="mixed-provider",
+            base_url="https://mixed.example/v1",
+            model="text-model",
+            api_mode="responses",
+            vision_model="vision-model",
+            vision_api_mode="chat",
+            enabled=True,
+            priority=0,
+        )
+        session.add(provider)
+        await session.flush()
+        provider_id = int(provider.id)
+
+    responses_payload = {
+        "status": "completed",
+        "output": [
+            {"type": "message", "content": [{"type": "output_text", "text": "文本应答"}]}
+        ],
+    }
+    chat_payload = {
+        "choices": [{"message": {"content": "图像判定正常"}}],
+    }
+    client = FakeClient(
+        responses=[
+            SimpleNamespace(status_code=200, json=lambda: responses_payload),
+            SimpleNamespace(status_code=200, json=lambda: chat_payload),
+        ]
+    )
+    captured: list[dict] = []
+    original_post = client.post
+
+    async def capturing_post(url, **kwargs):
+        captured.append({"url": url, "json": kwargs.get("json")})
+        return await original_post(url, **kwargs)
+
+    client.post = capturing_post
+    original_client = ai.httpx.AsyncClient
+    use_http_client(lambda **kwargs: client)
+    try:
+        async with session_scope() as session:
+            text_result = await ai.chat(
+                session, [{"role": "user", "content": "hi"}], provider_id=provider_id
+            )
+        async with session_scope() as session:
+            await ai.check_ad(
+                session,
+                "图片广告",
+                "测试群",
+                -100991002,
+                image_data_url="data:image/jpeg;base64,BBBB",
+                provider_id=provider_id,
+            )
+    finally:
+        use_http_client(original_client)
+
+    assert text_result.ok and text_result.model == "text-model", text_result
+    assert captured[0]["url"] == "https://mixed.example/v1/responses", captured[0]["url"]
+    assert "messages" not in captured[0]["json"], captured[0]["json"]
+    assert captured[1]["url"] == "https://mixed.example/v1/chat/completions", captured[1]["url"]
+    assert "messages" in captured[1]["json"], captured[1]["json"]
+    assert captured[1]["json"]["model"] == "vision-model", captured[1]["json"]
+    print("PASS text and image models can use different api modes on one provider")
+
+    async with session_scope() as session:
+        provider = await session.get(AIProvider, provider_id)
+        provider.api_mode = "chat"
+        provider.vision_api_mode = "responses"
+    reversed_client = FakeClient(
+        responses=[
+            SimpleNamespace(status_code=200, json=lambda: chat_payload),
+            SimpleNamespace(status_code=200, json=lambda: responses_payload),
+        ]
+    )
+    reversed_captured: list[dict] = []
+    original_reversed_post = reversed_client.post
+
+    async def capturing_reversed_post(url, **kwargs):
+        reversed_captured.append({"url": url, "json": kwargs.get("json")})
+        return await original_reversed_post(url, **kwargs)
+
+    reversed_client.post = capturing_reversed_post
+    use_http_client(lambda **kwargs: reversed_client)
+    try:
+        async with session_scope() as session:
+            await ai.chat(session, [{"role": "user", "content": "hi"}], provider_id=provider_id)
+        async with session_scope() as session:
+            await ai.check_ad(
+                session,
+                "图片广告",
+                "测试群",
+                -100991003,
+                image_data_url="data:image/jpeg;base64,CCCC",
+                provider_id=provider_id,
+            )
+    finally:
+        use_http_client(original_client)
+
+    assert reversed_captured[0]["url"] == "https://mixed.example/v1/chat/completions"
+    assert reversed_captured[1]["url"] == "https://mixed.example/v1/responses"
+    assert "input" in reversed_captured[1]["json"], reversed_captured[1]["json"]
+    print("PASS mixed modes invert independently for text and image models")
+
+    async with session_scope() as session:
+        provider = await session.get(AIProvider, provider_id)
+    text_probe = FakeClient(
+        responses=[SimpleNamespace(status_code=200, json=lambda: chat_payload)]
+    )
+    use_http_client(lambda **kwargs: text_probe)
+    try:
+        text_test = await ai.test_provider(provider)
+    finally:
+        use_http_client(original_client)
+    assert text_test.ok and text_test.model == "text-model", text_test
+    assert text_probe.posts == ["https://mixed.example/v1/chat/completions"], text_probe.posts
+
+    vision_probe = FakeClient(
+        responses=[SimpleNamespace(status_code=200, json=lambda: responses_payload)]
+    )
+    use_http_client(lambda **kwargs: vision_probe)
+    try:
+        vision_test = await ai.test_provider(provider, vision=True)
+    finally:
+        use_http_client(original_client)
+    assert vision_test.ok and vision_test.model == "vision-model", vision_test
+    assert vision_probe.posts == ["https://mixed.example/v1/responses"], vision_probe.posts
+    print("PASS provider test probes text and image models on their own endpoints")
+
+
 async def main() -> None:
     try:
         await run_tests()
         await test_responses_mode()
+        await test_mixed_api_modes_per_model()
     finally:
         await dispose_db()
 

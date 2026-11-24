@@ -57,7 +57,7 @@ Telegram 群组管理机器人 + Web 控制台。集封禁禁言、反广告、�
 - AI 管理助理：解释群规、整理信息、起草公告
 - AI 闲聊：群内 @机器人 或 `/ask` 对话
 - 三种能力可分别开关
-- OpenAI 兼容接口，支持 `/chat/completions` 与 `/responses` 两种调用格式，多个接口按优先级排序、失败自动切换备用
+- OpenAI 兼容接口，支持 `/chat/completions` 与 `/responses` 两种调用格式，文本模型与图像模型可各自独立选择调用格式，多个接口按优先级排序、失败自动切换备用
 - 供应商模板：选择 OpenAI、DeepSeek、OpenRouter、硅基流动、Moonshot、智谱、Groq、Together、Mistral、Ollama 或自定义接口，自动填入地址并拉取供应商模型列表
 - 接口列表模式：可随时切换接口的供应商、模型、优先级与启用状态
 - AI 学习数据：成功的广告判断、成员举报、助理回答与闲聊按群组写入本地 JSONL，重复内容优先命中学习数据，节省 token；不会自动过期，存储目录可在控制台修改
@@ -475,7 +475,9 @@ Epay 配置修改后重启 Web 服务以加载配置：`docker compose up -d --b
 | `base_url` | OpenAI 兼容地址，如 `https://api.openai.com/v1`；也可直接填完整的 `/chat/completions` 或 `/responses` |
 | `api_key` | 接口密钥，可留空（本地模型） |
 | `model` | 模型名，如 `gpt-4o-mini`、`deepseek-chat` |
-| `api_mode` | 调用格式：`chat`（默认，`/chat/completions`）或 `responses`（`/responses`） |
+| `api_mode` | 文本模型调用格式：`chat`（默认，`/chat/completions`）或 `responses`（`/responses`） |
+| `vision_model` | 图像模型名，留空表示不启用图像识别 |
+| `vision_api_mode` | 图像模型调用格式：`chat`（默认）或 `responses`，可与 `api_mode` 不同 |
 | `priority` | 优先级，数值越小越优先 |
 | `enabled` | 是否启用 |
 | `builtin` | 是否为内置接口标记 |
@@ -566,12 +568,13 @@ Telegram 命令面板按聊天类型分别注册：私聊只显示私聊命令�
 - 所有启用的接口按 `priority` 升序尝试，数值越小越优先；
 - 遇到网络错误、HTTP 4xx/5xx、空响应时自动尝试下一个；
 - 广告检测在接口拒绝 `response_format` 时会自动去掉 JSON 模式重试一次；
-- 控制台「AI 接口」页以列表模式展示所有接口，卡片头部集中放置测试连通、删除、编辑、优先级徽标与启用开关；
+- 控制台「AI 接口」页以列表模式展示所有接口，卡片头部集中放置「测试文本」「测试图像」、删除、编辑、优先级徽标与启用开关；测试按钮会按各自模型配置的调用格式与模型名发起请求；
 - 列表页点击「添加供应商与模型」进入独立添加页，避免把列表页拉得过长；
 - 添加接口时先选择供应商模板，面板会自动填入接口地址，并可通过「获取供应商模型」拉取 `/models` 列表；接口地址缺少协议时会自动补全（公网默认 `https://`，本机与内网地址默认 `http://`）；
 - 每个接口卡片直接提供供应商下拉框和模型下拉框：供应商变更后立即保存；点击模型下拉框时会先调用 `/ai/models` 拉取该接口的全部模型，再在列表中切换，样式与供应商下拉框一致；也可直接在搜索框中输入自定义模型名后按回车应用，下拉菜单底部提供「重新获取」；拉取期间显示加载状态。
+- 文本模型与图像模型各自拥有独立的「接口类型」下拉框，可分别设为 Chat Completions 或 Responses；两者共用同一个接口地址与 API Key，适合文本与图像走不同供应商格式的场景。
 
-兼容任意 OpenAI 风格接口，支持 `/chat/completions` 与 `/responses` 两种格式，在控制台「接口类型」中切换。例如：
+兼容任意 OpenAI 风格接口，支持 `/chat/completions` 与 `/responses` 两种格式。文本模型与图像模型可以分别指定调用格式，例如文本模型走 `/responses`、图像模型走 `/chat/completions`。可在控制台「文本模型接口类型」与「图像模型接口类型」中分别切换。例如：
 
 ```text
 https://api.openai.com/v1

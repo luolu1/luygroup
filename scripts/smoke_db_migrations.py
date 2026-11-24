@@ -100,6 +100,9 @@ def check_legacy_provider_gains_api_mode() -> None:
             Base.metadata.create_all(connection)
             _ = connection.exec_driver_sql("ALTER TABLE ai_providers DROP COLUMN api_mode")
             _ = connection.exec_driver_sql(
+                "ALTER TABLE ai_providers DROP COLUMN vision_api_mode"
+            )
+            _ = connection.exec_driver_sql(
                 "INSERT INTO ai_providers (id, name, label, base_url, model) "
                 "VALUES (1, 'legacy', 'legacy', 'https://legacy.example/v1', 'm')"
             )
@@ -109,10 +112,10 @@ def check_legacy_provider_gains_api_mode() -> None:
 
         with engine.connect() as connection:
             row = connection.exec_driver_sql(
-                "SELECT api_mode FROM ai_providers WHERE id = 1"
+                "SELECT api_mode, vision_api_mode FROM ai_providers WHERE id = 1"
             ).fetchone()
-            assert row == ("chat",), row
-        print("PASS legacy provider table gains api_mode defaulting to chat")
+            assert row == ("chat", "chat"), row
+        print("PASS legacy provider table gains api_mode and vision_api_mode defaulting to chat")
     finally:
         engine.dispose()
 
