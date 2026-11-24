@@ -195,21 +195,30 @@ def validated_base_url(base_url: str, *, allow_internal: bool = True) -> str:
     return base
 
 
-def _endpoint(base_url: str) -> str:
+def _endpoint(base_url: str, api_mode: str = "chat") -> str:
     base = normalize_base_url(base_url)
     if not base:
         return ""
-    if base.endswith("/chat/completions"):
-        return base
+    base = _strip_endpoint_suffix(base)
+    if api_mode == "responses":
+        return base + "/responses"
     return base + "/chat/completions"
 
 
+_ENDPOINT_SUFFIXES = ("/chat/completions", "/responses")
+
+
+def _strip_endpoint_suffix(base: str) -> str:
+    for suffix in _ENDPOINT_SUFFIXES:
+        if base.endswith(suffix):
+            return base[: -len(suffix)]
+    return base
+
+
 def _models_endpoint(base_url: str) -> str:
-    base = normalize_base_url(base_url)
+    base = _strip_endpoint_suffix(normalize_base_url(base_url))
     if not base:
         return ""
-    if base.endswith("/chat/completions"):
-        base = base[: -len("/chat/completions")]
     if base.endswith("/models"):
         return base
     return base + "/models"
@@ -381,6 +390,186 @@ async def enabled_providers(
 
 
 async def _chat_once(
+    provider: AIProvider,
+    client: httpx.AsyncClient,
+    messages: list[dict[str, Any]],
+    *,
+    model: str,
+    temperature: float,
+    max_tokens: int,
+    json_mode: bool,
+) -> AIResult:
+    api_mode = getattr(provider, "api_mode", "chat") or "chat"
+    if api_mode == "responses":
+        return await _responses_once(
+            provider,
+            client,
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+        )
+    return await _chat_completions_once(
+        provider,
+        client,
+        messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        json_mode=json_mode,
+    )
+
+
+def _responses_input(
+    messages: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    """Convert chat-style messages into Responses API ``instructions`` + ``input``."""
+    instructions: list[str] = []
+    items: list[dict[str, Any]] = []
+    for message in messages:
+        role = str(message.get("role") or "user")
+        content = message.get("content", "")
+        if role in {"system", "developer"}:
+            text = _flatten_text(content)
+            if text:
+                instructions.append(text)
+            continue
+        items.append({"role": role, "content": _responses_content(content)})
+    return "\n\n".join(instructions), items
+
+
+def _flatten_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict) and part.get("type") in {"text", "input_text"}
+        )
+    return ""
+
+
+def _responses_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    parts: list[dict[str, Any]] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        if kind in {"text", "input_text"}:
+            parts.append({"type": "input_text", "text": str(part.get("text", ""))})
+        elif kind in {"image_url", "input_image"}:
+            image = part.get("image_url")
+            url = image.get("url") if isinstance(image, dict) else image
+            if url:
+                parts.append({"type": "input_image", "image_url": str(url)})
+    return parts or ""
+
+
+def _responses_text(data: dict[str, Any]) -> tuple[str, bool]:
+    """Return concatenated ``output_text`` and whether the response was cut off."""
+    chunks: list[str] = []
+    for item in data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") not in {None, "message"}:
+            continue
+        for part in item.get("content") or []:
+            if isinstance(part, dict) and part.get("type") in {"output_text", "text"}:
+                chunks.append(str(part.get("text", "")))
+    text = "".join(chunks).strip()
+    if text:
+        return text, False
+    details = data.get("incomplete_details") or {}
+    truncated = str(details.get("reason") or "") in {"max_output_tokens", "max_tokens"}
+    if not truncated and data.get("status") == "incomplete":
+        truncated = True
+    return "", truncated
+
+
+async def _responses_once(
+    provider: AIProvider,
+    client: httpx.AsyncClient,
+    messages: list[dict[str, Any]],
+    *,
+    model: str,
+    temperature: float,
+    max_tokens: int,
+    json_mode: bool,
+) -> AIResult:
+    endpoint = _endpoint(provider.base_url, "responses")
+    headers = {"Content-Type": "application/json"}
+    if provider.api_key:
+        headers["Authorization"] = f"Bearer {provider.api_key}"
+    instructions, items = _responses_input(messages)
+    payload: dict[str, Any] = {
+        "model": model,
+        "input": items,
+        "temperature": temperature,
+        "max_output_tokens": max_tokens,
+    }
+    if instructions:
+        payload["instructions"] = instructions
+    if json_mode:
+        payload["text"] = {"format": {"type": "json_object"}}
+    started = time.monotonic()
+    try:
+        response = await client.post(endpoint, headers=headers, json=payload)
+        latency = int((time.monotonic() - started) * 1000)
+        if response.status_code >= 400:
+            return AIResult(
+                ok=False,
+                error=f"{provider.name}: HTTP {response.status_code} {response.text[:200]}",
+                provider=provider.name,
+                model=model,
+                latency_ms=latency,
+            )
+        data = response.json()
+        text, truncated = _responses_text(data)
+        if not text:
+            if truncated:
+                return AIResult(
+                    ok=False,
+                    error=f"{provider.name}: 输出被长度限制截断",
+                    provider=provider.name,
+                    model=model,
+                    latency_ms=latency,
+                    truncated=True,
+                )
+            error = (data.get("error") or {}).get("message") if isinstance(data, dict) else ""
+            return AIResult(
+                ok=False,
+                error=f"{provider.name}: {error or '空响应'}",
+                provider=provider.name,
+                model=model,
+                latency_ms=latency,
+            )
+        return AIResult(
+            ok=True,
+            text=text,
+            provider=provider.name,
+            model=model,
+            latency_ms=latency,
+        )
+    except Exception as exc:
+        latency = int((time.monotonic() - started) * 1000)
+        timed_out = isinstance(exc, httpx.TimeoutException)
+        return AIResult(
+            ok=False,
+            error=f"{provider.name}: {type(exc).__name__}: {exc}",
+            provider=provider.name,
+            model=model,
+            latency_ms=latency,
+            timed_out=timed_out,
+        )
+
+
+async def _chat_completions_once(
     provider: AIProvider,
     client: httpx.AsyncClient,
     messages: list[dict[str, Any]],
@@ -827,18 +1016,27 @@ async def chat_reply(
 
 async def test_provider(provider: AIProvider) -> AIResult:
     """Test a provider without touching the DB."""
-    endpoint = _endpoint(provider.base_url)
+    api_mode = getattr(provider, "api_mode", "chat") or "chat"
+    endpoint = _endpoint(provider.base_url, api_mode)
     if not endpoint or not provider.model:
         return AIResult(ok=False, error="请填写 Base URL 和模型名")
     headers = {"Content-Type": "application/json"}
     if provider.api_key:
         headers["Authorization"] = f"Bearer {provider.api_key}"
-    payload = {
-        "model": provider.model,
-        "messages": [{"role": "user", "content": "回复 OK"}],
-        "max_tokens": 10,
-        "temperature": 0,
-    }
+    if api_mode == "responses":
+        payload = {
+            "model": provider.model,
+            "input": [{"role": "user", "content": "回复 OK"}],
+            "max_output_tokens": 16,
+            "temperature": 0,
+        }
+    else:
+        payload = {
+            "model": provider.model,
+            "messages": [{"role": "user", "content": "回复 OK"}],
+            "max_tokens": 10,
+            "temperature": 0,
+        }
     started = time.monotonic()
     client = ai_http.get_client()
     try:
@@ -851,7 +1049,10 @@ async def test_provider(provider: AIProvider) -> AIResult:
                 latency_ms=latency,
             )
         data = response.json()
-        text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if api_mode == "responses":
+            text, _truncated = _responses_text(data)
+        else:
+            text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         return AIResult(ok=True, text=str(text)[:200], provider=provider.name, latency_ms=latency)
     except Exception as exc:
         return AIResult(ok=False, error=f"{type(exc).__name__}: {exc}")

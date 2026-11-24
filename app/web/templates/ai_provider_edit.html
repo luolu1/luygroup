@@ -31,6 +31,15 @@
         <label>接口地址</label>
         <input name="base_url" type="text" maxlength="512" value="{{ provider.base_url or '' }}" data-base-url>
       </div>
+      <div class="field span-2">
+        <label>接口类型</label>
+        <select name="api_mode">
+          {% set mode = provider.api_mode or 'chat' %}
+          <option value="chat" {% if mode == 'chat' %}selected{% endif %}>Chat Completions（/chat/completions）</option>
+          <option value="responses" {% if mode == 'responses' %}selected{% endif %}>Responses（/responses）</option>
+        </select>
+        <div class="hint">多数供应商使用 Chat Completions；OpenAI 新版接口与部分供应商支持 Responses。</div>
+      </div>
       <div class="field">
         <label>API Key（留空保持不变）</label>
         <input name="api_key" type="password" maxlength="512" data-api-key

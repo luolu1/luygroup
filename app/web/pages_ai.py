@@ -34,6 +34,11 @@ def _provider_editable(ent: Entitlements, provider: AIProvider) -> bool:
     return bool(ent.user and provider.owner_user_id == ent.user.id)
 
 
+def _api_mode(form) -> str:  # type: ignore[no-untyped-def]
+    mode = _text(form, "api_mode", 16).strip().lower()
+    return mode if mode in {"chat", "responses"} else "chat"
+
+
 @router.get("/ai/add", response_class=HTMLResponse)
 async def ai_add_page(request: Request) -> HTMLResponse:
     _require_feature(request, "ai_providers")
@@ -261,6 +266,7 @@ async def add_ai_provider(
             api_key=_text(form, "api_key", 512),
             model=model,
             vision_model=_text(form, "vision_model", 128),
+            api_mode=_api_mode(form),
             priority=_int(form, "priority", 100, 0, 100000),
             enabled=_bool(form, "enabled"),
             builtin=False,
@@ -311,6 +317,7 @@ async def update_ai_provider(
         provider.api_key = new_key
     provider.model = model
     provider.vision_model = vision_model
+    provider.api_mode = _api_mode(form)
     provider.priority = priority
     provider.enabled = enabled
     if old_name != name:

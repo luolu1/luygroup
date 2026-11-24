@@ -57,7 +57,7 @@ Telegram 群组管理机器人 + Web 控制台。集封禁禁言、反广告、�
 - AI 管理助理：解释群规、整理信息、起草公告
 - AI 闲聊：群内 @机器人 或 `/ask` 对话
 - 三种能力可分别开关
-- OpenAI 兼容接口，支持多个接口按优先级排序、失败自动切换备用
+- OpenAI 兼容接口，支持 `/chat/completions` 与 `/responses` 两种调用格式，多个接口按优先级排序、失败自动切换备用
 - 供应商模板：选择 OpenAI、DeepSeek、OpenRouter、硅基流动、Moonshot、智谱、Groq、Together、Mistral、Ollama 或自定义接口，自动填入地址并拉取供应商模型列表
 - 接口列表模式：可随时切换接口的供应商、模型、优先级与启用状态
 - AI 学习数据：成功的广告判断、成员举报、助理回答与闲聊按群组写入本地 JSONL，重复内容优先命中学习数据，节省 token；不会自动过期，存储目录可在控制台修改
@@ -472,9 +472,10 @@ Epay 配置修改后重启 Web 服务以加载配置：`docker compose up -d --b
 | --- | --- |
 | `name` | 唯一名称，如 `primary`、`backup` |
 | `label` | 显示名称 |
-| `base_url` | OpenAI 兼容地址，如 `https://api.openai.com/v1`；也可直接填完整的 `/chat/completions` |
+| `base_url` | OpenAI 兼容地址，如 `https://api.openai.com/v1`；也可直接填完整的 `/chat/completions` 或 `/responses` |
 | `api_key` | 接口密钥，可留空（本地模型） |
 | `model` | 模型名，如 `gpt-4o-mini`、`deepseek-chat` |
+| `api_mode` | 调用格式：`chat`（默认，`/chat/completions`）或 `responses`（`/responses`） |
 | `priority` | 优先级，数值越小越优先 |
 | `enabled` | 是否启用 |
 | `builtin` | 是否为内置接口标记 |
@@ -570,7 +571,7 @@ Telegram 命令面板按聊天类型分别注册：私聊只显示私聊命令�
 - 添加接口时先选择供应商模板，面板会自动填入接口地址，并可通过「获取供应商模型」拉取 `/models` 列表；接口地址缺少协议时会自动补全（公网默认 `https://`，本机与内网地址默认 `http://`）；
 - 每个接口卡片直接提供供应商下拉框和模型下拉框：供应商变更后立即保存；点击模型下拉框时会先调用 `/ai/models` 拉取该接口的全部模型，再在列表中切换，样式与供应商下拉框一致；也可直接在搜索框中输入自定义模型名后按回车应用，下拉菜单底部提供「重新获取」；拉取期间显示加载状态。
 
-兼容任意 OpenAI 风格 `/chat/completions` 接口，例如：
+兼容任意 OpenAI 风格接口，支持 `/chat/completions` 与 `/responses` 两种格式，在控制台「接口类型」中切换。例如：
 
 ```text
 https://api.openai.com/v1
@@ -844,19 +845,20 @@ docker compose up -d --build
 
 ### 数据库迁移
 
-更新代码后，如果数据库结构发生变化（例如添加了新字段），需要手动执行迁移：
+应用启动时会自动执行增量的表结构升级（只新增缺失字段与索引，不删除数据），因此一般升级只需重新构建并重启服务：
 
-**Docker Compose 部署**：
 ```bash
-docker compose exec bot python -c "import sqlite3; conn = sqlite3.connect('data/groupguard.db'); conn.execute('ALTER TABLE auctions ADD COLUMN hammer_interval INTEGER DEFAULT 1'); conn.commit()"
+docker compose up -d --build
 ```
 
-**systemd 部署**：
+`deploy/install.sh` 也会在启动前调用同一套升级逻辑，补齐旧数据库缺失的字段。若需手动检查或迁移已有数据库，可执行：
+
 ```bash
-sudo -u groupguard python3 -c "import sqlite3; conn = sqlite3.connect('/opt/groupguard/data/groupguard.db'); conn.execute('ALTER TABLE auctions ADD COLUMN hammer_interval INTEGER DEFAULT 1'); conn.commit()"
+sudo -u groupguard PYTHONPATH=/opt/groupguard \
+  python3 -c "from sqlalchemy import create_engine; from app.db import _upgrade_sqlite_schema; e = create_engine('sqlite:////opt/groupguard/data/groupguard.db'); c = e.begin(); conn = c.__enter__(); _upgrade_sqlite_schema(conn); c.__exit__(None, None, None); e.dispose()"
 ```
 
-> 注意：上述示例命令适用于 v1.x 到 v2.x 的迁移。未来版本如有新的迁移需求，请查看 commit message 或更新日志。
+升级前建议先复制一份 `data/groupguard.db` 备份。
 
 ### Nginx + HTTPS 反向代理
 

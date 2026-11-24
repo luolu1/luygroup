@@ -33,10 +33,18 @@
         <input id="api_key" name="api_key" type="password" maxlength="512" placeholder="sk-..." data-api-key>
       </div>
       <div class="field span-2">
-        <label for="base_url">接口地址（OpenAI 兼容）</label>
+        <label for="base_url">接口地址</label>
         <input id="base_url" name="base_url" type="text" maxlength="512" required
                placeholder="https://api.deepseek.com/v1" data-base-url>
         <div class="hint">可以省略协议：例如 <code>vyceai.com/v1</code> 会自动补全为 <code>https://vyceai.com/v1</code>。</div>
+      </div>
+      <div class="field span-2">
+        <label for="api_mode">接口类型</label>
+        <select id="api_mode" name="api_mode">
+          <option value="chat" selected>Chat Completions（/chat/completions）</option>
+          <option value="responses">Responses（/responses）</option>
+        </select>
+        <div class="hint">多数供应商使用 Chat Completions；OpenAI 新版接口与部分供应商支持 Responses。</div>
       </div>
       <div class="field span-2">
         <label for="model">文本模型</label>
@@ -81,7 +89,7 @@
   </div>
   <div class="divider"></div>
   <div class="alert">
-    所有接口均为 OpenAI 兼容的 <code>/chat/completions</code> 格式。模型可以通过“获取供应商模型”选择，也可以手动填写；添加后可在接口列表里继续切换供应商与模型。
+    接口支持 OpenAI 兼容的 <code>/chat/completions</code> 与 <code>/responses</code> 两种格式，按需在「接口类型」中选择。模型可以通过“获取供应商模型”选择，也可以手动填写；添加后可在接口列表里继续切换供应商与模型。
   </div>
 </div>
 {% endblock %}

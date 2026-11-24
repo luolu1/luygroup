@@ -116,6 +116,7 @@ def _upgrade_sqlite_schema(conn) -> None:  # type: ignore[no-untyped-def]
         "ai_providers": {
             "owner_user_id": "INTEGER",
             "vision_model": "VARCHAR(128) DEFAULT ''",
+            "api_mode": "VARCHAR(16) DEFAULT 'chat'",
         },
         "ai_usage": {
             "text_requests": "INTEGER DEFAULT 0",
@@ -419,6 +420,7 @@ async def init_db() -> None:
                     base_url=seed.base_url,
                     api_key=seed.api_key,
                     model=seed.model,
+                    api_mode=seed.api_mode,
                     priority=seed.priority,
                     enabled=seed.enabled,
                     builtin=seed.builtin,

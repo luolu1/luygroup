@@ -90,6 +90,33 @@ def check_provider_attribution() -> None:
                 engine.dispose()
 
 
+def check_legacy_provider_gains_api_mode() -> None:
+    from app.db import _upgrade_sqlite_schema
+    from app.models import Base
+
+    engine = create_engine("sqlite:///:memory:")
+    try:
+        with engine.begin() as connection:
+            Base.metadata.create_all(connection)
+            _ = connection.exec_driver_sql("ALTER TABLE ai_providers DROP COLUMN api_mode")
+            _ = connection.exec_driver_sql(
+                "INSERT INTO ai_providers (id, name, label, base_url, model) "
+                "VALUES (1, 'legacy', 'legacy', 'https://legacy.example/v1', 'm')"
+            )
+
+        with engine.begin() as connection:
+            _upgrade_sqlite_schema(connection)
+
+        with engine.connect() as connection:
+            row = connection.exec_driver_sql(
+                "SELECT api_mode FROM ai_providers WHERE id = 1"
+            ).fetchone()
+            assert row == ("chat",), row
+        print("PASS legacy provider table gains api_mode defaulting to chat")
+    finally:
+        engine.dispose()
+
+
 def main() -> None:
     """Preserve legacy account data and schema across two committed upgrades."""
     sys.dont_write_bytecode = True
@@ -178,6 +205,7 @@ def main() -> None:
             finally:
                 engine.dispose()
             check_provider_attribution()
+            check_legacy_provider_gains_api_mode()
 
 
 if __name__ == "__main__":

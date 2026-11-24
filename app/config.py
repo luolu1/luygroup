@@ -59,9 +59,18 @@ class AIProviderSeed(BaseModel):
     base_url: str = ""
     api_key: str = ""
     model: str = ""
+    api_mode: str = "chat"
     priority: int = 100
     enabled: bool = False
     builtin: bool = True
+
+    @field_validator("api_mode")
+    @classmethod
+    def _valid_api_mode(cls, value: str) -> str:
+        mode = (value or "chat").strip().lower()
+        if mode not in {"chat", "responses"}:
+            raise ValueError("api_mode 只能是 chat 或 responses")
+        return mode
 
 
 class AIConfig(BaseModel):

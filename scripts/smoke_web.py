@@ -710,6 +710,55 @@ try:
             ai_js[:300],
         )
 
+        add_page = client.get("/ai/add")
+        check(
+            "ai add page offers responses api mode",
+            'name="api_mode"' in add_page.text
+            and 'value="responses"' in add_page.text
+            and 'value="chat"' in add_page.text,
+            add_page.text[:500],
+        )
+        edit_page = client.get(f"/ai/providers/{provider_id}")
+        check(
+            "ai edit page offers responses api mode",
+            'name="api_mode"' in edit_page.text and 'value="responses"' in edit_page.text,
+            edit_page.text[:500],
+        )
+
+        r = client.post(
+            f"/ai/providers/{provider_id}/update",
+            data={"api_mode": "responses", "enabled": "on"},
+            follow_redirects=False,
+        )
+        con = connect()
+        mode_row = con.execute(
+            "SELECT api_mode FROM ai_providers WHERE id=?", (provider_id,)
+        ).fetchone()
+        check(
+            "ai provider saves responses api mode",
+            r.status_code == 303 and mode_row == ("responses",),
+            f"{r.status_code} {mode_row}",
+        )
+        client.post(
+            f"/ai/providers/{provider_id}/update",
+            data={"api_mode": "bogus", "enabled": "on"},
+            follow_redirects=False,
+        )
+        con = connect()
+        mode_row = con.execute(
+            "SELECT api_mode FROM ai_providers WHERE id=?", (provider_id,)
+        ).fetchone()
+        check(
+            "ai provider rejects unknown api mode",
+            mode_row == ("chat",),
+            str(mode_row),
+        )
+        client.post(
+            f"/ai/providers/{provider_id}/update",
+            data={"base_url": "https://api.deepseek.com/v1", "enabled": "on"},
+            follow_redirects=False,
+        )
+
         r = client.get("/groups/-1001234567890?tab=members")
         check(
             "left member hidden by default",

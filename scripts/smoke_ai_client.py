@@ -371,9 +371,150 @@ async def run_tests() -> None:
     assert len(retry_client.posts) == 5, retry_client.posts
     print("PASS timeout retries a model three times then switches models")
 
+async def test_responses_mode() -> None:
+    responses_payload = {
+        "id": "resp_test",
+        "object": "response",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "你好，我是群卫"}],
+            }
+        ],
+    }
+    response_ok = SimpleNamespace(status_code=200, json=lambda: responses_payload)
+
+    async with session_scope() as session:
+        provider = AIProvider(
+            name="responses-provider",
+            base_url="https://responses.example/v1",
+            model="gpt-5",
+            api_mode="responses",
+            enabled=True,
+            priority=0,
+        )
+        session.add(provider)
+        await session.flush()
+        provider_id = int(provider.id)
+
+    client = FakeClient(responses=[response_ok])
+    captured: list[dict] = []
+    original_post = client.post
+
+    async def capturing_post(url, **kwargs):
+        captured.append({"url": url, "json": kwargs.get("json")})
+        return await original_post(url, **kwargs)
+
+    client.post = capturing_post
+    original_client = ai.httpx.AsyncClient
+    use_http_client(lambda **kwargs: client)
+    try:
+        async with session_scope() as session:
+            result = await ai.chat(
+                session,
+                [
+                    {"role": "system", "content": "系统提示"},
+                    {"role": "user", "content": "你好"},
+                ],
+                provider_id=provider_id,
+            )
+    finally:
+        use_http_client(original_client)
+
+    assert result.ok and result.text == "你好，我是群卫", result
+    assert captured[0]["url"] == "https://responses.example/v1/responses", captured[0]["url"]
+    sent = captured[0]["json"]
+    assert sent["instructions"] == "系统提示", sent
+    assert sent["input"] == [{"role": "user", "content": "你好"}], sent
+    assert sent["max_output_tokens"] == 600, sent
+    assert "messages" not in sent, sent
+    print("PASS responses mode maps system prompt to instructions and reads output_text")
+
+    vision_payload = {
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "content": [{"type": "output_text", "text": "这是一张广告图"}],
+            }
+        ],
+    }
+    vision_response = SimpleNamespace(status_code=200, json=lambda: vision_payload)
+    vision_client = FakeClient(responses=[vision_response])
+    vision_captured: list[dict] = []
+    original_vision_post = vision_client.post
+
+    async def capturing_vision_post(url, **kwargs):
+        vision_captured.append({"url": url, "json": kwargs.get("json")})
+        return await original_vision_post(url, **kwargs)
+
+    vision_client.post = capturing_vision_post
+    async with session_scope() as session:
+        provider = await session.get(AIProvider, provider_id)
+        provider.api_mode = "responses"
+        provider.vision_model = "gpt-5-vision"
+    use_http_client(lambda **kwargs: vision_client)
+    try:
+        async with session_scope() as session:
+            _is_ad, _reason, vision_result = await ai.check_ad(
+                session,
+                "图片广告",
+                "测试群",
+                -100991001,
+                image_data_url="data:image/jpeg;base64,AAAA",
+                provider_id=provider_id,
+            )
+    finally:
+        use_http_client(original_client)
+
+    assert vision_result.ok, vision_result
+    sent = vision_captured[0]["json"]
+    content = sent["input"][0]["content"]
+    assert isinstance(content, list), content
+    assert content[0]["type"] == "input_text", content
+    assert any(part["type"] == "input_image" for part in content), content
+    assert "data:image/jpeg;base64,AAAA" in str(content), content
+    assert "messages" not in sent, sent
+    print("PASS responses mode converts image parts to input_image")
+
+    test_client = FakeClient(responses=[response_ok])
+    async with session_scope() as session:
+        provider = await session.get(AIProvider, provider_id)
+    use_http_client(lambda **kwargs: test_client)
+    try:
+        test_result = await ai.test_provider(provider)
+    finally:
+        use_http_client(original_client)
+    assert test_result.ok, test_result
+    assert test_client.posts == ["https://responses.example/v1/responses"], test_client.posts
+    print("PASS provider test uses the responses endpoint when api_mode is responses")
+
+    async with session_scope() as session:
+        provider = await session.get(AIProvider, provider_id)
+        provider.api_mode = "chat"
+    chat_client = FakeClient(
+        responses=[SimpleNamespace(status_code=200, json=lambda: {"choices": [{"message": {"content": "ok"}}]})]
+    )
+    use_http_client(lambda **kwargs: chat_client)
+    try:
+        async with session_scope() as session:
+            provider = await session.get(AIProvider, provider_id)
+            chat_result = await ai.chat(
+                session, [{"role": "user", "content": "hi"}], provider_id=provider_id
+            )
+    finally:
+        use_http_client(original_client)
+    assert chat_result.ok, chat_result
+    assert chat_client.posts == ["https://responses.example/v1/chat/completions"], chat_client.posts
+    print("PASS switching back to chat mode uses /chat/completions again")
+
+
 async def main() -> None:
     try:
         await run_tests()
+        await test_responses_mode()
     finally:
         await dispose_db()
 

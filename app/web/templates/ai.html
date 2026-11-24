@@ -180,6 +180,10 @@
           <span class="fact-label">图像模型</span>
           <span class="mono small">{{ p.vision_model or '—' }}</span>
         </div>
+        <div class="provider-fact">
+          <span class="fact-label">接口类型</span>
+          <span class="mono small">{{ 'Responses' if (p.api_mode or 'chat') == 'responses' else 'Chat Completions' }}</span>
+        </div>
       </div>
     </div>
     {% endfor %}

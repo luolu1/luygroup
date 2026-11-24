@@ -41,18 +41,38 @@ prepare_files() {
 
 migrate_database() {
   local db_path="$APP_DIR/data/groupguard.db"
-  [[ -f "$db_path" ]] || { log "数据库不存在，跳过迁移。"; return 0; }
-  
-  # Check if hammer_interval column exists
-  local has_hammer_interval
-  has_hammer_interval=$(python3 -c "import sqlite3; conn = sqlite3.connect('$db_path'); cursor = conn.cursor(); cursor.execute('PRAGMA table_info(auctions)'); print(any(row[1] == 'hammer_interval' for row in cursor.fetchall()))")
-  
-  if [[ "$has_hammer_interval" == "False" ]]; then
-    log "检测到数据库需要迁移，正在添加 hammer_interval 字段..."
-    python3 -c "import sqlite3; conn = sqlite3.connect('$db_path'); conn.execute('ALTER TABLE auctions ADD COLUMN hammer_interval INTEGER DEFAULT 1'); conn.commit(); print('迁移完成')"
-    log "数据库迁移成功。"
+  if [[ ! -f "$db_path" ]]; then
+    log "数据库不存在，首次启动时会自动建表。"
+    return 0
+  fi
+  local python_bin=""
+  if [[ -x "$APP_DIR/.venv/bin/python" ]]; then
+    python_bin="$APP_DIR/.venv/bin/python"
+  elif command -v python3 >/dev/null; then
+    python_bin="$(command -v python3)"
+  fi
+  if [[ -z "$python_bin" ]]; then
+    log "未找到可用的 Python，跳过迁移；容器启动时会自动补齐缺失字段。"
+    return 0
+  fi
+  local db_url="sqlite:///$db_path"
+  if ( cd "$APP_DIR" && PYTHONPATH="$APP_DIR" "$python_bin" - "$db_url" <<'PY'
+import sys
+from sqlalchemy import create_engine
+from app.db import _upgrade_sqlite_schema
+
+engine = create_engine(sys.argv[1])
+try:
+    with engine.begin() as connection:
+        _upgrade_sqlite_schema(connection)
+finally:
+    engine.dispose()
+PY
+  )
+  then
+    log "数据库结构已检查并补齐缺失字段。"
   else
-    log "数据库已是最新版本，跳过迁移。"
+    log "自动迁移未执行（缺少依赖）。容器/服务启动时会自动补齐缺失字段。"
   fi
 }
 

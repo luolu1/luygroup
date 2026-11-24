@@ -130,7 +130,13 @@ async def complete_setup(harness: Harness, *, auction_type: str, skip: bool) -> 
         await harness.say(scene.first.id, scene.first, "Preserved description <&>")
     assert games._auction_drafts[scene.first.id].step == "auction_type"
     await harness.click(scene.first, harness.private_prompt(scene.first), f"aucsetup:type:{auction_type}")
-    for text, step in (("100", "step"), ("10", "minutes"), ("30", "extend"), ("2", "confirm")):
+    for text, step in (
+        ("100", "step"),
+        ("10", "minutes"),
+        ("30", "extend"),
+        ("2", "hammer_interval"),
+        ("1", "confirm"),
+    ):
         await harness.say(scene.first.id, scene.first, text)
         draft = games._auction_drafts[scene.first.id]
         assert draft.step == step and draft.created_at == started

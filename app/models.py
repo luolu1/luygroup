@@ -428,6 +428,8 @@ class AIProvider(Base):
     api_key = Column(String(512), default="")
     model = Column(String(128), default="")
     vision_model = Column(String(128), default="")
+    # Providers adopt /responses at different times, so the schema is per-row.
+    api_mode = Column(String(16), default="chat")
     priority = Column(Integer, default=100)
     enabled = Column(Boolean, default=True)
     builtin = Column(Boolean, default=False)
